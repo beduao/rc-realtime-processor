@@ -1,0 +1,18 @@
+# Autostart da API no Raspberry Pi (Fase 2).
+# Ajuste User e os caminhos, copie para /etc/systemd/system/ e:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now facial-api
+[Unit]
+Description=Reconhecimento Facial - API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=pi
+WorkingDirectory=/home/pi/reconhecimento_facial_ia
+ExecStart=/home/pi/reconhecimento_facial_ia/.venv/bin/uvicorn api:app --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

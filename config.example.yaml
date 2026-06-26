@@ -1,0 +1,44 @@
+# Copie para config.yaml e ajuste. (config.yaml tem prioridade; este arquivo é o fallback.)
+
+camera:
+  # URL RTSP da câmera Intelbras (firmware base Dahua).
+  #   substream (leve, recomendado p/ Pi): ...subtype=1
+  #   stream principal (alta resolução):   ...subtype=0
+  rtsp_url: "rtsp://admin:SUA_SENHA@192.168.0.10:554/cam/realmonitor?channel=1&subtype=1"
+  reconnect_delay_seconds: 3
+
+api:
+  # Onde o uvicorn escuta (no Pi/Mac que roda a API).
+  host: "0.0.0.0"
+  port: 8000
+  # Endereço que o PAINEL usa para falar com a API.
+  #   Fase 1 (tudo no Mac): http://localhost:8000
+  #   Fase 2 (painel no PC): http://IP_DO_PI:8000
+  base_url: "http://localhost:8000"
+
+models:
+  detector: "models/face_detection_yunet_2023mar.onnx"
+  recognizer: "models/face_recognition_sface_2021dec.onnx"
+  detector_input_width: 320
+  detector_input_height: 240
+  score_threshold: 0.8       # confiança mínima do detector
+  nms_threshold: 0.3
+  top_k: 50
+  detect_width: 320          # reduz o frame p/ esta largura antes de detectar (0 = não reduz)
+
+recognition:
+  cosine_threshold: 0.363    # SFace (FR_COSINE): >= => mesma pessoa
+  min_face_size: 60          # ignora rostos menores que isto (px)
+
+worker:
+  process_every_n_frames: 5  # processa 1 a cada N frames (alivia a CPU do Pi)
+  event_cooldown_seconds: 15 # não registra a mesma identidade de novo nessa janela
+  draw_annotations: true
+
+enroll:
+  frames_to_capture: 5       # amostras boas por pessoa no cadastro
+  capture_timeout_seconds: 10
+
+storage:
+  db_path: "data/data.db"
+  snapshots_dir: "data/snapshots"

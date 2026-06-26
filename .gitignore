@@ -1,0 +1,12 @@
+# Ambiente
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Configuração local e dados (contêm credenciais / biometria)
+config.yaml
+data/
+
+# Modelos baixados
+models/*.onnx
