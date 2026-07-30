@@ -31,9 +31,11 @@ recognition:
   min_face_size: 60          # ignora rostos menores que isto (px)
 
 worker:
-  process_every_n_frames: 5  # processa 1 a cada N frames (alivia a CPU do Pi)
+  process_every_n_frames: 5  # processa 1 a cada N frames RECEBIDOS da câmera
+  min_interval_seconds: 0.0  # teto de taxa: 0.5 = no máximo 2 processamentos/s (0 = sem teto)
   event_cooldown_seconds: 15 # não registra a mesma identidade de novo nessa janela
   draw_annotations: true
+  opencv_threads: 0          # 0 = automático; no Pi 3B use 3 (deixa 1 núcleo p/ o decode)
 
 enroll:
   frames_to_capture: 5       # amostras boas por pessoa no cadastro
@@ -42,3 +44,6 @@ enroll:
 storage:
   db_path: "data/data.db"
   snapshots_dir: "data/snapshots"
+  # Preview ao vivo. No Raspberry Pi aponte para tmpfs (/dev/shm/facial-live.jpg):
+  # o arquivo é reescrito ~2x/s e isso desgasta o cartão SD.
+  live_path: "data/live.jpg"

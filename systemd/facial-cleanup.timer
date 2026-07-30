@@ -1,0 +1,11 @@
+[Unit]
+Description=Dispara a limpeza de snapshots todos os dias
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+# O Pi pode estar desligado no horário; Persistent roda no próximo boot.
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,15 @@
+# Limpeza diária de snapshots antigos (disparada pelo facial-cleanup.timer).
+# Placeholders substituídos pelo install_pi.sh.
+[Unit]
+Description=Reconhecimento Facial - Limpeza de snapshots antigos
+
+[Service]
+Type=oneshot
+User=__USER__
+Group=__USER__
+WorkingDirectory=__DIR__
+# Ajuste --days conforme o prazo de retenção definido para o seu caso (LGPD).
+ExecStart=__DIR__/.venv/bin/python scripts/cleanup_snapshots.py --days __RETENTION_DAYS__ --max-mb __MAX_MB__
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=facial-cleanup

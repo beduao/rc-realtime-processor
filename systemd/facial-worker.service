@@ -1,18 +1,30 @@
-# Autostart do worker no Raspberry Pi (Fase 2).
-# Ajuste User e os caminhos, copie para /etc/systemd/system/ e:
-#   sudo systemctl daemon-reload
-#   sudo systemctl enable --now facial-worker
+# Autostart do worker de reconhecimento no Raspberry Pi.
+#
+# NÃO edite __USER__/__DIR__ à mão: rode ./install_pi.sh, que substitui os
+# placeholders pelo usuário e caminho reais e instala o serviço.
+# (Manualmente: troque __USER__/__DIR__, copie para /etc/systemd/system/ e rode
+#  `sudo systemctl daemon-reload && sudo systemctl enable --now facial-worker`.)
 [Unit]
 Description=Reconhecimento Facial - Worker
-After=network-online.target
+After=network-online.target time-sync.target
 Wants=network-online.target
+# Sem isto o systemd desiste após algumas falhas seguidas (ex.: câmera offline
+# durante uma queda de energia) e o serviço fica morto até alguém intervir.
+# (Precisa ficar em [Unit], não em [Service].)
+StartLimitIntervalSec=0
 
 [Service]
-User=pi
-WorkingDirectory=/home/pi/reconhecimento_facial_ia
-ExecStart=/home/pi/reconhecimento_facial_ia/.venv/bin/python worker.py
+Type=simple
+User=__USER__
+Group=__USER__
+WorkingDirectory=__DIR__
+Environment=PYTHONUNBUFFERED=1
+ExecStart=__DIR__/.venv/bin/python worker.py
 Restart=always
-RestartSec=3
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=facial-worker
 
 [Install]
 WantedBy=multi-user.target

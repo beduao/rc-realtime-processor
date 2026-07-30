@@ -29,8 +29,8 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
-from core.camera import Camera
-from core.config import load_config, project_path
+from core.camera import Camera, camera_from_config
+from core.config import live_image_path, load_config, project_path
 from core.database import Database
 from core.draw import crop_face, draw_face
 from core.face_engine import FaceEngine
@@ -42,7 +42,7 @@ db = Database(cfg.storage.db_path)
 store = SnapshotStore(cfg.storage.snapshots_dir)
 
 SNAP_BASE = project_path(cfg.storage.snapshots_dir).resolve()
-LIVE_PATH = project_path("data/live.jpg")
+LIVE_PATH = live_image_path(cfg)
 ENROLL_TARGET = int(cfg.enroll.frames_to_capture)  # amostras sugeridas por pessoa
 
 app = FastAPI(title="Reconhecimento Facial — API")
@@ -57,7 +57,7 @@ def _get_camera() -> Camera:
     global _enroll_cam
     with _lock:
         if _enroll_cam is None:
-            _enroll_cam = Camera(cfg.camera.rtsp_url, cfg.camera.reconnect_delay_seconds).start()
+            _enroll_cam = camera_from_config(cfg).start()
         return _enroll_cam
 
 
@@ -91,7 +91,18 @@ class SampleDelReq(BaseModel):
 # ---- saúde ---------------------------------------------------------------- #
 @app.get("/health")
 def health():
-    return {"ok": True, "enroll_target": ENROLL_TARGET}
+    """Saúde do sistema — útil para checar o Pi remotamente pelo navegador."""
+    live_age = None
+    if LIVE_PATH.exists():
+        live_age = round(time.time() - LIVE_PATH.stat().st_mtime, 1)
+    return {
+        "ok": True,
+        "enroll_target": ENROLL_TARGET,
+        "opencv": cv2.__version__,
+        "people": len(db.list_people()),
+        "worker_live_age_seconds": live_age,   # None ou muito alto => worker parado
+        "enroll_session_active": bool(_sessions),
+    }
 
 
 # ---- cadastro interativo -------------------------------------------------- #

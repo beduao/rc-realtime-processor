@@ -1,0 +1,62 @@
+# Configuração ajustada para RASPBERRY PI 3B (4 núcleos 1.2 GHz, 1 GB RAM).
+# O install_pi.sh copia este arquivo para config.yaml se ele ainda não existir.
+#
+# Só o que você PRECISA editar: camera.rtsp_url (linha abaixo).
+#   Senha com caractere especial precisa ser codificada na URL:
+#     @ -> %40    : -> %3A    / -> %2F    # -> %23    ? -> %3F    espaço -> %20
+#   Ex.: senha "Th@2024#" fica "Th%402024%23"
+
+camera:
+  # SEMPRE use o substream (subtype=1) no Pi 3B. O stream principal derruba a CPU.
+  rtsp_url: "rtsp://admin:SENHA_CODIFICADA@192.168.0.10:554/cam/realmonitor?channel=1&subtype=1"
+  reconnect_delay_seconds: 5
+
+  # WEBCAM USB ou CÂMERA CSI (alternativa quando a câmera IP não tem RTSP —
+  # caso da linha Mibo). Troque rtsp_url por um índice ou dispositivo:
+  #   rtsp_url: 0             (ou "/dev/video0")
+  # As quatro chaves abaixo só têm efeito com dispositivo local:
+  # width: 640
+  # height: 480
+  # fps: 15
+  # mjpeg: true             # MJPEG em vez de vídeo cru: essencial em USB 2.0
+
+api:
+  host: "0.0.0.0"
+  port: 8000
+  # No Pi a API fala consigo mesma. O PAINEL (no seu PC) usa o IP do Pi
+  # no config.yaml DELE — não aqui.
+  base_url: "http://localhost:8000"
+
+models:
+  detector: "models/face_detection_yunet_2023mar.onnx"
+  recognizer: "models/face_recognition_sface_2021dec.onnx"
+  # Para ganhar ~2x de velocidade, rode `python models/download_models.py --int8`
+  # e troque pelos caminhos abaixo (depois recalibre o cosine_threshold):
+  #   detector:   "models/face_detection_yunet_2023mar_int8.onnx"
+  #   recognizer: "models/face_recognition_sface_2021dec_int8.onnx"
+  detector_input_width: 320
+  detector_input_height: 240
+  score_threshold: 0.8
+  nms_threshold: 0.3
+  top_k: 20                  # 50 é desperdício num corredor; 20 basta e é mais leve
+  detect_width: 320          # detecta em 320px de largura e reescala as caixas
+
+recognition:
+  cosine_threshold: 0.363    # calibre com fotos reais do local (veja o GUIA)
+  min_face_size: 50          # px no frame ORIGINAL; abaixo disso o embedding é ruim
+
+worker:
+  process_every_n_frames: 2  # com substream a 10 fps => tenta ~5 processamentos/s
+  min_interval_seconds: 0.5  # ...mas o teto real é 2/s. Este é o freio principal do Pi.
+  event_cooldown_seconds: 20 # evita encher o cartão SD de snapshots repetidos
+  draw_annotations: true
+  opencv_threads: 3          # 3 na DNN + 1 núcleo livre p/ o decode do RTSP
+
+enroll:
+  frames_to_capture: 5
+  capture_timeout_seconds: 15
+
+storage:
+  db_path: "data/data.db"
+  snapshots_dir: "data/snapshots"
+  live_path: "/dev/shm/facial-live.jpg"   # tmpfs: NÃO escreve no cartão SD

@@ -14,12 +14,61 @@ import numpy as np
 
 from .config import project_path
 
+# O YuNet "2023mar" usa formas de entrada dinâmicas e SÓ carrega no OpenCV >= 4.8.
+# Se você estiver preso a um OpenCV mais antigo (ex.: o python3-opencv 4.6 do
+# Raspberry Pi OS Bookworm), use o modelo "2022mar" — daí este mapa de fallback.
+_DETECTOR_FALLBACKS = {
+    "face_detection_yunet_2023mar.onnx": "face_detection_yunet_2022mar.onnx",
+    "face_detection_yunet_2023mar_int8.onnx": "face_detection_yunet_2022mar.onnx",
+}
+
+
+def _cv_version() -> tuple[int, int]:
+    parts = cv2.__version__.split(".")
+    return int(parts[0]), int(parts[1])
+
+
+def _resolve_model(rel_path: str, kind: str) -> str:
+    """Devolve um caminho de modelo existente e compatível com este OpenCV."""
+    path = project_path(rel_path)
+    major, minor = _cv_version()
+    too_old = (major, minor) < (4, 8)
+
+    candidates = [path]
+    if kind == "detector":
+        fb = _DETECTOR_FALLBACKS.get(path.name)
+        if fb:
+            fb_path = path.with_name(fb)
+            if too_old:
+                candidates.insert(0, fb_path)   # com OpenCV antigo, o legado vem 1º
+            else:
+                candidates.append(fb_path)
+
+    for cand in candidates:
+        if cand.exists():
+            if kind == "detector" and too_old and "2023mar" in cand.name:
+                raise RuntimeError(
+                    f"OpenCV {cv2.__version__} é antigo demais para {cand.name} "
+                    "(o YuNet 2023mar exige OpenCV >= 4.8). Corrija com:\n"
+                    "  pip install 'opencv-contrib-python-headless>=4.9,<5'\n"
+                    "(é o que o install_pi.sh faz). Alternativa: colocar o modelo "
+                    "face_detection_yunet_2022mar.onnx na pasta models/, que este "
+                    "código usa automaticamente quando o OpenCV é antigo."
+                )
+            return str(cand)
+
+    tried = ", ".join(c.name for c in candidates)
+    raise FileNotFoundError(
+        f"Modelo de {kind} não encontrado (tentei: {tried}) em {path.parent}. "
+        "Rode: python models/download_models.py"
+    )
+
 
 class FaceEngine:
     def __init__(self, cfg):
         m = cfg.models
-        det_path = str(project_path(m.detector))
-        rec_path = str(project_path(m.recognizer))
+        det_path = _resolve_model(m.detector, "detector")
+        rec_path = _resolve_model(m.recognizer, "recognizer")
 
         self.detector = cv2.FaceDetectorYN.create(
             det_path,
@@ -30,6 +79,8 @@ class FaceEngine:
             int(m.top_k),
         )
         self.recognizer = cv2.FaceRecognizerSF.create(rec_path, "")
+        self.detector_path = det_path
+        self.recognizer_path = rec_path
 
         self.detect_width = int(m.get("detect_width", 0))  # 0 = não redimensiona
         self.cosine_threshold = float(cfg.recognition.cosine_threshold)

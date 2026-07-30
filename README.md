@@ -35,8 +35,14 @@ Câmera Intelbras ──RTSP──► worker.py ──┐
 | `worker.py` | Loop de reconhecimento contínuo |
 | `api.py` | API HTTP (cadastro, pessoas, eventos, snapshots, live) |
 | `panel/app.py` | Painel Streamlit |
-| `scripts/test_camera.py` | Testa a conexão RTSP |
-| `models/download_models.py` | Baixa os modelos ONNX |
+| `scripts/test_camera.py` | Testa a conexão (RTSP, webcam USB ou arquivo) |
+| `scripts/find_camera.py` | Varre a rede e descobre se a câmera expõe RTSP |
+| `scripts/check_pi.py` | Diagnóstico do Pi + medição de FPS real |
+| `scripts/cleanup_snapshots.py` | Retenção de snapshots (protege o cartão SD) |
+| `models/download_models.py` | Baixa e valida os modelos ONNX |
+| `install_pi.sh` | Instalação automatizada no Raspberry Pi |
+| `config.pi.example.yaml` | Preset de configuração para Pi 3B |
+| **[`GUIA_RASPBERRY_PI.md`](GUIA_RASPBERRY_PI.md)** | **Guia completo do Pi + câmera Intelbras** |
 
 ---
 
@@ -86,25 +92,30 @@ No painel: **Cadastrar** uma pessoa, depois ver **Reconhecimentos** e **Ao vivo*
 
 ## Fase 2 — exportar para o Raspberry Pi
 
-No **Pi** (Raspberry Pi OS Bookworm 64-bit, Python 3.11) ficam o worker + API:
+> 📖 O passo a passo detalhado, a configuração da câmera Intelbras e a solução
+> de problemas estão em **[GUIA_RASPBERRY_PI.md](GUIA_RASPBERRY_PI.md)**.
+
+Requer **Raspberry Pi OS Bookworm 64-bit** (`uname -m` = `aarch64`). Copie o
+projeto **sem** o `.venv` e rode o instalador:
 
 ```bash
-# OpenCV do sistema (evita compilar no Pi):
-sudo apt update && sudo apt install -y python3-opencv
+# do seu PC
+rsync -av --exclude .venv --exclude __pycache__ --exclude .git \
+      ./rc-realtime-processor/ usuario@IP_DO_PI:~/rc-realtime-processor/
 
-python3 -m venv .venv --system-site-packages   # reaproveita o opencv do apt
-source .venv/bin/activate
-# no requirements-pi.txt, comente a linha opencv-contrib-python e:
-pip install -r requirements-pi.txt
-
-python models/download_models.py
-cp config.example.yaml config.yaml   # ajuste a rtsp_url
-
-# habilite os serviços (ajuste usuário/caminhos nos arquivos .service)
-sudo cp systemd/facial-*.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now facial-api facial-worker
+# no Pi
+cd ~/rc-realtime-processor
+chmod +x install_pi.sh
+./install_pi.sh --rtsp "rtsp://admin:SENHA@IP:554/cam/realmonitor?channel=1&subtype=1"
 ```
+
+O `install_pi.sh` valida o hardware, instala o OpenCV correto, baixa os modelos,
+cria o `config.yaml` a partir do preset de Pi, testa a câmera e liga os serviços
+`facial-worker`, `facial-api` e a limpeza diária de snapshots.
+
+> ⚠️ **Não use o `python3-opencv` do apt.** No Bookworm ele é a versão 4.6, e o
+> detector YuNet `2023mar` só carrega no **OpenCV ≥ 4.8**. Em 64-bit o PyPI tem
+> wheel pronto (`opencv-contrib-python-headless`), então nada é compilado.
 
 No **PC** fica só o painel:
 
@@ -116,6 +127,14 @@ streamlit run panel/app.py
 
 Nenhuma mudança de código entre as fases — só `config.yaml`.
 
+Diagnóstico e monitoramento no Pi:
+
+```bash
+.venv/bin/python scripts/check_pi.py     # ambiente, modelos, câmera e FPS real
+sudo journalctl -u facial-worker -f      # log ao vivo
+curl http://localhost:8000/health        # saúde da API + idade do preview
+```
+
 ---
 
 ## URL RTSP da Intelbras (firmware base Dahua)
@@ -125,15 +144,28 @@ substream (leve):   rtsp://USUARIO:SENHA@IP:554/cam/realmonitor?channel=1&subtyp
 principal (HD):     rtsp://USUARIO:SENHA@IP:554/cam/realmonitor?channel=1&subtype=0
 ```
 
-Use o **substream** para aliviar a CPU (essencial no Pi 3B).
+Use o **substream** para aliviar a CPU (essencial no Pi 3B). Configure-o na
+câmera como **H.264** (não H.265), **640x480**, **10 fps** — o Pi 3B não
+decodifica H.265 em software com folga.
+
+Senha com caractere especial precisa vir **codificada na URL** (`@` → `%40`,
+`#` → `%23`). É a causa mais comum de falha de conexão.
 
 ## Ajuste de performance (Pi 3B) — em `config.yaml`
 
-- `worker.process_every_n_frames`: ↑ processa menos frames (mais leve).
+- `worker.min_interval_seconds`: teto de processamentos por segundo — o **freio
+  principal**. ↑ = mais leve.
+- `worker.process_every_n_frames`: processa 1 a cada N frames recebidos. ↑ = mais leve.
 - `models.detect_width`: ↓ detecta em imagem menor (mais rápido).
+- `worker.opencv_threads`: 3 no Pi 3B (deixa 1 núcleo para o decode do RTSP).
 - `recognition.cosine_threshold`: calibre com fotos reais (0.363 é o ponto de partida;
   ↑ = mais rígido/menos falsos positivos; ↓ = mais tolerante).
 - `worker.event_cooldown_seconds`: janela anti-duplicação por pessoa.
+- `storage.live_path`: no Pi aponte para `/dev/shm/...` (tmpfs) — evita ~172 mil
+  escritas por dia no cartão SD.
+
+Expectativa realista no Pi 3B: **2 a 3 reconhecimentos por segundo** (o dobro com
+`models/download_models.py --int8`). Meça o seu com `scripts/check_pi.py`.
 
 ## ⚠️ LGPD / Privacidade
 

@@ -1,0 +1,23 @@
+# Este projeto é editado no Windows/Mac mas EXECUTADO no Linux (Raspberry Pi).
+#
+# Arquivo com terminação de linha do Windows (CRLF) quebra de formas confusas
+# no Pi:
+#   - script .sh  -> "bash: $'\r': command not found"
+#   - unit systemd -> o \r entra no argumento do ExecStart e o serviço não sobe
+#
+# Forçando LF em tudo, o mesmo arquivo funciona nas duas pontas.
+* text=auto eol=lf
+
+*.sh      text eol=lf
+*.service text eol=lf
+*.timer   text eol=lf
+*.py      text eol=lf
+*.yaml    text eol=lf
+*.yml     text eol=lf
+*.md      text eol=lf
+
+*.onnx binary
+*.jpg  binary
+*.jpeg binary
+*.png  binary
+*.db   binary

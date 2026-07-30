@@ -1,9 +1,13 @@
-# Worker + API (roda no Pi; e também no Mac na Fase 1).
-# No Raspberry Pi 3B, prefira o OpenCV do sistema para NÃO compilar:
-#   sudo apt install python3-opencv      (Bookworm = OpenCV 4.6, já tem YuNet/SFace)
-# e então remova/comente a linha opencv-contrib-python abaixo.
-opencv-contrib-python>=4.7
-numpy
+# Worker + API (roda no Raspberry Pi; e também no Mac na Fase 1).
+#
+# IMPORTANTE — OpenCV: o detector YuNet "2023mar" usa formas de entrada
+# dinâmicas e SÓ carrega no OpenCV >= 4.8. O `python3-opencv` do apt no
+# Raspberry Pi OS Bookworm é 4.6, ou seja NÃO serve para este projeto.
+# Em Pi OS 64-bit (aarch64) existe wheel pronto no PyPI — nada compila:
+#   pip install "opencv-contrib-python-headless>=4.9,<5"
+# "headless" porque o Pi roda sem interface gráfica (menos deps, menos RAM).
+opencv-contrib-python-headless>=4.9,<5
+numpy<3
 fastapi
 uvicorn
 pyyaml

@@ -139,3 +139,29 @@ class Database:
                 "SELECT * FROM events ORDER BY ts DESC LIMIT ?", (limit,)
             ).fetchall()
         return [dict(r) for r in rows]
+
+    def count_events(self) -> int:
+        with self._connect() as con:
+            return int(con.execute("SELECT COUNT(*) FROM events").fetchone()[0])
+
+    def purge_events_before(self, ts: float, vacuum: bool = True) -> int:
+        """Apaga eventos anteriores a `ts` e devolve quantos saíram.
+
+        O VACUUM roda em conexão separada e em autocommit: o SQLite recusa
+        VACUUM dentro de uma transação, e o `with con` abre uma implicitamente.
+        """
+        con = self._connect()
+        try:
+            cur = con.execute("DELETE FROM events WHERE ts < ?", (ts,))
+            removed = cur.rowcount or 0
+            con.commit()
+        finally:
+            con.close()
+
+        if removed and vacuum:
+            con = sqlite3.connect(self.path, timeout=30, isolation_level=None)
+            try:
+                con.execute("VACUUM")
+            finally:
+                con.close()
+        return removed

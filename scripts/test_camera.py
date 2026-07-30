@@ -1,4 +1,7 @@
-"""Valida a conexão RTSP com a câmera: conecta, imprime a resolução e salva 1 frame.
+"""Valida a conexão com a câmera: conecta, imprime a resolução e salva 1 frame.
+
+Funciona para câmera IP (RTSP), webcam USB (`camera.rtsp_url: 0`) e arquivo de
+vídeo — o backend é escolhido automaticamente.
 
 Uso:  python scripts/test_camera.py
 """
@@ -10,14 +13,15 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import cv2  # noqa: E402
 
-from core.camera import Camera  # noqa: E402
+from core.camera import camera_from_config  # noqa: E402
 from core.config import load_config, project_path  # noqa: E402
 
 
 def main() -> int:
     cfg = load_config()
     print("Conectando em:", cfg.camera.rtsp_url)
-    cam = Camera(cfg.camera.rtsp_url, cfg.camera.reconnect_delay_seconds).start()
+    cam = camera_from_config(cfg).start()
+    print("Backend:", "V4L2 (dispositivo local)" if cam.is_local_device else "FFmpeg (RTSP/arquivo)")
     try:
         frame = cam.read_wait(timeout=15)
     finally:

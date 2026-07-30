@@ -62,3 +62,20 @@ def project_path(rel: str | os.PathLike) -> Path:
     """Resolve um caminho relativo à raiz do projeto (paths absolutos passam direto)."""
     p = Path(rel)
     return p if p.is_absolute() else ROOT / p
+
+
+DEFAULT_LIVE_PATH = "data/live.jpg"
+
+
+def live_image_path(cfg) -> Path:
+    """Caminho do preview ao vivo (worker escreve, API serve).
+
+    No Raspberry Pi aponte `storage.live_path` para um caminho em tmpfs
+    (ex.: /dev/shm/facial-live.jpg): o arquivo é reescrito ~2x por segundo e
+    isso desgasta o cartão SD sem necessidade.
+    """
+    rel = DEFAULT_LIVE_PATH
+    storage = cfg.get("storage") or {}
+    if isinstance(storage, dict):
+        rel = storage.get("live_path") or DEFAULT_LIVE_PATH
+    return project_path(rel)
