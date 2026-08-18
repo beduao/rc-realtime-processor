@@ -422,6 +422,121 @@ O int8 muda a escala dos scores — **recalibre o limiar** (seção 7).
 
 ---
 
+## 6.5 Grupos e chamada de presença — o modo `captura`
+
+O modo padrão (`realtime`) reconhece cada rosto no instante em que ele aparece.
+Isso não funciona quando várias pessoas passam juntas, e a conta explica por quê:
+
+| Rostos no frame | Tempo para processar 1 frame |
+|---|---|
+| 1 | 0,34 s |
+| 3 | 0,91 s |
+| 5 | 1,48 s |
+| 10 | 2,91 s |
+| 20 | 5,76 s |
+
+A detecção custa ~57 ms por frame **independente da quantidade** de rostos — é
+uma passada única da rede. O que escala é o reconhecimento: ~285 ms **por
+rosto**. E enquanto o worker processa um frame, os que chegam são descartados,
+então o grupo inteiro é visto num único instantâneo. Quem estava de perfil,
+atrás de alguém ou borrado naquele exato frame não é registrado.
+
+### Como o modo `captura` resolve
+
+Ele separa as duas fases:
+
+```
+FASE 1 (ao vivo, barata)          FASE 2 (depois, sem pressa)
+detecta ~17 fps                   lê as trilhas pendentes
+  -> rastreia cada pessoa           -> reconhece cada recorte
+  -> guarda os 3 melhores           -> decide por VOTAÇÃO
+     recortes de cada uma           -> grava a presença
+```
+
+Três ganhos, não um:
+
+1. A captura acompanha o vídeo mesmo com o corredor cheio.
+2. Cada pessoa tem **várias chances** de aparecer bem, não uma só.
+3. A decisão sai por **votação** entre os recortes. Um recorte ruim vira voto
+   vencido em vez de decisão final — é a correção direta para o falso positivo
+   que aparece no modo em tempo real.
+
+### Alternar entre os dois modos
+
+Você não precisa escolher de uma vez: o modo é trocável a qualquer momento, e
+o worker aplica **sem reiniciar o serviço** (ele relê a configuração a cada 10 s).
+
+```bash
+.venv/bin/python scripts/set_mode.py             # ver o modo atual
+.venv/bin/python scripts/set_mode.py captura      # dia normal, muita criança
+.venv/bin/python scripts/set_mode.py realtime     # dia de pouco movimento, ou teste
+```
+
+Na troca a partir do modo captura, as trilhas que estavam em cena são salvas
+antes da transição — ninguém que estava passando naquele instante se perde. E as
+trilhas já capturadas continuam pendentes: o lote as processa depois, mesmo que
+você tenha voltado para o modo em tempo real.
+
+Para um teste pontual, sem mexer na configuração, dá para fixar o modo na
+linha de comando (isso também desliga a troca automática):
+
+```bash
+sudo systemctl stop facial-worker
+.venv/bin/python worker.py --mode realtime
+```
+
+Conferir o que está rodando, de qualquer máquina:
+
+```bash
+curl http://IP_DO_PI:8000/health
+# "worker_mode": "captura", "tracks_pending": 34
+```
+
+O modo em `/health` é o que o worker está **realmente** executando, que pode
+diferir do `config.yaml` se alguém tiver iniciado com `--mode`.
+
+Ajustes finos do modo captura, no `config.yaml` (estes exigem reinício):
+
+```yaml
+tracking:
+  crops_per_track: 3       # mais recortes = mais votos = mais robusto
+batch:
+  min_votos: 2             # quantos recortes precisam concordar
+```
+
+E ligue o lote uma vez:
+
+```bash
+sudo systemctl enable --now facial-batch.timer    # a cada 10 min
+```
+
+### Operar
+
+```bash
+.venv/bin/python scripts/recognize_batch.py              # reconhecer agora
+.venv/bin/python scripts/recognize_batch.py --presenca    # presença de hoje
+.venv/bin/python scripts/recognize_batch.py --presenca --dia 2026-08-03
+.venv/bin/python scripts/recognize_batch.py --reprocessar # após cadastrar gente nova
+```
+
+O `--reprocessar` é importante: se alguém for cadastrado depois, as trilhas
+antigas podem ser reavaliadas — nada foi perdido, os recortes continuam lá.
+
+### Ajustar
+
+| Sintoma | Ajuste |
+|---|---|
+| Pessoas conhecidas saindo como "Desconhecido" | `batch.min_votos` para 1; suba `crops_per_track` |
+| Ainda há troca de identidade | `min_votos` para 3 (com `crops_per_track: 4`); suba o limiar |
+| Trilhas demais, curtas e inúteis | suba `min_track_frames` |
+| Uma pessoa virando várias trilhas | suba `max_missing_frames`; baixe `iou_threshold` |
+| Duas pessoas viram uma trilha só | suba `iou_threshold` |
+
+> **Presença não é o mesmo que ausência.** Quem não foi identificado pode ter
+> sido falha de captura — não trate automaticamente como falta. O relatório
+> lista essas pessoas separadamente, e vale conferir as trilhas marcadas como
+> "Desconhecido" antes de fechar a chamada.
+
 ## 7. Calibrar o limiar de reconhecimento
 
 `recognition.cosine_threshold: 0.363` é o valor de referência do SFace, não uma
@@ -432,19 +547,38 @@ verdade universal. Ele decide entre "é a Maria" e "é um desconhecido".
   virando "Desconhecido".
 - Descer (ex.: 0.30): reconhece mais, com risco de confundir pessoas parecidas.
 
-Como calibrar com dados reais, não por palpite: cadastre as pessoas, deixe rodar
-algumas horas e olhe os scores dos eventos.
+Calibre com os seus dados, não por palpite. Deixe rodar algumas horas e use:
 
 ```bash
-# scores dos acertos (pessoas conhecidas)
-sqlite3 data/data.db "SELECT name, ROUND(score,3) FROM events WHERE is_known=1 ORDER BY score LIMIT 20;"
-# scores dos que caíram como desconhecidos
-sqlite3 data/data.db "SELECT ROUND(score,3) FROM events WHERE is_known=0 ORDER BY score DESC LIMIT 20;"
+.venv/bin/python scripts/calibrate_threshold.py            # distribuição dos scores
+.venv/bin/python scripts/calibrate_threshold.py --review    # marca acerto/erro e sugere
+.venv/bin/python scripts/calibrate_threshold.py --simular 0.55   # efeito antes de aplicar
 ```
 
-Escolha um limiar **entre** o menor score dos acertos e o maior score dos erros.
-Se esses dois números se sobrepõem, o problema não é o limiar: é enquadramento,
-iluminação ou poucas amostras no cadastro.
+No `--review` ele mostra cada reconhecimento com o link da foto e pergunta se
+acertou. Com isso separa a distribuição dos acertos da dos erros e propõe um
+limiar entre as duas. As respostas ficam salvas, então dá para revisar aos poucos.
+
+Se as distribuições **se sobrepõem**, ele avisa em vez de inventar um número —
+e com razão: nesse caso nenhum limiar separa os dois casos, e mexer nele só
+troca falso positivo por falso negativo. O que resolve aí é cadastro e
+enquadramento (veja abaixo).
+
+### Falso positivo: identifica outra pessoa como alguém cadastrado
+
+Em ordem de eficácia:
+
+1. **Cadastre mais amostras** da pessoa, variando ângulo, distância e
+   iluminação. Mais amostras aumentam o score dela nos acertos, o que permite
+   subir o limiar sem perdê-la.
+2. **Cadastre também as outras pessoas** que passam. Com só uma pessoa na
+   galeria, todo rosto é comparado apenas com ela — não há identidade
+   concorrente para "vencer" a comparação. É o cenário mais propício a erro.
+3. **Suba o limiar**, guiado pelo `calibrate_threshold.py`.
+4. **Aumente `recognition.min_face_size`** (de 50 para 70–80). Rosto pequeno
+   gera embedding ruim e é fonte clássica de confusão.
+5. **Melhore o enquadramento**: rosto de frente, sem contraluz, na altura dos
+   olhos.
 
 ---
 

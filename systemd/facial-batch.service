@@ -1,0 +1,21 @@
+# Fase 2 do modo "captura": reconhece as trilhas capturadas pelo worker.
+# Disparado pelo facial-batch.timer. Placeholders substituídos pelo install_pi.sh.
+#
+# Roda com prioridade baixa de CPU e de disco: a captura (facial-worker) tem
+# que continuar acompanhando o vídeo enquanto isto processa o acumulado.
+[Unit]
+Description=Reconhecimento Facial - Reconhecimento em lote das trilhas
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=__USER__
+Group=__USER__
+WorkingDirectory=__DIR__
+Environment=PYTHONUNBUFFERED=1
+Nice=15
+IOSchedulingClass=idle
+ExecStart=__DIR__/.venv/bin/python scripts/recognize_batch.py
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=facial-batch

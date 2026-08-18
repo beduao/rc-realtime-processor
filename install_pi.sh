@@ -241,7 +241,8 @@ else
   trap 'rm -rf "$TMP"' EXIT
   # O `tr -d '\r'` é proteção contra arquivos vindos do Windows: um CRLF numa
   # unit faz o \r entrar no argumento do ExecStart e o serviço não sobe.
-  for unit in facial-api.service facial-worker.service facial-cleanup.service; do
+  for unit in facial-api.service facial-worker.service facial-cleanup.service \
+              facial-batch.service; do
     tr -d '\r' < "$PROJ/systemd/$unit" | sed \
         -e "s|__USER__|$RUN_USER|g" \
         -e "s|__DIR__|$PROJ|g" \
@@ -250,13 +251,26 @@ else
         -e "s|__MAX_MB__|$MAX_MB|g" \
         > "$TMP/$unit"
   done
-  tr -d '\r' < "$PROJ/systemd/facial-cleanup.timer" > "$TMP/facial-cleanup.timer"
+  for t in facial-cleanup.timer facial-batch.timer; do
+    tr -d '\r' < "$PROJ/systemd/$t" > "$TMP/$t"
+  done
 
   sudo cp "$TMP"/facial-*.service "$TMP"/facial-*.timer /etc/systemd/system/
   sudo systemctl daemon-reload
   sudo systemctl enable --now facial-api.service facial-worker.service >/dev/null
   sudo systemctl enable --now facial-cleanup.timer >/dev/null
   ok "facial-api, facial-worker e facial-cleanup.timer habilitados no boot"
+
+  # O lote só faz sentido no modo captura; ligar sozinho evita ter que
+  # lembrar disso depois de trocar o modo no config.
+  if grep -qE '^\s*mode:\s*"?captura"?' "$CFG"; then
+    sudo systemctl enable --now facial-batch.timer >/dev/null
+    ok "modo captura detectado: facial-batch.timer habilitado (lote a cada 10 min)"
+  else
+    sudo systemctl disable --now facial-batch.timer >/dev/null 2>&1 || true
+    printf '      modo realtime: o lote fica desligado. Se trocar para captura,\n'
+    printf '      rode: sudo systemctl enable --now facial-batch.timer\n'
+  fi
 
   sleep 4
   for svc in facial-api facial-worker; do

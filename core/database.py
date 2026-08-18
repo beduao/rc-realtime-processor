@@ -64,6 +64,32 @@ class Database:
                 );
                 CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts DESC);
                 CREATE INDEX IF NOT EXISTS idx_emb_person ON embeddings(person_id);
+
+                -- Pipeline de duas fases (modo captura).
+                -- Uma "trilha" é uma pessoa acompanhada ao longo dos frames.
+                -- A captura grava as trilhas; o reconhecimento em lote as
+                -- processa depois e preenche person_id/name/score.
+                CREATE TABLE IF NOT EXISTS tracks (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    started_at  REAL NOT NULL,
+                    ended_at    REAL NOT NULL,
+                    frames      INTEGER NOT NULL,
+                    status      TEXT NOT NULL DEFAULT 'pendente',
+                    person_id   INTEGER,
+                    name        TEXT,
+                    score       REAL,
+                    votes       TEXT
+                );
+                CREATE TABLE IF NOT EXISTS track_crops (
+                    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                    track_id  INTEGER NOT NULL,
+                    path      TEXT NOT NULL,
+                    quality   REAL NOT NULL,
+                    face      TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_tracks_status ON tracks(status);
+                CREATE INDEX IF NOT EXISTS idx_tracks_started ON tracks(started_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_crops_track ON track_crops(track_id);
                 """
             )
 
@@ -137,6 +163,98 @@ class Database:
         with self._connect() as con:
             rows = con.execute(
                 "SELECT * FROM events ORDER BY ts DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ---- trilhas (pipeline de duas fases) -------------------------------------
+    def add_track(self, started_at: float, ended_at: float, frames: int,
+                  crops: list[dict]) -> int:
+        """Grava uma trilha e seus recortes. `crops`: [{path, quality, face}].
+
+        `face` é a linha de 15 valores do YuNet já em coordenadas do recorte,
+        serializada em JSON — é o que permite ao lote refazer exatamente o mesmo
+        alinhamento que o modo em tempo real faria.
+        """
+        with self._connect() as con:
+            cur = con.execute(
+                """
+                INSERT INTO tracks(started_at, ended_at, frames, status)
+                VALUES(?, ?, ?, 'pendente')
+                """,
+                (started_at, ended_at, frames),
+            )
+            track_id = int(cur.lastrowid)
+            con.executemany(
+                "INSERT INTO track_crops(track_id, path, quality, face) VALUES(?,?,?,?)",
+                [(track_id, c["path"], float(c["quality"]), c["face"]) for c in crops],
+            )
+        return track_id
+
+    def pending_tracks(self, limit: int = 500) -> list[dict]:
+        with self._connect() as con:
+            rows = con.execute(
+                """
+                SELECT * FROM tracks WHERE status = 'pendente'
+                ORDER BY started_at LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def track_crops(self, track_id: int) -> list[dict]:
+        with self._connect() as con:
+            rows = con.execute(
+                "SELECT * FROM track_crops WHERE track_id=? ORDER BY quality DESC",
+                (track_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def resolve_track(self, track_id: int, person_id, name: str, score: float,
+                      votes: str, status: str = "processado") -> None:
+        with self._connect() as con:
+            con.execute(
+                """
+                UPDATE tracks SET status=?, person_id=?, name=?, score=?, votes=?
+                WHERE id=?
+                """,
+                (status, person_id, name, float(score), votes, track_id),
+            )
+
+    def reset_processed_tracks(self) -> int:
+        """Devolve as trilhas processadas para 'pendente' (reprocessamento)."""
+        with self._connect() as con:
+            return con.execute(
+                "UPDATE tracks SET status='pendente' WHERE status='processado'"
+            ).rowcount or 0
+
+    def count_tracks_by_status(self) -> dict:
+        with self._connect() as con:
+            rows = con.execute(
+                "SELECT status, COUNT(*) AS n FROM tracks GROUP BY status"
+            ).fetchall()
+        return {r["status"]: int(r["n"]) for r in rows}
+
+    def attendance(self, day_start: float, day_end: float) -> list[dict]:
+        """Presença do período: uma linha por pessoa identificada.
+
+        Para chamada o que importa é "foi vista pelo menos uma vez", não quantas
+        vezes passou — por isso agrupa por pessoa e devolve a primeira aparição.
+        """
+        with self._connect() as con:
+            rows = con.execute(
+                """
+                SELECT t.person_id, t.name,
+                       MIN(t.started_at) AS primeira,
+                       MAX(t.ended_at)   AS ultima,
+                       COUNT(*)          AS passagens,
+                       MAX(t.score)      AS melhor_score
+                FROM tracks t
+                WHERE t.status = 'processado' AND t.person_id IS NOT NULL
+                  AND t.started_at >= ? AND t.started_at < ?
+                GROUP BY t.person_id
+                ORDER BY primeira
+                """,
+                (day_start, day_end),
             ).fetchall()
         return [dict(r) for r in rows]
 

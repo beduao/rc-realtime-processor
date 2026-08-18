@@ -38,7 +38,11 @@ models:
   detector_input_height: 240
   score_threshold: 0.8
   nms_threshold: 0.3
-  top_k: 20                  # 50 é desperdício num corredor; 20 basta e é mais leve
+  # ATENÇÃO: top_k é o número MÁXIMO de rostos que o detector devolve por frame.
+  # Se passar mais gente que isso ao mesmo tempo, o excedente é DESCARTADO —
+  # não existe para o sistema. Em ambiente com grupos (corredor de escola),
+  # mantenha folga: 50 ou mais. Custa pouco (o caro é o embedding, não a detecção).
+  top_k: 50
   detect_width: 320          # detecta em 320px de largura e reescala as caixas
 
 recognition:
@@ -46,8 +50,30 @@ recognition:
   min_face_size: 50          # px no frame ORIGINAL; abaixo disso o embedding é ruim
 
 worker:
-  process_every_n_frames: 2  # com substream a 10 fps => tenta ~5 processamentos/s
-  min_interval_seconds: 0.5  # ...mas o teto real é 2/s. Este é o freio principal do Pi.
+  # ---------------------------------------------------------------------------
+  # MODO DE OPERAÇÃO — a escolha mais importante do arquivo.
+  #
+  # "realtime": reconhece na hora. Custa ~285 ms POR ROSTO, então com várias
+  #    pessoas no mesmo frame o Pi não acompanha o vídeo e perde gente.
+  #    Adequado a fluxo esparso, uma pessoa por vez.
+  #
+  # "captura": só detecta e rastreia, guardando os melhores recortes de cada
+  #    pessoa; o reconhecimento roda depois, em lote. A detecção custa ~57 ms
+  #    por frame INDEPENDENTE de quantos rostos haja, então a captura aguenta
+  #    o corredor cheio. E como cada pessoa gera vários recortes, a decisão sai
+  #    por votação — bem mais precisa. Use para grupos e chamada de presença.
+  #      Reconhecer:  python scripts/recognize_batch.py
+  #      Presença:    python scripts/recognize_batch.py --presenca
+  # ---------------------------------------------------------------------------
+  mode: "realtime"
+  # O worker relê `mode` neste intervalo e troca SEM reiniciar o serviço. Use
+  #   python scripts/set_mode.py captura
+  # para alternar. Os demais parâmetros continuam exigindo reinício.
+  mode_check_seconds: 10
+
+  # Só valem no modo "realtime" (no modo captura o worker processa todo frame):
+  process_every_n_frames: 2
+  min_interval_seconds: 0.5
   event_cooldown_seconds: 20 # evita encher o cartão SD de snapshots repetidos
   draw_annotations: true
   opencv_threads: 3          # 3 na DNN + 1 núcleo livre p/ o decode do RTSP
@@ -55,6 +81,21 @@ worker:
 enroll:
   frames_to_capture: 5
   capture_timeout_seconds: 15
+
+# Rastreamento — só usado no modo "captura".
+tracking:
+  iou_threshold: 0.3         # sobreposição mínima para considerar o mesmo rosto
+  max_missing_frames: 8      # frames sem ver a pessoa antes de encerrar a trilha
+  crops_per_track: 3         # quantos recortes guardar por pessoa (mais = mais votos)
+  min_track_frames: 2        # trilha de 1 frame é descartada (falso positivo do detector)
+  crops_dir: "data/tracks"
+
+# Reconhecimento em lote.
+batch:
+  # Quantos recortes precisam concordar na mesma identidade para virar presença.
+  # 2 é um bom equilíbrio com crops_per_track: 3. Suba para 3 se ainda houver
+  # falso positivo; desça para 1 se estiver perdendo gente.
+  min_votos: 2
 
 storage:
   db_path: "data/data.db"

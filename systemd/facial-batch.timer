@@ -1,0 +1,12 @@
+[Unit]
+Description=Dispara o reconhecimento em lote periodicamente
+
+[Timer]
+# A cada 10 minutos. A chamada não é em tempo real, então não há pressa —
+# e espaçar assim evita competir com a captura no horário de entrada.
+OnBootSec=5min
+OnUnitActiveSec=10min
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

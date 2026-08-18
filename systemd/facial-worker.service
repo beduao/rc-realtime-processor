@@ -22,6 +22,9 @@ Environment=PYTHONUNBUFFERED=1
 ExecStart=__DIR__/.venv/bin/python worker.py
 Restart=always
 RestartSec=5
+# Dá tempo do worker salvar as trilhas em andamento antes de ser morto.
+KillSignal=SIGTERM
+TimeoutStopSec=25
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=facial-worker

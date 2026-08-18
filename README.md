@@ -30,6 +30,7 @@ Câmera Intelbras ──RTSP──► worker.py ──┐
 |---|---|
 | `core/camera.py` | Leitor RTSP em thread (só o último frame, reconecta sozinho) |
 | `core/face_engine.py` | YuNet + SFace + match por cosseno |
+| `core/tracker.py` | Rastreia rostos entre frames e guarda os melhores recortes |
 | `core/database.py` | SQLite (people / embeddings / events) em WAL |
 | `core/storage.py` | Salva snapshots em `data/snapshots/AAAAMMDD/` |
 | `worker.py` | Loop de reconhecimento contínuo |
@@ -38,6 +39,10 @@ Câmera Intelbras ──RTSP──► worker.py ──┐
 | `scripts/test_camera.py` | Testa a conexão (RTSP, webcam USB ou arquivo) |
 | `scripts/find_camera.py` | Varre a rede e descobre se a câmera expõe RTSP |
 | `scripts/check_pi.py` | Diagnóstico do Pi + medição de FPS real |
+| `scripts/calibrate_threshold.py` | Calibra o limiar a partir dos acertos e erros reais |
+| `scripts/recognize_batch.py` | Fase 2 do modo captura: reconhece por votação e gera a presença |
+| `scripts/set_mode.py` | Alterna entre `realtime` e `captura` sem reiniciar o serviço |
+| `tests/test_all.py` | Suíte de regressão (roda sem câmera e sem os modelos) |
 | `scripts/cleanup_snapshots.py` | Retenção de snapshots (protege o cartão SD) |
 | `models/download_models.py` | Baixa e valida os modelos ONNX |
 | `install_pi.sh` | Instalação automatizada no Raspberry Pi |

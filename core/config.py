@@ -64,6 +64,24 @@ def project_path(rel: str | os.PathLike) -> Path:
     return p if p.is_absolute() else ROOT / p
 
 
+def config_path() -> Path:
+    """Caminho do arquivo de configuração em uso (útil para relê-lo)."""
+    return _resolve_config_path()
+
+
+def reload_config() -> Config:
+    """Relê a configuração do disco, ignorando o cache.
+
+    Usado pelo worker para detectar troca de modo sem reiniciar. Só o
+    `worker.mode` é aplicado a quente — trocar outros parâmetros no meio da
+    execução deixaria o processo num estado inconsistente (metade dos valores
+    antigos, metade novos), então esses continuam exigindo reinício.
+    """
+    global _cache
+    _cache = None
+    return load_config()
+
+
 DEFAULT_LIVE_PATH = "data/live.jpg"
 
 

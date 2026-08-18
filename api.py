@@ -20,6 +20,7 @@ Observações:
 Subir com:  uvicorn api:app --host 0.0.0.0 --port 8000
 """
 
+import json
 import threading
 import time
 import uuid
@@ -43,6 +44,7 @@ store = SnapshotStore(cfg.storage.snapshots_dir)
 
 SNAP_BASE = project_path(cfg.storage.snapshots_dir).resolve()
 LIVE_PATH = live_image_path(cfg)
+STATUS_PATH = LIVE_PATH.with_name("facial-status.json")
 ENROLL_TARGET = int(cfg.enroll.frames_to_capture)  # amostras sugeridas por pessoa
 
 app = FastAPI(title="Reconhecimento Facial — API")
@@ -95,12 +97,27 @@ def health():
     live_age = None
     if LIVE_PATH.exists():
         live_age = round(time.time() - LIVE_PATH.stat().st_mtime, 1)
+
+    # Modo REAL em execução, publicado pelo worker. Difere do config.yaml
+    # quando o worker foi iniciado com --mode.
+    worker_mode, tracks_pending = None, None
+    try:
+        with open(STATUS_PATH, encoding="utf-8") as fh:
+            st = json.load(fh)
+        if time.time() - st.get("updated_at", 0) < 600:
+            worker_mode = st.get("mode")
+            tracks_pending = st.get("pendentes")
+    except (OSError, ValueError):
+        pass
+
     return {
         "ok": True,
         "enroll_target": ENROLL_TARGET,
         "opencv": cv2.__version__,
         "people": len(db.list_people()),
         "worker_live_age_seconds": live_age,   # None ou muito alto => worker parado
+        "worker_mode": worker_mode,            # None => worker parado ou antigo
+        "tracks_pending": tracks_pending,      # só no modo captura
         "enroll_session_active": bool(_sessions),
     }
 
