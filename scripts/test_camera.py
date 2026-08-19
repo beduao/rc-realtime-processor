@@ -14,11 +14,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import cv2  # noqa: E402
 
 from core.camera import camera_from_config  # noqa: E402
-from core.config import load_config, project_path  # noqa: E402
+from core.config import load_config_or_exit, project_path  # noqa: E402
 
 
 def main() -> int:
-    cfg = load_config()
+    cfg = load_config_or_exit()
     print("Conectando em:", cfg.camera.rtsp_url)
     cam = camera_from_config(cfg).start()
     print("Backend:", "V4L2 (dispositivo local)" if cam.is_local_device else "FFmpeg (RTSP/arquivo)")
@@ -29,7 +29,15 @@ def main() -> int:
         pass
 
     if frame is None:
-        print("FALHA: nenhum frame em 15s. Verifique IP/usuário/senha/porta e a rede.")
+        if cam.is_local_device:
+            print("FALHA: não consegui abrir o dispositivo.")
+            print("  Webcam USB e câmera CSI aceitam UM processo por vez. Se o")
+            print("  facial-worker estiver rodando, ele está com o dispositivo:")
+            print("    sudo systemctl stop facial-worker")
+            print("  Se não estiver, confira o dispositivo e as permissões:")
+            print("    ls /dev/video*  |  v4l2-ctl --list-devices  |  groups | grep video")
+        else:
+            print("FALHA: nenhum frame em 15s. Verifique IP/usuário/senha/porta e a rede.")
         cam.stop()
         return 1
 

@@ -21,7 +21,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core.config import load_config, project_path  # noqa: E402
+from core.config import load_config_or_exit, project_path  # noqa: E402
 from core.database import Database  # noqa: E402
 
 
@@ -47,7 +47,7 @@ def main() -> int:
                          "no cartão SD; útil evitar se o banco for grande)")
     args = ap.parse_args()
 
-    cfg = load_config()
+    cfg = load_config_or_exit()
     base = project_path(cfg.storage.snapshots_dir)
     if not base.exists():
         print(f"Nada a fazer: {base} não existe.")

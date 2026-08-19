@@ -24,7 +24,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core.config import load_config, project_path  # noqa: E402
+from core.config import load_config_or_exit, project_path  # noqa: E402
 from core.database import Database  # noqa: E402
 
 LABELS_FILE = "data/calibracao.json"
@@ -208,7 +208,7 @@ def main() -> int:
                     help="mostra o efeito de um limiar sem aplicá-lo")
     args = ap.parse_args()
 
-    cfg = load_config()
+    cfg = load_config_or_exit()
     db = Database(cfg.storage.db_path)
     porta = int(cfg.api.get("port", 8000))
 

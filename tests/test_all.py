@@ -105,6 +105,10 @@ class EngineFalsa:
         i = int(np.argmax(s))
         return ids[i], float(s[i])
 
+    @staticmethod
+    def best_face(faces):
+        return max(faces, key=lambda f: float(f[2]) * float(f[3])) if faces else None
+
 
 # --------------------------------------------------------------------------- #
 # config
@@ -683,6 +687,70 @@ def set_mode_edita_preservando_comentarios():
                         cwd=RAIZ, env=env, capture_output=True, text=True)
     assert "worker.mode = captura" in r2.stdout, r2.stdout
     return f"trocou para captura preservando os {comentarios_antes} comentários"
+
+
+@teste
+def cadastro_usa_o_frame_do_worker_quando_ele_esta_no_ar():
+    """Com webcam USB o dispositivo é exclusivo: a API não pode abri-lo.
+
+    Aqui a "câmera" é um caminho inexistente — se a API tentasse abri-la,
+    falharia. Ela só funciona se estiver consumindo o frame publicado.
+    """
+    import importlib
+    import core.face_engine as fe
+
+    escrever_config(**{"camera.rtsp_url": "/dev/video-inexistente"})
+    fe.FaceEngine = lambda cfg: EngineFalsa(cfg)
+    api = importlib.import_module("api")
+    importlib.reload(api)
+
+    # worker parado: sem frame publicado -> cai no caminho da câmera (que falha)
+    if api.FRAME_PATH.exists():
+        api.FRAME_PATH.unlink()
+    assert api._frame_do_worker() is None
+    h = api.health()
+    assert h["enroll_source"] == "camera", h
+
+    # worker publicando: a API usa o frame dele
+    quadro = np.full((480, 640, 3), 90, np.uint8)
+    cv2.imwrite(str(api.FRAME_PATH), quadro)
+    assert api._frame_do_worker() is not None
+    assert api.health()["enroll_source"] == "worker"
+
+    frame, origem = api.frame_para_cadastro()
+    assert origem == "worker" and frame.shape == (480, 640, 3), (origem, frame)
+
+    resp = api.enroll_start(api.StartReq(name="Teste USB"))
+    sid = resp["session_id"]
+    cap = api.enroll_capture(api.SessionReq(session_id=sid))
+    assert cap["ok"] and cap["count"] == 1, cap
+    fim = api.enroll_finish(api.SessionReq(session_id=sid))
+    assert fim["captured"] == 1 and fim["name"] == "Teste USB", fim
+
+    # frame velho é ignorado: melhor não cadastrar do que cadastrar imagem antiga
+    os.utime(api.FRAME_PATH, (0, 0))
+    assert api._frame_do_worker() is None, "frame velho deveria ser descartado"
+    return ("preview e captura funcionaram sem abrir a câmera; "
+            "frame velho é descartado")
+
+
+@teste
+def monitor_identifica_o_worker_sem_falso_positivo():
+    """Casar a substring 'worker.py' na linha de comando pega o shell errado."""
+    from scripts.monitor import _e_o_worker, explicar_throttled
+
+    # o próprio processo de teste NÃO é o worker
+    assert not _e_o_worker(os.getpid()), "confundiu o processo de teste com o worker"
+    assert not _e_o_worker(1), "PID 1 não pode passar"
+    assert not _e_o_worker(999999), "PID inexistente deve dar False"
+
+    # bits do vcgencmd traduzidos
+    assert explicar_throttled(0) == []
+    agora = explicar_throttled(0x1)
+    assert agora and "AGORA" in agora[0], agora
+    hist = explicar_throttled(0x50000)
+    assert len(hist) == 2 and all("desde o boot" in h or "houve" in h for h in hist), hist
+    return "PID do teste, init e inexistente rejeitados; flags traduzidas"
 
 
 # --------------------------------------------------------------------------- #

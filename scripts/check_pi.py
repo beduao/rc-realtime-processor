@@ -25,7 +25,7 @@ import cv2  # noqa: E402
 import numpy as np  # noqa: E402
 
 from core.camera import camera_from_config  # noqa: E402
-from core.config import live_image_path, load_config, project_path  # noqa: E402
+from core.config import live_image_path, load_config_or_exit, project_path  # noqa: E402
 from core.database import Database  # noqa: E402
 
 OK = "  [ok] "
@@ -35,6 +35,21 @@ WARN = "  [!!] "
 
 def head(title: str):
     print(f"\n=== {title} " + "=" * max(0, 60 - len(title)))
+
+
+def _worker_rodando() -> bool:
+    """Há um `python .../worker.py` no ar? (ele segura a câmera USB)"""
+    try:
+        from scripts.monitor import achar_worker
+        return achar_worker({}) is not None
+    except Exception:                                   # noqa: BLE001
+        pass
+    try:
+        import subprocess
+        return subprocess.run(["systemctl", "is-active", "--quiet", "facial-worker"],
+                              timeout=5).returncode == 0
+    except Exception:                                   # noqa: BLE001
+        return False
 
 
 def _read_first_line(path: str) -> str:
@@ -115,7 +130,7 @@ def check_environment() -> bool:
 
 def check_config_and_models() -> bool:
     head("Configuração e modelos")
-    cfg = load_config()
+    cfg = load_config_or_exit()
     good = True
 
     url = str(cfg.camera.rtsp_url)
@@ -183,14 +198,33 @@ def check_config_and_models() -> bool:
 
 def check_camera_and_speed(seconds: float) -> bool:
     head(f"Câmera e desempenho ({seconds:.0f}s)")
-    cfg = load_config()
+    cfg = load_config_or_exit()
     cam = camera_from_config(cfg).start()
     try:
         t0 = time.time()
         frame = cam.read_wait(timeout=20)
         if frame is None:
-            print(BAD + "nenhum frame em 20s. Verifique IP, usuário, senha, porta 554 e a rede.")
-            print("       Teste rápido:  ffprobe -rtsp_transport tcp '<sua_url>'")
+            if cam.is_local_device:
+                # Causa nº 1 com webcam USB: dispositivo V4L2 é EXCLUSIVO.
+                ocupado = _worker_rodando()
+                print(BAD + "não consegui abrir a câmera.")
+                if ocupado:
+                    print("       O serviço facial-worker está rodando e segura o "
+                          "dispositivo.")
+                    print("       Webcam USB e câmera CSI só aceitam UM processo por vez:")
+                    print("         sudo systemctl stop facial-worker")
+                    print("         .venv/bin/python scripts/check_pi.py")
+                    print("         sudo systemctl start facial-worker")
+                    print("       (para acompanhar SEM parar nada, use scripts/monitor.py)")
+                else:
+                    print("       Confira o dispositivo e as permissões:")
+                    print("         ls /dev/video*        # existe?")
+                    print("         v4l2-ctl --list-devices")
+                    print("         groups | grep video   # seu usuário está no grupo?")
+            else:
+                print(BAD + "nenhum frame em 20s. Verifique IP, usuário, senha, "
+                            "porta 554 e a rede.")
+                print("       Teste rápido:  ffprobe -rtsp_transport tcp '<sua_url>'")
             return False
         h, w = frame.shape[:2]
         print(OK + f"primeiro frame em {time.time() - t0:.1f}s — {w}x{h}")

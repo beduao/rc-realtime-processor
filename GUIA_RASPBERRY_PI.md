@@ -385,15 +385,52 @@ substream 640x480 e `detect_width: 320`, a ordem de grandeza é:
 
 Com os modelos `--int8`, espere aproximadamente o dobro de velocidade.
 
-Meça no **seu** hardware e enquadramento:
+Meça no **seu** hardware e enquadramento. Há duas ferramentas, com propósitos
+diferentes:
+
+**`check_pi.py` — diagnóstico com o serviço PARADO.** Ele abre a câmera para
+medir fps, ms de detecção e ms de embedding, e avisa se o `config.yaml` está
+pedindo mais do que o Pi entrega.
 
 ```bash
-cd ~/rc-realtime-processor
+sudo systemctl stop facial-worker     # obrigatório com webcam USB
 .venv/bin/python scripts/check_pi.py
+sudo systemctl start facial-worker
 ```
 
-Ele mede fps da câmera, ms de detecção, ms de embedding, e avisa se o
-`config.yaml` está pedindo mais do que o Pi entrega.
+Parar o worker é obrigatório com webcam USB, porque dispositivo V4L2 é
+exclusivo — dois processos não abrem `/dev/video0` ao mesmo tempo. Com câmera
+IP funcionaria sem parar, mas o teste competiria por CPU com o worker e as
+medições sairiam pessimistas.
+
+**`monitor.py` — acompanhamento com o serviço RODANDO.** Não toca na câmera:
+lê tudo de `/proc`, do `vcgencmd`, do status do worker e do banco.
+
+```bash
+.venv/bin/python scripts/monitor.py                 # até Ctrl+C
+.venv/bin/python scripts/monitor.py --segundos 300   # observa 5 min e resume
+```
+
+```
+hora       cpu   temp   livre   swap  worker       cpu    mem   fps  pend  disco
+11:23:53   82%  64.2C   180MB    0MB  captura     241%   210MB  15.8    12   34GB
+```
+
+O que olhar, e por quê:
+
+| Coluna | Sinal de alerta |
+|---|---|
+| `temp` | Acima de 80 °C o Pi reduz o clock sozinho e tudo fica mais lento |
+| `livre` | Abaixo de ~80 MB começa swap, e swap em cartão SD arruína a latência |
+| `swap` | Qualquer valor crescendo é ruim |
+| `worker cpu` | Pode passar de 100% (são 4 núcleos, teto 400%) |
+| `pend` | Se só cresce, o lote não acompanha a captura |
+
+No fim ele resume a temperatura máxima, se houve subtensão ou throttling, e se
+a fila cresceu ou diminuiu no período. **Subtensão é o achado mais importante
+ao testar com webcam USB**: a câmera divide o barramento e a alimentação com o
+Pi, e fonte fraca causa falhas intermitentes difíceis de diagnosticar de outra
+forma. O aviso aparece mesmo que tudo pareça estar funcionando.
 
 ### Ajustes em `config.yaml` (reinicie com `sudo systemctl restart facial-worker`)
 

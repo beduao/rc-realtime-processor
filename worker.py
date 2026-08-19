@@ -29,7 +29,8 @@ import time
 import cv2
 
 from core.camera import camera_from_config
-from core.config import live_image_path, load_config, project_path, reload_config
+from core.config import (frame_image_path, live_image_path, load_config_or_exit,
+                         project_path, reload_config)
 from core.database import Database
 from core.draw import draw_face
 from core.face_engine import FaceEngine
@@ -38,6 +39,8 @@ from core.storage import SnapshotStore
 GALLERY_RELOAD_SECONDS = 10.0   # recarrega cadastros novos sem reiniciar
 LIVE_WRITE_SECONDS = 0.5        # frequência de atualização do preview ao vivo
 LIVE_JPEG_QUALITY = 70          # menor = menos CPU e menos escrita em disco
+FRAME_WRITE_SECONDS = 0.5       # frame limpo publicado para o cadastro da API
+FRAME_JPEG_QUALITY = 95         # alto: dele saem os embeddings do cadastro
 STATS_EVERY_SECONDS = 300.0     # log periódico de saúde (aparece no journalctl)
 
 # Encerramento limpo. Sem isto, o SIGTERM do `systemctl stop/restart` mata o
@@ -98,23 +101,38 @@ def publicar_status(live_path, modo: str, extra: dict = None):
         pass    # status é informativo; falhar aqui não pode parar o worker
 
 
-def _write_live(path, image):
-    """Escreve o preview de forma atômica (arquivo temporário + rename).
+def _escrever_jpeg(path, image, qualidade):
+    """Escreve um JPEG de forma atômica (arquivo temporário + rename).
 
-    Sem isso a API pode servir um JPEG cortado, porque ela lê o arquivo no
+    Sem isso a API pode servir uma imagem cortada, porque ela lê o arquivo no
     mesmo instante em que o worker está escrevendo.
 
     Codificamos em memória com `imencode` em vez de usar `imwrite` num arquivo
     ".tmp": o OpenCV escolhe o formato pela EXTENSÃO, então um nome temporário
     terminado em .tmp faz o imwrite falhar.
     """
-    ok, buf = cv2.imencode(".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), LIVE_JPEG_QUALITY])
+    ok, buf = cv2.imencode(".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), qualidade])
     if not ok:
         return
     tmp = str(path) + ".part"
     with open(tmp, "wb") as fh:
         fh.write(buf.tobytes())
     os.replace(tmp, str(path))
+
+
+def _write_live(path, image):
+    """Preview anotado, consumido pela API em /live.jpg."""
+    _escrever_jpeg(path, image, LIVE_JPEG_QUALITY)
+
+
+def _write_frame(path, image):
+    """Frame LIMPO para o cadastro da API.
+
+    Publicado sempre, nos dois modos e independente de `draw_annotations`:
+    é o que permite cadastrar pessoas com o worker rodando, já que webcam USB
+    não aceita dois processos abrindo o dispositivo.
+    """
+    _escrever_jpeg(path, image, FRAME_JPEG_QUALITY)
 
 
 def intervalo_checagem(cfg) -> float:
@@ -149,9 +167,10 @@ def loop_realtime(cfg, engine, db, live_path, cam, modo_fixo=False):
     annotate = bool(cfg.worker.draw_annotations)
     threshold = engine.cosine_threshold
 
+    frame_path = frame_image_path(cfg)
     gallery = db.load_gallery()
     last_reload = last_stats = last_mode = time.time()
-    last_live = last_proc = 0.0
+    last_live = last_proc = last_frame = 0.0
     last_seen: dict[str, float] = {}
     seq = frames_seen = processed = 0
     proc_time = 0.0
@@ -170,6 +189,12 @@ def loop_realtime(cfg, engine, db, live_path, cam, modo_fixo=False):
 
         frames_seen += 1
         now = time.time()
+
+        # Publica o frame limpo antes de qualquer descarte, para o cadastro da
+        # API ter preview fluido mesmo quando o processamento está represado.
+        if now - last_frame > FRAME_WRITE_SECONDS:
+            _write_frame(frame_path, frame)
+            last_frame = now
 
         if not modo_fixo and now - last_mode > intervalo_checagem(cfg):
             last_mode = now
@@ -252,8 +277,9 @@ def loop_captura(cfg, engine, db, live_path, cam, modo_fixo=False):
     crops_base.mkdir(parents=True, exist_ok=True)
     annotate = bool(cfg.worker.draw_annotations)
 
+    frame_path = frame_image_path(cfg)
     last_stats = last_mode = time.time()
-    last_live = 0.0
+    last_live = last_frame = 0.0
     seq = frames_seen = frame_idx = trilhas = 0
     det_time = 0.0
     trocar_para = None
@@ -302,6 +328,10 @@ def loop_captura(cfg, engine, db, live_path, cam, modo_fixo=False):
             frames_seen += 1
             frame_idx += 1
             now = time.time()
+
+            if now - last_frame > FRAME_WRITE_SECONDS:
+                _write_frame(frame_path, frame)
+                last_frame = now
 
             if not modo_fixo and now - last_mode > intervalo_checagem(cfg):
                 last_mode = now
@@ -365,7 +395,7 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     instalar_handlers()
-    cfg = load_config()
+    cfg = load_config_or_exit()
 
     modo_fixo = args.mode is not None
     if modo_fixo:

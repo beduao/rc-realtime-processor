@@ -25,7 +25,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core.config import config_path, live_image_path, load_config  # noqa: E402
+from core.config import config_path, live_image_path, load_config_or_exit  # noqa: E402
 
 MODOS = ("realtime", "captura")
 
@@ -108,7 +108,7 @@ def main() -> int:
                     help="sem argumento, apenas mostra o estado atual")
     args = ap.parse_args()
 
-    cfg = load_config()
+    cfg = load_config_or_exit()
     return mostrar(cfg) if args.modo is None else trocar(cfg, args.modo)
 
 

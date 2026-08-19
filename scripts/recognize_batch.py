@@ -31,7 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import cv2  # noqa: E402
 import numpy as np  # noqa: E402
 
-from core.config import load_config, project_path  # noqa: E402
+from core.config import load_config_or_exit, project_path  # noqa: E402
 from core.database import Database  # noqa: E402
 from core.face_engine import FaceEngine  # noqa: E402
 
@@ -200,7 +200,7 @@ def main() -> int:
     ap.add_argument("--dia", default="", help="dia do relatório (AAAA-MM-DD)")
     args = ap.parse_args()
 
-    cfg = load_config()
+    cfg = load_config_or_exit()
     db = Database(cfg.storage.db_path)
     if args.presenca:
         return presenca(db, args.dia)

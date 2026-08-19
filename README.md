@@ -38,7 +38,8 @@ Câmera Intelbras ──RTSP──► worker.py ──┐
 | `panel/app.py` | Painel Streamlit |
 | `scripts/test_camera.py` | Testa a conexão (RTSP, webcam USB ou arquivo) |
 | `scripts/find_camera.py` | Varre a rede e descobre se a câmera expõe RTSP |
-| `scripts/check_pi.py` | Diagnóstico do Pi + medição de FPS real |
+| `scripts/check_pi.py` | Diagnóstico do Pi + medição de FPS real (abre a câmera) |
+| `scripts/monitor.py` | Acompanha CPU, temperatura, memória e fila **com o worker rodando** |
 | `scripts/calibrate_threshold.py` | Calibra o limiar a partir dos acertos e erros reais |
 | `scripts/recognize_batch.py` | Fase 2 do modo captura: reconhece por votação e gera a presença |
 | `scripts/set_mode.py` | Alterna entre `realtime` e `captura` sem reiniciar o serviço |

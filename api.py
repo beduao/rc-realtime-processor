@@ -31,7 +31,8 @@ from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
 from core.camera import Camera, camera_from_config
-from core.config import live_image_path, load_config, project_path
+from core.config import (frame_image_path, live_image_path, load_config,
+                         project_path)
 from core.database import Database
 from core.draw import crop_face, draw_face
 from core.face_engine import FaceEngine
@@ -45,6 +46,8 @@ store = SnapshotStore(cfg.storage.snapshots_dir)
 SNAP_BASE = project_path(cfg.storage.snapshots_dir).resolve()
 LIVE_PATH = live_image_path(cfg)
 STATUS_PATH = LIVE_PATH.with_name("facial-status.json")
+FRAME_PATH = frame_image_path(cfg)
+FRAME_MAX_AGE = 5.0        # acima disso o frame do worker é velho demais
 ENROLL_TARGET = int(cfg.enroll.frames_to_capture)  # amostras sugeridas por pessoa
 
 app = FastAPI(title="Reconhecimento Facial — API")
@@ -55,12 +58,40 @@ _sessions: dict[str, dict] = {}   # session_id -> {name, samples:[{index,embeddi
 _enroll_cam: Camera | None = None
 
 
+def _frame_do_worker():
+    """Último frame limpo publicado pelo worker, ou None se não houver/estiver velho."""
+    try:
+        if time.time() - FRAME_PATH.stat().st_mtime > FRAME_MAX_AGE:
+            return None
+    except OSError:
+        return None
+    return cv2.imread(str(FRAME_PATH))
+
+
 def _get_camera() -> Camera:
     global _enroll_cam
     with _lock:
         if _enroll_cam is None:
             _enroll_cam = camera_from_config(cfg).start()
         return _enroll_cam
+
+
+def frame_para_cadastro():
+    """Frame para preview e captura do cadastro.
+
+    Prioriza o frame publicado pelo worker. Isso não é otimização: webcam USB e
+    câmera CSI são dispositivos V4L2 EXCLUSIVOS, então com o worker rodando a
+    API simplesmente não consegue abrir a câmera. Consumindo o frame dele, o
+    cadastro funciona sem precisar parar o reconhecimento.
+
+    Se o worker estiver parado (frame ausente ou velho), abre a câmera
+    diretamente — que é o caminho de sempre, e o único quando só a API roda.
+    """
+    img = _frame_do_worker()
+    if img is not None:
+        return img, "worker"
+    cam = _get_camera()
+    return cam.read(), "camera"
 
 
 def _maybe_close_camera():
@@ -119,6 +150,9 @@ def health():
         "worker_mode": worker_mode,            # None => worker parado ou antigo
         "tracks_pending": tracks_pending,      # só no modo captura
         "enroll_session_active": bool(_sessions),
+        # "worker" => cadastro usa o frame publicado (funciona com o worker no ar);
+        # "camera" => a API abre a câmera (só possível com o worker parado)
+        "enroll_source": "worker" if _frame_do_worker() is not None else "camera",
     }
 
 
@@ -128,7 +162,10 @@ def enroll_start(req: StartReq):
     name = req.name.strip()
     if not name:
         raise HTTPException(400, "Nome é obrigatório.")
-    _get_camera()  # abre a câmera para preview/captura
+    # Só abre a câmera se o worker NÃO estiver publicando frames — com webcam
+    # USB, tentar abrir enquanto ele roda falha (dispositivo exclusivo).
+    if _frame_do_worker() is None:
+        _get_camera()
     sid = uuid.uuid4().hex[:12]
     with _lock:
         _sessions[sid] = {"name": name, "samples": []}
@@ -138,12 +175,14 @@ def enroll_start(req: StartReq):
 @app.get("/enroll/preview")
 def enroll_preview():
     """Frame ao vivo (limpo) com a caixa do rosto detectado desenhada."""
-    cam = _enroll_cam
-    if cam is None:
+    if not _sessions and _enroll_cam is None and _frame_do_worker() is None:
         raise HTTPException(404, "Nenhuma sessão de cadastro ativa.")
-    frame = cam.read()
+    frame, origem = frame_para_cadastro()
     if frame is None:
-        raise HTTPException(503, "Ainda sem imagem da câmera.")
+        raise HTTPException(
+            503, "Ainda sem imagem. Se a câmera é USB e o worker está parado, "
+                 "aguarde alguns segundos; se ele está rodando, verifique "
+                 "'sudo systemctl status facial-worker'.")
     preview = frame.copy()
     for face in engine.detect(frame):
         draw_face(preview, face, "rosto", score=float(face[14]), known=True)
@@ -159,8 +198,7 @@ def enroll_capture(req: SessionReq):
     sess = _sessions.get(req.session_id)
     if sess is None:
         raise HTTPException(404, "Sessão inválida ou expirada.")
-    cam = _get_camera()
-    frame = cam.read()
+    frame, origem = frame_para_cadastro()
     if frame is None:
         return {"ok": False, "message": "Ainda sem imagem da câmera."}
 
