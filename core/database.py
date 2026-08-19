@@ -92,6 +92,24 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_crops_track ON track_crops(track_id);
                 """
             )
+        self._migrar()
+
+    def _migrar(self):
+        """Acrescenta colunas novas a bancos já existentes.
+
+        `CREATE TABLE IF NOT EXISTS` não altera tabela que já existe, então um
+        banco criado por versão anterior ficaria sem as colunas novas. Aqui a
+        adição é feita só quando falta, e sem apagar nada — o cadastro de quem
+        já foi registrado continua valendo (fica apenas sem foto associada,
+        porque essa informação não existia na época).
+        """
+        with self._connect() as con:
+            existentes = {r["name"] for r in con.execute("PRAGMA table_info(embeddings)")}
+            for coluna, tipo in (("snapshot_path", "TEXT"),
+                                 ("created_at", "REAL"),
+                                 ("quality", "REAL")):
+                if coluna not in existentes:
+                    con.execute(f"ALTER TABLE embeddings ADD COLUMN {coluna} {tipo}")
 
     # ---- pessoas / embeddings -------------------------------------------------
     def add_person(self, name: str) -> int:
@@ -102,18 +120,78 @@ class Database:
             )
             return int(cur.lastrowid)
 
-    def add_embedding(self, person_id: int, vec) -> None:
+    def add_embedding(self, person_id: int, vec, snapshot_path: str = None,
+                      quality: float = None) -> int:
         blob = np.asarray(vec, dtype=np.float32).tobytes()
         with self._connect() as con:
-            con.execute(
-                "INSERT INTO embeddings(person_id, vec) VALUES(?, ?)",
-                (person_id, blob),
+            cur = con.execute(
+                """
+                INSERT INTO embeddings(person_id, vec, snapshot_path, created_at, quality)
+                VALUES(?, ?, ?, ?, ?)
+                """,
+                (person_id, blob, snapshot_path, time.time(), quality),
             )
+            return int(cur.lastrowid)
 
-    def delete_person(self, person_id: int) -> None:
+    def list_embeddings(self, person_id: int) -> list[dict]:
+        """Amostras da pessoa, com vetor — o vetor é usado para medir redundância."""
         with self._connect() as con:
+            rows = con.execute(
+                """
+                SELECT id, snapshot_path, created_at, quality, vec
+                FROM embeddings WHERE person_id=? ORDER BY id
+                """,
+                (person_id,),
+            ).fetchall()
+        saida = []
+        for r in rows:
+            d = dict(r)
+            d["vec"] = np.frombuffer(r["vec"], dtype=np.float32)
+            saida.append(d)
+        return saida
+
+    def get_embedding(self, embedding_id: int) -> dict | None:
+        with self._connect() as con:
+            r = con.execute(
+                "SELECT id, person_id, snapshot_path FROM embeddings WHERE id=?",
+                (embedding_id,),
+            ).fetchone()
+        return dict(r) if r else None
+
+    def count_embeddings(self, person_id: int) -> int:
+        with self._connect() as con:
+            return int(con.execute(
+                "SELECT COUNT(*) FROM embeddings WHERE person_id=?",
+                (person_id,)).fetchone()[0])
+
+    def delete_embedding(self, embedding_id: int) -> None:
+        with self._connect() as con:
+            con.execute("DELETE FROM embeddings WHERE id=?", (embedding_id,))
+
+    def get_person(self, person_id: int) -> dict | None:
+        with self._connect() as con:
+            r = con.execute("SELECT id, name, created_at FROM people WHERE id=?",
+                            (person_id,)).fetchone()
+        return dict(r) if r else None
+
+    def rename_person(self, person_id: int, name: str) -> None:
+        with self._connect() as con:
+            con.execute("UPDATE people SET name=? WHERE id=?", (name, person_id))
+
+    def delete_person(self, person_id: int) -> list[str]:
+        """Apaga pessoa e embeddings. Devolve os caminhos de foto que ficaram órfãos.
+
+        Quem chama é responsável por remover os arquivos — o banco não conhece o
+        sistema de arquivos. Devolver a lista evita deixar imagens de rosto no
+        disco depois de um pedido de exclusão.
+        """
+        with self._connect() as con:
+            caminhos = [r["snapshot_path"] for r in con.execute(
+                "SELECT snapshot_path FROM embeddings WHERE person_id=?",
+                (person_id,)) if r["snapshot_path"]]
             con.execute("DELETE FROM embeddings WHERE person_id=?", (person_id,))
             con.execute("DELETE FROM people WHERE id=?", (person_id,))
+        return caminhos
 
     def list_people(self) -> list[dict]:
         with self._connect() as con:

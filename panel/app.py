@@ -163,6 +163,11 @@ elif page == "Reconhecimentos":
 # --------------------------------------------------------------------------- #
 elif page == "Pessoas":
     st.header("Pessoas cadastradas")
+
+    # Acima de qual similaridade duas amostras contam como redundantes. 0.95 é
+    # alto de propósito: abaixo disso a variação entre elas ainda ajuda.
+    LIMITE_REDUNDANCIA = 0.95
+
     try:
         people = requests.get(f"{API}/people", timeout=10).json()
     except requests.RequestException as exc:
@@ -171,13 +176,132 @@ elif page == "Pessoas":
 
     if not people:
         st.info("Ninguém cadastrado ainda. Vá em **Cadastrar**.")
-    for p in people:
-        c1, c2, c3 = st.columns([3, 1, 1])
-        c1.write(f"**{p['name']}**")
-        c2.write(f"{p['embeddings']} amostras")
-        if c3.button("Remover", key=f"del-{p['id']}"):
-            requests.delete(f"{API}/people/{p['id']}", timeout=10)
-            st.rerun()
+        st.stop()
+
+    # O worker publica o frame que a API usa no preview. Sem ele rodando, não
+    # há como capturar amostra nova — melhor avisar do que mostrar imagem quebrada.
+    try:
+        saude = requests.get(f"{API}/health", timeout=5).json()
+    except requests.RequestException:
+        saude = {}
+    camera_viva = bool(saude.get("worker_mode"))
+
+    st.caption(f"{len(people)} pessoa(s) cadastrada(s). "
+               "Selecione uma para ver e gerenciar as amostras.")
+    rotulos = {f"{p['name']}  ({p['embeddings']} amostra(s))": p for p in people}
+    escolhido = st.selectbox("Pessoa", list(rotulos))
+    p = rotulos[escolhido]
+
+    try:
+        dados = requests.get(f"{API}/people/{p['id']}/samples", timeout=15).json()
+    except requests.RequestException as exc:
+        st.error(f"Falha ao buscar amostras: {exc}")
+        st.stop()
+
+    amostras = dados.get("samples", [])
+    if dados.get("sem_foto"):
+        st.caption(f"{dados['sem_foto']} amostra(s) foram cadastradas antes desta "
+                   "versão e não têm foto guardada. Elas continuam valendo para o "
+                   "reconhecimento — só não é possível revisá-las visualmente.")
+
+    # --- grade de amostras -------------------------------------------------- #
+    st.subheader("Amostras")
+    colunas = st.columns(4)
+    for i, a in enumerate(amostras):
+        col = colunas[i % 4]
+        with col:
+            if a["snapshot_url"]:
+                st.image(f"{API}{a['snapshot_url']}", width="stretch")
+            else:
+                st.info("sem foto")
+
+            legenda = [f"#{a['id']}"]
+            if a.get("quality") is not None:
+                legenda.append(f"nitidez {a['quality']:.0f}")
+            if a.get("created_at"):
+                legenda.append(time.strftime("%d/%m %H:%M",
+                                             time.localtime(a["created_at"])))
+            st.caption(" · ".join(legenda))
+
+            sim = a.get("similaridade_maxima")
+            if sim is not None and sim >= LIMITE_REDUNDANCIA:
+                st.warning(f"redundante — {sim:.2f} com a #{a['parecida_com']}")
+            elif sim is not None:
+                st.caption(f"similaridade máx. {sim:.2f}")
+
+            if st.button("Excluir", key=f"delemb-{a['id']}"):
+                r = requests.delete(f"{API}/embeddings/{a['id']}", timeout=15)
+                if r.ok:
+                    st.rerun()
+                else:
+                    st.error(r.json().get("detail", r.text))
+
+    redundantes = [a for a in amostras
+                   if (a.get("similaridade_maxima") or 0) >= LIMITE_REDUNDANCIA]
+    if redundantes:
+        st.info(f"{len(redundantes)} amostra(s) quase idênticas a outras. Excluir "
+                "uma delas não piora o reconhecimento: o que ajuda é variação de "
+                "ângulo e iluminação, não quantidade.")
+    elif len(amostras) < 3:
+        st.info("Poucas amostras. Mais amostras variadas elevam o score dos "
+                "acertos, o que permite subir o limiar sem deixar de reconhecer "
+                "a pessoa.")
+
+    st.divider()
+
+    # --- reforçar cadastro -------------------------------------------------- #
+    st.subheader("Reforçar cadastro")
+    if not camera_viva:
+        st.warning("O worker não está publicando imagem, então não dá para "
+                   "capturar agora. Verifique: sudo systemctl status facial-worker")
+    else:
+        ca, cb = st.columns([2, 3])
+        with ca:
+            st.caption("A pessoa deve estar em frente à câmera. Varie o ângulo "
+                       "em relação às amostras que já existem.")
+            if st.button("Capturar nova amostra", type="primary",
+                         key=f"add-{p['id']}"):
+                try:
+                    r = requests.post(f"{API}/people/{p['id']}/samples", timeout=30)
+                    data = r.json()
+                except requests.RequestException as exc:
+                    st.error(f"Falha: {exc}")
+                else:
+                    if r.ok and data.get("ok"):
+                        st.success(f"Amostra adicionada (total: {data['total']}).")
+                        st.rerun()
+                    else:
+                        st.warning(data.get("message") or data.get("detail") or r.text)
+            if st.button("Atualizar prévia", key=f"prev-{p['id']}"):
+                st.rerun()
+        with cb:
+            st.image(f"{API}/enroll/preview?t={time.time()}",
+                     caption="prévia da câmera", width="stretch")
+
+    st.divider()
+
+    # --- renomear e remover ------------------------------------------------- #
+    st.subheader("Editar")
+    cr, cd = st.columns([3, 1])
+    with cr:
+        novo = st.text_input("Nome", value=p["name"], key=f"nome-{p['id']}")
+        if st.button("Renomear", key=f"ren-{p['id']}",
+                     disabled=not novo.strip() or novo.strip() == p["name"]):
+            r = requests.patch(f"{API}/people/{p['id']}",
+                               json={"name": novo.strip()}, timeout=10)
+            if r.ok:
+                st.rerun()
+            else:
+                st.error(r.json().get("detail", r.text))
+    with cd:
+        st.caption("Apaga a pessoa, as amostras e as fotos dela. O histórico de "
+                   "reconhecimentos é mantido.")
+        if st.button("Remover pessoa", key=f"del-{p['id']}"):
+            r = requests.delete(f"{API}/people/{p['id']}", timeout=15)
+            if r.ok:
+                st.rerun()
+            else:
+                st.error(r.text)
 
 
 # --------------------------------------------------------------------------- #

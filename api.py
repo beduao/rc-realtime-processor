@@ -21,11 +21,13 @@ Subir com:  uvicorn api:app --host 0.0.0.0 --port 8000
 """
 
 import json
+import shutil
 import threading
 import time
 import uuid
 
 import cv2
+import numpy as np
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
@@ -105,6 +107,60 @@ def _maybe_close_camera():
 def _public_samples(sess: dict):
     return [{"index": s["index"], "snapshot_url": f"/snapshots/{s['snapshot']}"}
             for s in sess["samples"]]
+
+
+AMOSTRAS_SUBDIR = "amostras"          # snapshots/amostras/<person_id>/
+
+
+def _nitidez(imagem) -> float:
+    """Variância do Laplaciano: quanto maior, mais nítido o recorte."""
+    try:
+        cinza = cv2.cvtColor(imagem, cv2.COLOR_BGR2GRAY)
+        return round(float(cv2.Laplacian(cinza, cv2.CV_64F).var()), 1)
+    except cv2.error:
+        return 0.0
+
+
+def _guardar_amostra(person_id: int, crop, rotulo: str) -> str:
+    """Salva o recorte na pasta definitiva da pessoa e devolve o caminho relativo."""
+    return store.save(crop, rotulo, subdir=f"{AMOSTRAS_SUBDIR}/{person_id}")
+
+
+def _mover_para_amostras(origem, person_id: int) -> str:
+    """Move um recorte já salvo para a pasta da pessoa. Devolve o novo caminho."""
+    destino_dir = SNAP_BASE / AMOSTRAS_SUBDIR / str(person_id)
+    destino_dir.mkdir(parents=True, exist_ok=True)
+    destino = destino_dir / origem.name
+    shutil.move(str(origem), str(destino))
+    return f"{AMOSTRAS_SUBDIR}/{person_id}/{origem.name}"
+
+
+def _redundancia(amostras: list[dict]) -> list[dict]:
+    """Para cada amostra, a maior similaridade com as OUTRAS da mesma pessoa.
+
+    Amostra quase idêntica a outra não acrescenta informação ao cadastro — ela
+    infla a contagem sem melhorar o reconhecimento. Como os vetores estão
+    normalizados, o produto interno já é o cosseno.
+    """
+    saida = []
+    for i, a in enumerate(amostras):
+        melhor, parceiro = 0.0, None
+        for j, b in enumerate(amostras):
+            if i == j:
+                continue
+            sim = float(np.dot(a["vec"], b["vec"]))
+            if sim > melhor:
+                melhor, parceiro = sim, b["id"]
+        saida.append({
+            "id": a["id"],
+            "snapshot_url": (f"/snapshots/{a['snapshot_path']}"
+                             if a["snapshot_path"] else None),
+            "created_at": a["created_at"],
+            "quality": a["quality"],
+            "similaridade_maxima": round(melhor, 3) if parceiro else None,
+            "parecida_com": parceiro,
+        })
+    return saida
 
 
 # ---- modelos de request --------------------------------------------------- #
@@ -210,7 +266,8 @@ def enroll_capture(req: SessionReq):
     index = len(sess["samples"])
     crop = crop_face(frame, face)
     snapshot = store.save(crop, f"{sess['name']}_s{index + 1}", subdir=f"enroll/{req.session_id}")
-    sess["samples"].append({"index": index, "embedding": vec, "snapshot": snapshot})
+    sess["samples"].append({"index": index, "embedding": vec, "snapshot": snapshot,
+                            "quality": _nitidez(crop)})
     return {"ok": True, "count": len(sess["samples"]), "target": ENROLL_TARGET,
             "samples": _public_samples(sess)}
 
@@ -244,8 +301,20 @@ def enroll_finish(req: SessionReq):
     if not sess["samples"]:
         raise HTTPException(422, "Capture pelo menos uma amostra antes de concluir.")
     person_id = db.add_person(sess["name"])
+
+    # Move os recortes da pasta temporária da sessão para a pasta definitiva da
+    # pessoa. Assim cada embedding fica ligado à sua foto (é o que permite
+    # revisar as amostras depois) e apagar a pessoa remove as imagens dela.
     for s in sess["samples"]:
-        db.add_embedding(person_id, s["embedding"])
+        destino = None
+        try:
+            origem = SNAP_BASE / s["snapshot"]
+            destino = _mover_para_amostras(origem, person_id)
+        except OSError as exc:
+            print(f"[api] não movi o recorte da amostra: {exc}", flush=True)
+        db.add_embedding(person_id, s["embedding"], destino, s.get("quality"))
+
+    store.remove_dir(f"enroll/{req.session_id}")
     captured = len(sess["samples"])
     name = sess["name"]
     with _lock:
@@ -271,8 +340,103 @@ def people():
 
 @app.delete("/people/{person_id}")
 def delete_person(person_id: int):
-    db.delete_person(person_id)
-    return {"deleted": person_id}
+    """Apaga a pessoa, seus embeddings E as fotos das amostras dela.
+
+    Antes as imagens ficavam no disco depois da exclusão. Para dado biométrico
+    isso é problema: 'excluir' precisa excluir de fato.
+    """
+    caminhos = db.delete_person(person_id)
+    removidas = 0
+    for rel in caminhos:
+        arq = (SNAP_BASE / rel).resolve()
+        if str(arq).startswith(str(SNAP_BASE)) and arq.is_file():
+            arq.unlink(missing_ok=True)
+            removidas += 1
+    pasta = (SNAP_BASE / AMOSTRAS_SUBDIR / str(person_id)).resolve()
+    if str(pasta).startswith(str(SNAP_BASE)) and pasta.is_dir():
+        shutil.rmtree(pasta, ignore_errors=True)
+    return {"deleted": person_id, "fotos_removidas": removidas,
+            "aviso": "O histórico de reconhecimentos (eventos) foi mantido."}
+
+
+class RenameReq(BaseModel):
+    name: str
+
+
+@app.patch("/people/{person_id}")
+def rename_person(person_id: int, req: RenameReq):
+    nome = req.name.strip()
+    if not nome:
+        raise HTTPException(400, "Nome não pode ficar vazio.")
+    if db.get_person(person_id) is None:
+        raise HTTPException(404, "Pessoa não encontrada.")
+    db.rename_person(person_id, nome)
+    return {"id": person_id, "name": nome}
+
+
+@app.get("/people/{person_id}/samples")
+def person_samples(person_id: int):
+    """Amostras da pessoa, com nitidez e indicação de redundância."""
+    pessoa = db.get_person(person_id)
+    if pessoa is None:
+        raise HTTPException(404, "Pessoa não encontrada.")
+    amostras = db.list_embeddings(person_id)
+    return {"person": pessoa, "samples": _redundancia(amostras),
+            "sem_foto": sum(1 for a in amostras if not a["snapshot_path"])}
+
+
+@app.post("/people/{person_id}/samples")
+def add_sample(person_id: int):
+    """Acrescenta uma amostra a quem já está cadastrado, do frame atual.
+
+    É a forma mais eficaz de reduzir falso positivo: mais amostras da mesma
+    pessoa, em ângulos e luz variados, elevam o score dos acertos e permitem
+    subir o limiar sem perdê-la.
+    """
+    pessoa = db.get_person(person_id)
+    if pessoa is None:
+        raise HTTPException(404, "Pessoa não encontrada.")
+
+    frame, origem = frame_para_cadastro()
+    if frame is None:
+        return {"ok": False, "message": "Ainda sem imagem da câmera."}
+    face = engine.best_face(engine.detect(frame))
+    if face is None:
+        return {"ok": False, "message": "Nenhum rosto detectado. Ajuste a posição."}
+
+    vec = engine.embed(frame, face)
+    crop = crop_face(frame, face)
+    n = db.count_embeddings(person_id) + 1
+    caminho = _guardar_amostra(person_id, crop, f"{pessoa['name']}_s{n}")
+    eid = db.add_embedding(person_id, vec, caminho, _nitidez(crop))
+    _maybe_close_camera()
+    return {"ok": True, "id": eid, "origem": origem,
+            "snapshot_url": f"/snapshots/{caminho}",
+            "total": db.count_embeddings(person_id)}
+
+
+@app.delete("/embeddings/{embedding_id}")
+def delete_sample(embedding_id: int):
+    """Remove UMA amostra, com trava para não deixar a pessoa sem nenhuma.
+
+    Pessoa sem embedding nunca mais seria reconhecida, mas continuaria na lista
+    de cadastrados — um estado silenciosamente quebrado.
+    """
+    amostra = db.get_embedding(embedding_id)
+    if amostra is None:
+        raise HTTPException(404, "Amostra não encontrada.")
+    if db.count_embeddings(amostra["person_id"]) <= 1:
+        raise HTTPException(
+            409, "Esta é a última amostra da pessoa. Adicione outra antes de "
+                 "remover, ou exclua a pessoa inteira.")
+
+    db.delete_embedding(embedding_id)
+    if amostra["snapshot_path"]:
+        arq = (SNAP_BASE / amostra["snapshot_path"]).resolve()
+        if str(arq).startswith(str(SNAP_BASE)) and arq.is_file():
+            arq.unlink(missing_ok=True)
+    return {"deleted": embedding_id,
+            "restantes": db.count_embeddings(amostra["person_id"])}
 
 
 @app.get("/events")

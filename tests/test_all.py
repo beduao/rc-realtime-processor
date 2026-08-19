@@ -734,6 +734,175 @@ def cadastro_usa_o_frame_do_worker_quando_ele_esta_no_ar():
             "frame velho é descartado")
 
 
+def _api_cliente(nome="api"):
+    """Sobe a API com engine falsa e frame vindo de 'worker'. Devolve (client, cfg)."""
+    import importlib
+    import core.config as cc
+    import core.face_engine as fe
+
+    pasta = os.path.join(TMP, nome)
+    os.makedirs(pasta, exist_ok=True)
+    cfg = yaml.safe_load(open(os.path.join(RAIZ, "config.pi.example.yaml")))
+    cfg["storage"]["db_path"] = os.path.join(pasta, "dados.db")
+    cfg["storage"]["snapshots_dir"] = os.path.join(pasta, "snaps")
+    cfg["storage"]["live_path"] = os.path.join(pasta, "live.jpg")
+    caminho = os.path.join(pasta, "cfg.yaml")
+    yaml.safe_dump(cfg, open(caminho, "w"))
+    os.environ["FACIAL_CONFIG"] = caminho
+    cc._cache = None
+
+    class E:
+        cosine_threshold = 0.5
+
+        def __init__(self, c=None):
+            self.k = 0
+
+        def detect(self, img):
+            return [face_em(200, 150, 120)]
+
+        def best_face(self, fs):
+            return fs[0] if fs else None
+
+        def embed(self, img, f):
+            self.k += 1
+            v = np.zeros(128, np.float32)
+            v[0] = 1.0
+            v[self.k % 40 + 1] = 0.05 * (self.k % 3)
+            return v / np.linalg.norm(v)
+
+        def match(self, v, m, ids):
+            if m is None or not len(ids):
+                return None, 0.0
+            s = m @ v
+            i = int(np.argmax(s))
+            return ids[i], float(s[i])
+
+    fe.FaceEngine = E
+    # o frame limpo do worker fica ao lado do live.jpg
+    cv2.imwrite(os.path.join(pasta, "facial-frame.jpg"),
+                np.random.RandomState(3).randint(0, 255, (480, 640, 3), dtype=np.uint8))
+
+    api = importlib.import_module("api")
+    importlib.reload(api)
+    from fastapi.testclient import TestClient
+    return TestClient(api.app), pasta
+
+
+@teste
+def api_gestao_de_amostras_por_pessoa():
+    """Ver, adicionar e excluir amostras, renomear, e cascata na exclusão."""
+    try:
+        import fastapi.testclient  # noqa: F401
+    except ImportError:
+        return "PULADO: fastapi.testclient indisponível"
+
+    c, pasta = _api_cliente("amostras")
+
+    # cadastro completo -> cada embedding com sua foto
+    sid = c.post("/enroll/start", json={"name": "Maria"}).json()["session_id"]
+    for _ in range(4):
+        assert c.post("/enroll/capture", json={"session_id": sid}).json()["ok"]
+    fin = c.post("/enroll/finish", json={"session_id": sid}).json()
+    pid = fin["id"]
+    assert fin["captured"] == 4
+    assert not os.path.isdir(os.path.join(pasta, "snaps", "enroll", sid)), \
+        "pasta temporária da sessão não foi limpa"
+
+    det = c.get(f"/people/{pid}/samples").json()
+    assert len(det["samples"]) == 4 and det["sem_foto"] == 0
+    for a in det["samples"]:
+        assert a["snapshot_url"] and "amostras/" in a["snapshot_url"], a
+        assert a["quality"] is not None, "nitidez não calculada"
+        assert a["similaridade_maxima"] is not None, "redundância não calculada"
+        assert c.get(a["snapshot_url"]).status_code == 200, a["snapshot_url"]
+
+    # reforçar cadastro depois
+    add = c.post(f"/people/{pid}/samples").json()
+    assert add["ok"] and add["total"] == 5, add
+
+    # excluir uma amostra some com o registro E com a foto
+    alvo = det["samples"][0]
+    arq = os.path.join(pasta, "snaps", alvo["snapshot_url"].split("/snapshots/")[1])
+    assert os.path.exists(arq)
+    r = c.delete(f"/embeddings/{alvo['id']}")
+    assert r.status_code == 200 and r.json()["restantes"] == 4, r.text
+    assert not os.path.exists(arq), "foto da amostra excluída ficou no disco"
+
+    # renomear, com validações
+    assert c.patch(f"/people/{pid}", json={"name": "Maria Silva"}).status_code == 200
+    assert c.patch(f"/people/{pid}", json={"name": "  "}).status_code == 400
+    assert c.patch("/people/99999", json={"name": "X"}).status_code == 404
+
+    # excluir a pessoa remove a pasta de amostras dela
+    dir_pessoa = os.path.join(pasta, "snaps", "amostras", str(pid))
+    assert os.path.isdir(dir_pessoa)
+    r = c.delete(f"/people/{pid}")
+    assert r.status_code == 200 and r.json()["fotos_removidas"] >= 1, r.text
+    assert not os.path.isdir(dir_pessoa), "pasta de amostras ficou no disco"
+    return ("cadastro com foto por amostra, nitidez, redundância, reforço, "
+            "exclusão individual e cascata")
+
+
+@teste
+def api_trava_a_exclusao_da_ultima_amostra():
+    """Pessoa sem embedding nunca seria reconhecida, mas seguiria na lista."""
+    try:
+        import fastapi.testclient  # noqa: F401
+    except ImportError:
+        return "PULADO: fastapi.testclient indisponível"
+
+    c, _ = _api_cliente("ultima")
+    sid = c.post("/enroll/start", json={"name": "Solo"}).json()["session_id"]
+    assert c.post("/enroll/capture", json={"session_id": sid}).json()["ok"]
+    pid = c.post("/enroll/finish", json={"session_id": sid}).json()["id"]
+
+    unica = c.get(f"/people/{pid}/samples").json()["samples"][0]["id"]
+    r = c.delete(f"/embeddings/{unica}")
+    assert r.status_code == 409, f"deveria recusar com 409, veio {r.status_code}"
+    assert "última" in r.json()["detail"].lower(), r.json()
+    assert c.get(f"/people/{pid}/samples").json()["samples"], "apagou mesmo assim"
+    return "409 ao tentar remover a única amostra; cadastro preservado"
+
+
+@teste
+def api_migra_banco_antigo_sem_perder_cadastro():
+    """Banco criado antes das colunas novas precisa continuar funcionando."""
+    import sqlite3
+    pasta = os.path.join(TMP, "migracao")
+    os.makedirs(pasta, exist_ok=True)
+    caminho = os.path.join(pasta, "velho.db")
+
+    con = sqlite3.connect(caminho)
+    con.executescript("""
+        CREATE TABLE people (id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL, created_at REAL NOT NULL);
+        CREATE TABLE embeddings (id INTEGER PRIMARY KEY AUTOINCREMENT,
+            person_id INTEGER NOT NULL, vec BLOB NOT NULL);
+        CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, person_id INTEGER,
+            name TEXT NOT NULL, score REAL NOT NULL, ts REAL NOT NULL,
+            snapshot_path TEXT, is_known INTEGER NOT NULL);
+    """)
+    v = np.ones(128, np.float32)
+    v /= np.linalg.norm(v)
+    con.execute("INSERT INTO people(name,created_at) VALUES('Antiga',?)", (time.time(),))
+    con.execute("INSERT INTO embeddings(person_id,vec) VALUES(1,?)", (v.tobytes(),))
+    con.commit()
+    con.close()
+
+    from core.database import Database
+    db = Database(caminho)                      # dispara a migração
+    pessoas = db.list_people()
+    assert len(pessoas) == 1 and pessoas[0]["embeddings"] == 1, pessoas
+    amostras = db.list_embeddings(pessoas[0]["id"])
+    assert len(amostras) == 1 and amostras[0]["snapshot_path"] is None
+    assert np.allclose(amostras[0]["vec"], v), "vetor antigo corrompido"
+    # e o banco migrado aceita os campos novos
+    eid = db.add_embedding(pessoas[0]["id"], v, "amostras/1/x.jpg", 123.4)
+    nova = [a for a in db.list_embeddings(pessoas[0]["id"]) if a["id"] == eid][0]
+    assert nova["snapshot_path"] == "amostras/1/x.jpg" and nova["quality"] == 123.4
+    return "cadastro e vetor preservados; colunas novas adicionadas sem perda"
+
+
 @teste
 def monitor_identifica_o_worker_sem_falso_positivo():
     """Casar a substring 'worker.py' na linha de comando pega o shell errado."""
