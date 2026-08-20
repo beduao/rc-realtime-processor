@@ -22,12 +22,20 @@ from core.config import load_config  # noqa: E402
 cfg = load_config()
 API = cfg.api.base_url.rstrip("/")
 
+# Sessão única com o token, quando configurado. Se a API do Pi exigir token e
+# o config DESTE computador não tiver, as chamadas voltam 401 — os dois
+# arquivos precisam do mesmo valor em api.token.
+S = requests.Session()
+_token = str((cfg.get("api") or {}).get("token") or "").strip()
+if _token:
+    S.headers["X-API-Token"] = _token
+
 st.set_page_config(page_title="Reconhecimento Facial", page_icon="📷", layout="wide")
 
 
 def api_up() -> bool:
     try:
-        return requests.get(f"{API}/health", timeout=3).ok
+        return S.get(f"{API}/health", timeout=3).ok
     except requests.RequestException:
         return False
 
@@ -57,7 +65,7 @@ if page == "Cadastrar":
         name = st.text_input("Nome")
         if st.button("Iniciar cadastro", type="primary", disabled=not name.strip()):
             try:
-                r = requests.post(f"{API}/enroll/start", json={"name": name.strip()}, timeout=30)
+                r = S.post(f"{API}/enroll/start", json={"name": name.strip()}, timeout=30)
             except requests.RequestException as exc:
                 st.error(f"Falha ao falar com a API: {exc}")
             else:
@@ -89,7 +97,7 @@ if page == "Cadastrar":
             if st.button(f"📸 Capturar amostra {n + 1}", type="primary",
                          disabled=n >= target, width="stretch"):
                 try:
-                    r = requests.post(f"{API}/enroll/capture",
+                    r = S.post(f"{API}/enroll/capture",
                                       json={"session_id": ss.enroll_session}, timeout=30)
                     data = r.json()
                 except requests.RequestException as exc:
@@ -108,7 +116,7 @@ if page == "Cadastrar":
             for s in ss.samples:
                 st.image(f"{API}{s['snapshot_url']}", width=110)
                 if st.button("🗑 remover", key=f"rm-{s['index']}"):
-                    r = requests.post(f"{API}/enroll/sample/delete",
+                    r = S.post(f"{API}/enroll/sample/delete",
                                       json={"session_id": ss.enroll_session, "index": s["index"]},
                                       timeout=30)
                     if r.ok:
@@ -118,7 +126,7 @@ if page == "Cadastrar":
         st.divider()
         c1, c2 = st.columns(2)
         if c1.button("✅ Concluir cadastro", type="primary", disabled=n < 1, width="stretch"):
-            r = requests.post(f"{API}/enroll/finish",
+            r = S.post(f"{API}/enroll/finish",
                               json={"session_id": ss.enroll_session}, timeout=30)
             if r.ok:
                 st.success(f"{ss.enroll_name} cadastrado(a) com {r.json()['captured']} amostras.")
@@ -127,7 +135,7 @@ if page == "Cadastrar":
             else:
                 st.error(r.json().get("detail", r.text))
         if c2.button("Cancelar", width="stretch"):
-            requests.post(f"{API}/enroll/cancel", json={"session_id": ss.enroll_session}, timeout=30)
+            S.post(f"{API}/enroll/cancel", json={"session_id": ss.enroll_session}, timeout=30)
             ss.enroll_session = None
             ss.samples = []
             st.rerun()
@@ -142,7 +150,7 @@ elif page == "Reconhecimentos":
         st.rerun()
 
     try:
-        events = requests.get(f"{API}/events", params={"limit": int(limit)}, timeout=10).json()
+        events = S.get(f"{API}/events", params={"limit": int(limit)}, timeout=10).json()
     except requests.RequestException as exc:
         st.error(f"Falha ao buscar eventos: {exc}")
         events = []
@@ -169,10 +177,12 @@ elif page == "Pessoas":
     LIMITE_REDUNDANCIA = 0.95
 
     try:
-        people = requests.get(f"{API}/people", timeout=10).json()
+        rp = S.get(f"{API}/people", timeout=10)
+        rp.raise_for_status()
+        people = rp.json()
     except requests.RequestException as exc:
         st.error(f"Falha ao buscar pessoas: {exc}")
-        people = []
+        st.stop()
 
     if not people:
         st.info("Ninguém cadastrado ainda. Vá em **Cadastrar**.")
@@ -181,7 +191,7 @@ elif page == "Pessoas":
     # O worker publica o frame que a API usa no preview. Sem ele rodando, não
     # há como capturar amostra nova — melhor avisar do que mostrar imagem quebrada.
     try:
-        saude = requests.get(f"{API}/health", timeout=5).json()
+        saude = S.get(f"{API}/health", timeout=5).json()
     except requests.RequestException:
         saude = {}
     camera_viva = bool(saude.get("worker_mode"))
@@ -193,19 +203,52 @@ elif page == "Pessoas":
     p = rotulos[escolhido]
 
     try:
-        dados = requests.get(f"{API}/people/{p['id']}/samples", timeout=15).json()
+        r = S.get(f"{API}/people/{p['id']}/samples", timeout=15)
     except requests.RequestException as exc:
         st.error(f"Falha ao buscar amostras: {exc}")
         st.stop()
 
+    # Verificar o status é essencial aqui: sem isso um 404 (API numa versão
+    # antiga, sem este endpoint) viraria "nenhuma amostra" e esconderia a causa.
+    if r.status_code == 404 and "Not Found" in r.text:
+        st.error(
+            "A API do Pi não tem o endpoint de amostras — ela está rodando uma "
+            "versão anterior do código.\n\n"
+            "No Raspberry Pi:\n"
+            "```\ngit pull\nsudo systemctl restart facial-api facial-worker\n```")
+        st.caption(f"Conferir direto: {API}/people/{p['id']}/samples")
+        st.stop()
+    if not r.ok:
+        st.error(f"A API respondeu {r.status_code}: "
+                 f"{r.json().get('detail', r.text) if r.text else '(vazio)'}")
+        st.stop()
+
+    dados = r.json()
     amostras = dados.get("samples", [])
     if dados.get("sem_foto"):
-        st.caption(f"{dados['sem_foto']} amostra(s) foram cadastradas antes desta "
-                   "versão e não têm foto guardada. Elas continuam valendo para o "
-                   "reconhecimento — só não é possível revisá-las visualmente.")
+        st.warning(
+            f"**{dados['sem_foto']} amostra(s) sem foto guardada.** Elas continuam "
+            "valendo para o reconhecimento, mas não é possível revisá-las aqui.\n\n"
+            "Isso acontece quando o cadastro foi feito **antes** de a API do Pi ser "
+            "atualizada. Se este cadastro é recente e a API já está atualizada, "
+            "verifique no Pi se a gravação da foto falhou:\n\n"
+            "```\nsudo journalctl -u facial-api | grep 'não movi o recorte'\n```\n"
+            "Para ter as fotos: use **Reforçar cadastro** abaixo para criar "
+            "amostras novas e depois exclua as antigas, ou remova a pessoa e "
+            "cadastre de novo.")
 
     # --- grade de amostras -------------------------------------------------- #
     st.subheader("Amostras")
+    if not amostras:
+        # Não deveria acontecer: /people contou embeddings para esta pessoa.
+        # Se cair aqui, banco e API estão vendo arquivos diferentes.
+        st.error(
+            f"A API não retornou amostras, mas a lista de pessoas diz que "
+            f"**{p['embeddings']}** existem. Isso indica que a API e o painel "
+            "estão olhando bancos diferentes, ou que a API é de uma versão antiga.")
+        st.caption(f"Conferir direto no navegador: {API}/people/{p['id']}/samples")
+        st.stop()
+
     colunas = st.columns(4)
     for i, a in enumerate(amostras):
         col = colunas[i % 4]
@@ -230,7 +273,7 @@ elif page == "Pessoas":
                 st.caption(f"similaridade máx. {sim:.2f}")
 
             if st.button("Excluir", key=f"delemb-{a['id']}"):
-                r = requests.delete(f"{API}/embeddings/{a['id']}", timeout=15)
+                r = S.delete(f"{API}/embeddings/{a['id']}", timeout=15)
                 if r.ok:
                     st.rerun()
                 else:
@@ -262,7 +305,7 @@ elif page == "Pessoas":
             if st.button("Capturar nova amostra", type="primary",
                          key=f"add-{p['id']}"):
                 try:
-                    r = requests.post(f"{API}/people/{p['id']}/samples", timeout=30)
+                    r = S.post(f"{API}/people/{p['id']}/samples", timeout=30)
                     data = r.json()
                 except requests.RequestException as exc:
                     st.error(f"Falha: {exc}")
@@ -287,7 +330,7 @@ elif page == "Pessoas":
         novo = st.text_input("Nome", value=p["name"], key=f"nome-{p['id']}")
         if st.button("Renomear", key=f"ren-{p['id']}",
                      disabled=not novo.strip() or novo.strip() == p["name"]):
-            r = requests.patch(f"{API}/people/{p['id']}",
+            r = S.patch(f"{API}/people/{p['id']}",
                                json={"name": novo.strip()}, timeout=10)
             if r.ok:
                 st.rerun()
@@ -297,7 +340,7 @@ elif page == "Pessoas":
         st.caption("Apaga a pessoa, as amostras e as fotos dela. O histórico de "
                    "reconhecimentos é mantido.")
         if st.button("Remover pessoa", key=f"del-{p['id']}"):
-            r = requests.delete(f"{API}/people/{p['id']}", timeout=15)
+            r = S.delete(f"{API}/people/{p['id']}", timeout=15)
             if r.ok:
                 st.rerun()
             else:

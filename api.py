@@ -21,6 +21,7 @@ Subir com:  uvicorn api:app --host 0.0.0.0 --port 8000
 """
 
 import json
+import secrets
 import shutil
 import threading
 import time
@@ -28,7 +29,7 @@ import uuid
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
@@ -52,7 +53,39 @@ FRAME_PATH = frame_image_path(cfg)
 FRAME_MAX_AGE = 5.0        # acima disso o frame do worker é velho demais
 ENROLL_TARGET = int(cfg.enroll.frames_to_capture)  # amostras sugeridas por pessoa
 
-app = FastAPI(title="Reconhecimento Facial — API")
+# --------------------------------------------------------------------------- #
+# Autenticação opcional por token.
+#
+# Sem `api.token` no config.yaml, nada muda — a API segue aberta, como sempre.
+# Definindo o token, TODAS as rotas passam a exigi-lo, exceto /health (que
+# precisa ficar aberta para monitoramento e para o painel detectar a API).
+# É opcional porque ligar de repente trancaria o painel; e existe porque um
+# endpoint que devolve nomes de crianças por HTTP não deveria ficar sem
+# nenhuma barreira quando for consumido por outro sistema.
+# --------------------------------------------------------------------------- #
+API_TOKEN = str((cfg.get("api") or {}).get("token") or "").strip()
+
+
+ROTAS_ABERTAS = {"/health", "/docs", "/openapi.json", "/redoc"}
+
+
+def exigir_token(request: Request,
+                 x_api_token: str = Header(default=""),
+                 authorization: str = Header(default="")):
+    if not API_TOKEN or request.url.path in ROTAS_ABERTAS:
+        return
+    fornecido = x_api_token or ""
+    if not fornecido and authorization.lower().startswith("bearer "):
+        fornecido = authorization[7:]
+    # compare_digest evita vazar informação pelo tempo de comparação
+    if not secrets.compare_digest(fornecido, API_TOKEN):
+        raise HTTPException(
+            401, "Token ausente ou inválido. Envie o cabeçalho "
+                 "'X-API-Token: <token>' ou 'Authorization: Bearer <token>'.")
+
+
+app = FastAPI(title="Reconhecimento Facial — API",
+              dependencies=[Depends(exigir_token)])
 
 # ---- estado das sessões de cadastro --------------------------------------- #
 _lock = threading.Lock()
@@ -442,6 +475,108 @@ def delete_sample(embedding_id: int):
 @app.get("/events")
 def events(limit: int = Query(50, ge=1, le=500)):
     return db.list_events(limit)
+
+
+def _janela(dia: str, inicio: str, fim: str):
+    """Converte dia + horas em uma janela de timestamps no fuso LOCAL do Pi.
+
+    O fuso importa: o consumidor precisa saber a que 'dia' os dados se referem,
+    e comparar horário local com UTC produziria chamada de outro dia perto da
+    meia-noite. Devolvemos também os limites em ISO para o outro sistema poder
+    conferir o que foi consultado.
+    """
+    if dia:
+        try:
+            d = time.strptime(dia, "%Y-%m-%d")
+        except ValueError:
+            raise HTTPException(400, "Parâmetro 'dia' inválido. Use AAAA-MM-DD.")
+        base = (d.tm_year, d.tm_mon, d.tm_mday)
+    else:
+        agora = time.localtime()
+        base = (agora.tm_year, agora.tm_mon, agora.tm_mday)
+
+    def hora(texto, padrao):
+        if not texto:
+            return padrao
+        try:
+            h, _, m = texto.partition(":")
+            h, m = int(h), int(m or 0)
+            if not (0 <= h <= 23 and 0 <= m <= 59):
+                raise ValueError
+            return h, m
+        except ValueError:
+            raise HTTPException(400, f"Horário inválido: {texto!r}. Use HH:MM.")
+
+    h0, m0 = hora(inicio, (0, 0))
+    h1, m1 = hora(fim, (23, 59))
+    t0 = time.mktime((*base, h0, m0, 0, 0, 0, -1))
+    t1 = time.mktime((*base, h1, m1, 59, 0, 0, -1))
+    if t1 <= t0:
+        raise HTTPException(400, "'fim' precisa ser depois de 'inicio'.")
+    return t0, t1
+
+
+@app.get("/attendance")
+def attendance(dia: str = Query("", description="AAAA-MM-DD; vazio = hoje"),
+               inicio: str = Query("", description="HH:MM; vazio = 00:00"),
+               fim: str = Query("", description="HH:MM; vazio = 23:59")):
+    """Chamada do período, para consumo por outro sistema.
+
+    Pontos de atenção para quem integra:
+
+    `completo`  — false quando ainda há trilhas aguardando reconhecimento. A
+      chamada está INCOMPLETA nesse caso: quem consumir e marcar falta vai
+      marcar falta de quem talvez esteja na fila. Sempre verifique este campo
+      antes de gravar ausência.
+
+    `nao_identificados` — pessoas cadastradas que não foram vistas na janela.
+      NÃO é o mesmo que ausente: pode ser falha de captura, criança que passou
+      fora do enquadramento, ou reconhecimento que não atingiu o limiar. A
+      decisão de transformar isso em falta é do outro sistema, e deveria passar
+      por conferência humana.
+
+    `person_id` é o identificador interno deste sistema. Casar por nome é
+      frágil (homônimos, acentuação, digitação); para integração de verdade,
+      convém guardar a matrícula do aluno aqui e casar por ela.
+    """
+    t0, t1 = _janela(dia, inicio, fim)
+    presentes = db.attendance(t0, t1)
+    todos = db.list_people()
+    vistos = {l["person_id"] for l in presentes}
+    pendentes = db.count_tracks_by_status().get("pendente", 0)
+
+    return {
+        "periodo": {
+            "dia": time.strftime("%Y-%m-%d", time.localtime(t0)),
+            "inicio": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(t0)),
+            "fim": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(t1)),
+            "fuso": time.strftime("%Z", time.localtime(t0)),
+        },
+        "completo": pendentes == 0,
+        "trilhas_pendentes": pendentes,
+        "total_cadastrados": len(todos),
+        "total_presentes": len(presentes),
+        "presentes": [
+            {
+                "person_id": l["person_id"],
+                "nome": l["name"],
+                "primeira_vez": time.strftime("%Y-%m-%dT%H:%M:%S%z",
+                                              time.localtime(l["primeira"])),
+                "ultima_vez": time.strftime("%Y-%m-%dT%H:%M:%S%z",
+                                            time.localtime(l["ultima"])),
+                "passagens": l["passagens"],
+                "melhor_score": round(l["melhor_score"], 3),
+                "fontes": (l["fontes"] or "").split(","),
+            }
+            for l in presentes
+        ],
+        "nao_identificados": [
+            {"person_id": p["id"], "nome": p["name"]}
+            for p in todos if p["id"] not in vistos
+        ],
+        "aviso": ("'nao_identificados' não significa ausente — confira antes de "
+                  "registrar falta." if len(presentes) < len(todos) else None),
+    }
 
 
 @app.get("/snapshots/{path:path}")

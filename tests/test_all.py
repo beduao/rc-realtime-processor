@@ -904,6 +904,108 @@ def api_migra_banco_antigo_sem_perder_cadastro():
 
 
 @teste
+def api_presenca_une_as_duas_origens_e_avisa_quando_incompleta():
+    """O endpoint de chamada, com os pontos que um integrador precisa confiar."""
+    try:
+        import fastapi.testclient  # noqa: F401
+    except ImportError:
+        return "PULADO: fastapi.testclient indisponível"
+
+    c, pasta = _api_cliente("presenca")
+    from core.database import Database
+    db = Database(os.path.join(pasta, "dados.db"))
+
+    ana = db.add_person("Ana")
+    bruno = db.add_person("Bruno")
+    db.add_person("Carla")                       # cadastrada, não aparece
+
+    hoje = time.localtime()
+    meia = time.mktime((hoje.tm_year, hoje.tm_mon, hoje.tm_mday, 0, 0, 0, 0, 0, -1))
+    crop = [{"path": "x.jpg", "quality": 1.0, "face": "[]"}]
+
+    # Ana vem do modo CAPTURA (trilha processada), 2 passagens
+    for h in (7.5, 7.7):
+        tid = db.add_track(meia + h * 3600, meia + h * 3600 + 1, 9, crop)
+        db.resolve_track(tid, ana, "Ana", 0.81, "[]")
+    # Bruno vem do modo REALTIME (evento) — a versão antiga do attendance()
+    # ignorava esta origem e devolveria chamada sem ele
+    db.add_event(bruno, "Bruno", 0.74, "b.jpg", 1)
+
+    r = c.get("/attendance")
+    assert r.status_code == 200, r.text
+    d = r.json()
+    nomes = {p["nome"] for p in d["presentes"]}
+    assert nomes == {"Ana", "Bruno"}, f"origens não unidas: {nomes}"
+    ana_linha = next(p for p in d["presentes"] if p["nome"] == "Ana")
+    assert ana_linha["passagens"] == 2 and "captura" in ana_linha["fontes"]
+    bruno_linha = next(p for p in d["presentes"] if p["nome"] == "Bruno")
+    assert "realtime" in bruno_linha["fontes"], bruno_linha
+    assert [n["nome"] for n in d["nao_identificados"]] == ["Carla"]
+    assert d["completo"] is True and d["trilhas_pendentes"] == 0
+    assert d["total_cadastrados"] == 3 and d["total_presentes"] == 2
+    assert d["aviso"], "deveria avisar que 'não identificado' não é ausente"
+
+    # trilha pendente => chamada INCOMPLETA (o campo mais importante)
+    db.add_track(meia + 8 * 3600, meia + 8 * 3600 + 1, 5, crop)
+    d2 = c.get("/attendance").json()
+    assert d2["completo"] is False and d2["trilhas_pendentes"] == 1, d2
+
+    # janela de horário: Ana entrou 7:30, filtro a partir das 7:45 a exclui
+    d3 = c.get("/attendance", params={"inicio": "07:45"}).json()
+    assert "Ana" not in {p["nome"] for p in d3["presentes"]}, d3["presentes"]
+
+    # validações de entrada
+    assert c.get("/attendance", params={"dia": "20/08/2026"}).status_code == 400
+    assert c.get("/attendance", params={"inicio": "25:00"}).status_code == 400
+    assert c.get("/attendance", params={"inicio": "10:00", "fim": "09:00"}).status_code == 400
+
+    # dia sem movimento devolve estrutura válida e vazia, não erro
+    d4 = c.get("/attendance", params={"dia": "2020-01-01"}).json()
+    assert d4["total_presentes"] == 0 and len(d4["nao_identificados"]) == 3
+    assert d4["periodo"]["dia"] == "2020-01-01"
+    return ("une captura+realtime, sinaliza chamada incompleta, filtra por "
+            "horário e recusa entrada inválida")
+
+
+@teste
+def api_token_opcional_protege_sem_trancar_o_health():
+    try:
+        import fastapi.testclient  # noqa: F401
+    except ImportError:
+        return "PULADO: fastapi.testclient indisponível"
+    import importlib
+    import core.config as cc
+
+    pasta = os.path.join(TMP, "token")
+    os.makedirs(pasta, exist_ok=True)
+    cfg = yaml.safe_load(open(os.path.join(RAIZ, "config.pi.example.yaml")))
+    cfg["storage"]["db_path"] = os.path.join(pasta, "dados.db")
+    cfg["storage"]["snapshots_dir"] = os.path.join(pasta, "snaps")
+    cfg["storage"]["live_path"] = os.path.join(pasta, "live.jpg")
+    cfg["api"]["token"] = "segredo-de-teste"
+    caminho = os.path.join(pasta, "cfg.yaml")
+    yaml.safe_dump(cfg, open(caminho, "w"))
+    os.environ["FACIAL_CONFIG"] = caminho
+    cc._cache = None
+
+    import core.face_engine as fe
+    fe.FaceEngine = lambda c=None: type("E", (), {"cosine_threshold": 0.5})()
+    api = importlib.import_module("api")
+    importlib.reload(api)
+    from fastapi.testclient import TestClient
+    c = TestClient(api.app)
+
+    assert c.get("/health").status_code == 200, "/health não pode exigir token"
+    assert c.get("/people").status_code == 401, "rota protegida aceitou sem token"
+    assert c.get("/attendance").status_code == 401
+    assert c.get("/people", headers={"X-API-Token": "errado"}).status_code == 401
+    assert c.get("/people", headers={"X-API-Token": "segredo-de-teste"}).status_code == 200
+    assert c.get("/people",
+                 headers={"Authorization": "Bearer segredo-de-teste"}).status_code == 200
+    return "health aberto; token exigido via X-API-Token e Bearer; token errado = 401"
+
+
+@teste
 def monitor_identifica_o_worker_sem_falso_positivo():
     """Casar a substring 'worker.py' na linha de comando pega o shell errado."""
     from scripts.monitor import _e_o_worker, explicar_throttled

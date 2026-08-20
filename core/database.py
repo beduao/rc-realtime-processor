@@ -317,22 +317,40 @@ class Database:
 
         Para chamada o que importa é "foi vista pelo menos uma vez", não quantas
         vezes passou — por isso agrupa por pessoa e devolve a primeira aparição.
+
+        Une as DUAS origens possíveis, porque cada modo do worker grava em lugar
+        diferente e ignorar uma delas devolveria chamada vazia:
+          - modo captura  -> tabela `tracks` (reconhecimento em lote);
+          - modo realtime -> tabela `events` (reconhecimento na hora).
+        A coluna `fontes` diz de onde veio cada pessoa, o que ajuda a auditar
+        quando os dois modos foram usados no mesmo dia.
         """
         with self._connect() as con:
             rows = con.execute(
                 """
-                SELECT t.person_id, t.name,
-                       MIN(t.started_at) AS primeira,
-                       MAX(t.ended_at)   AS ultima,
-                       COUNT(*)          AS passagens,
-                       MAX(t.score)      AS melhor_score
-                FROM tracks t
-                WHERE t.status = 'processado' AND t.person_id IS NOT NULL
-                  AND t.started_at >= ? AND t.started_at < ?
-                GROUP BY t.person_id
+                SELECT person_id, name,
+                       MIN(ts)                        AS primeira,
+                       MAX(fim)                       AS ultima,
+                       COUNT(*)                       AS passagens,
+                       MAX(score)                     AS melhor_score,
+                       GROUP_CONCAT(DISTINCT fonte)   AS fontes
+                FROM (
+                    SELECT person_id, name, started_at AS ts, ended_at AS fim,
+                           score, 'captura' AS fonte
+                    FROM tracks
+                    WHERE status = 'processado' AND person_id IS NOT NULL
+                      AND started_at >= ? AND started_at < ?
+                    UNION ALL
+                    SELECT person_id, name, ts, ts AS fim,
+                           score, 'realtime' AS fonte
+                    FROM events
+                    WHERE is_known = 1 AND person_id IS NOT NULL
+                      AND ts >= ? AND ts < ?
+                )
+                GROUP BY person_id
                 ORDER BY primeira
                 """,
-                (day_start, day_end),
+                (day_start, day_end, day_start, day_end),
             ).fetchall()
         return [dict(r) for r in rows]
 

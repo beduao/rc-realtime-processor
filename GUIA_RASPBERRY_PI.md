@@ -574,6 +574,68 @@ antigas podem ser reavaliadas — nada foi perdido, os recortes continuam lá.
 > lista essas pessoas separadamente, e vale conferir as trilhas marcadas como
 > "Desconhecido" antes de fechar a chamada.
 
+## 6.6 Integração: endpoint de presença
+
+Para outro sistema (acadêmico, planilha, script) buscar a chamada:
+
+```
+GET http://IP_DO_PI:8000/attendance
+GET http://IP_DO_PI:8000/attendance?dia=2026-08-20
+GET http://IP_DO_PI:8000/attendance?dia=2026-08-20&inicio=07:00&fim=08:00
+```
+
+Três campos merecem atenção de quem for consumir:
+
+**`completo`** — vem `false` quando ainda há trilhas na fila de reconhecimento.
+A chamada está **incompleta** nesse caso. Quem gravar falta sem checar isso vai
+marcar falta de aluno que está apenas na fila. Este é o campo mais importante
+da resposta.
+
+**`nao_identificados`** — não é a mesma coisa que ausente. Pode ser falha de
+captura, criança que passou fora do enquadramento, ou score abaixo do limiar.
+Transformar isso em falta é decisão do outro sistema, e deveria passar por
+conferência humana.
+
+**`person_id`** — identificador interno deste sistema. Casar por **nome** é
+frágil: homônimos, acentuação e digitação divergente quebram a associação. Para
+integração de verdade, o próximo passo é guardar a matrícula do aluno aqui e
+casar por ela.
+
+A resposta une as duas origens possíveis — trilhas do modo captura e eventos do
+modo realtime — e o campo `fontes` de cada pessoa diz de onde veio. Isso importa
+porque cada modo grava em tabela diferente: ler só uma delas devolveria chamada
+vazia dependendo do modo em uso naquele dia.
+
+### Protegendo o acesso
+
+A API nasceu sem autenticação. Como este endpoint devolve nomes de crianças com
+horário, há agora um token opcional. No `config.yaml` do Pi:
+
+```yaml
+api:
+  token: "cole-aqui-um-valor-forte"
+```
+
+Gere o valor com:
+
+```bash
+python -c "import secrets;print(secrets.token_urlsafe(32))"
+```
+
+Com o token preenchido, **todas** as rotas passam a exigir o cabeçalho
+`X-API-Token` (ou `Authorization: Bearer`), exceto `/health`, que fica aberta
+para monitoramento:
+
+```bash
+curl -H "X-API-Token: SEU_TOKEN" http://IP_DO_PI:8000/attendance
+```
+
+> ⚠️ Dois avisos. O `config.yaml` **do PC** precisa do mesmo token, senão o
+> painel passa a receber 401. E token sobre HTTP simples trafega em texto claro
+> na rede — em rede de escola compartilhada, isso protege contra acesso casual,
+> não contra quem esteja capturando tráfego. HTTPS resolveria, e fica na lista
+> de pendências.
+
 ## 7. Calibrar o limiar de reconhecimento
 
 `recognition.cosine_threshold: 0.363` é o valor de referência do SFace, não uma

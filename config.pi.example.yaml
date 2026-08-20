@@ -23,6 +23,15 @@ camera:
 api:
   host: "0.0.0.0"
   port: 8000
+  # Token de acesso. VAZIO = API aberta (comportamento padrão).
+  # Preenchido, TODAS as rotas passam a exigir o cabeçalho
+  #   X-API-Token: <token>        (ou Authorization: Bearer <token>)
+  # exceto /health, que fica aberta para monitoramento.
+  # Gere um valor forte com:  python -c "import secrets;print(secrets.token_urlsafe(32))"
+  # ATENÇÃO: o config do PC (painel) precisa do MESMO valor, senão o painel
+  # recebe 401. E token só protege de verdade sobre HTTPS — em rede local
+  # aberta ele ainda trafega em texto claro.
+  token: ""
   # No Pi a API fala consigo mesma. O PAINEL (no seu PC) usa o IP do Pi
   # no config.yaml DELE — não aqui.
   base_url: "http://localhost:8000"
