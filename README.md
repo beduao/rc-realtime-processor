@@ -49,6 +49,7 @@ Câmera Intelbras ──RTSP──► worker.py ──┐
 | `install_pi.sh` | Instalação automatizada no Raspberry Pi |
 | `config.pi.example.yaml` | Preset de configuração para Pi 3B |
 | **[`GUIA_RASPBERRY_PI.md`](GUIA_RASPBERRY_PI.md)** | **Guia completo do Pi + câmera Intelbras** |
+| **[`ARQUITETURA.md`](ARQUITETURA.md)** | **Algoritmos, estruturas de dados e decisões do `core/`** |
 
 ---
 
