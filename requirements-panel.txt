@@ -1,4 +1,4 @@
-# Painel web (Streamlit). Roda no Mac (Fase 1) ou no PC (Fase 2).
+# Painel web (Streamlit). Roda no seu computador (Windows, Linux ou macOS).
 # Cliente HTTP fino: NÃO precisa de OpenCV.
 streamlit
 requests

@@ -6,7 +6,7 @@ câmera IP Intelbras (RTSP). Cada passagem é registrada com **foto + horário**
 - **Engine:** YuNet (detecção) + SFace (reconhecimento) via OpenCV DNN — leve,
   roda em CPU, sem GPU/dlib/onnxruntime. Pensado para o **Raspberry Pi 3B**.
 - **Painel web:** Streamlit (cadastro ao vivo, histórico, gestão de pessoas).
-- **Duas fases:** (1) testar **tudo no Mac**; (2) exportar **o mesmo código**
+- **Duas fases:** (1) testar **tudo num computador só**; (2) exportar **o mesmo código**
   para o Pi, deixando só o painel no PC. A única mudança é `api.base_url`.
 
 ## Arquitetura
@@ -53,44 +53,55 @@ Câmera Intelbras ──RTSP──► worker.py ──┐
 
 ---
 
-## Fase 1 — rodar tudo no Mac
+## Fase 1 — rodar tudo no seu computador
 
-> ⚠️ Use **Python 3.11 ou 3.12**. O Python 3.14 do sistema ainda não tem wheels
-> de OpenCV. Instale com `brew install python@3.12`.
+Serve para testar sem o Raspberry Pi: worker, API e painel na mesma máquina.
+Funciona em **Windows, Linux ou macOS**.
+
+> ⚠️ Use **Python 3.11 ou mais recente**, baixado de
+> [python.org](https://www.python.org/downloads/) — no Windows, marque
+> **"Add python.exe to PATH"** no instalador. Evite a versão da Microsoft Store:
+> o atalho dela se comporta de forma estranha no Git Bash.
+
+**Windows** (PowerShell ou Git Bash, na pasta do projeto):
 
 ```bash
-cd ~/Desktop/reconhecimento_facial_ia
+# 1) ambiente virtual
+python -m venv .venv
+.venv\Scripts\activate            # PowerShell
+# source .venv/Scripts/activate   # Git Bash
 
-# 1) ambiente virtual com Python 3.12
-python3.12 -m venv .venv
-source .venv/bin/activate
-
-# 2) dependências (worker+API e painel no mesmo venv para testar local)
-pip install -r requirements-pi.txt -r requirements-panel.txt
+# 2) dependências (worker+API e painel no mesmo venv, para testar local)
+python -m pip install -r requirements-pi.txt -r requirements-panel.txt
 
 # 3) baixar os modelos
 python models/download_models.py
 
-# 4) configurar a câmera
-cp config.example.yaml config.yaml
-#   edite config.yaml: camera.rtsp_url (use o subtype=1) e mantenha
-#   api.base_url = http://localhost:8000
+# 4) configurar a fonte de vídeo
+copy config.example.yaml config.yaml
+#   edite config.yaml:
+#     câmera IP  -> camera.rtsp_url com a URL RTSP (use subtype=1)
+#     webcam     -> camera.rtsp_url: 0
+#   e mantenha api.base_url = http://localhost:8000
 
 # 5) testar a câmera
 python scripts/test_camera.py     # deve salvar data/test_frame.jpg
 ```
 
+**Linux ou macOS:** o mesmo, trocando `.venv\Scripts\activate` por
+`source .venv/bin/activate` e `copy` por `cp`.
+
 Agora abra **3 terminais** (com o venv ativado em cada um):
 
 ```bash
 # terminal A — API
-uvicorn api:app --host 0.0.0.0 --port 8000
+python -m uvicorn api:app --host 0.0.0.0 --port 8000
 
 # terminal B — worker (reconhecimento)
 python worker.py
 
 # terminal C — painel
-streamlit run panel/app.py        # abre http://localhost:8501
+python -m streamlit run panel/app.py    # abre http://localhost:8501
 ```
 
 No painel: **Cadastrar** uma pessoa, depois ver **Reconhecimentos** e **Ao vivo**.

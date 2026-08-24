@@ -1,4 +1,4 @@
-"""API HTTP (FastAPI) — roda junto do worker (no Pi, ou no Mac na Fase 1).
+"""API HTTP (FastAPI) — roda junto do worker (no Pi, ou no seu computador na Fase 1).
 
 Cadastro INTERATIVO por sessão (preview + captura individual das amostras):
 

@@ -1,6 +1,6 @@
 """Painel web (Streamlit) — cliente HTTP fino da API.
 
-Na Fase 1 roda no Mac apontando para http://localhost:8000.
+Na Fase 1 roda no seu computador apontando para http://localhost:8000.
 Na Fase 2 roda no PC; basta trocar api.base_url no config.yaml para o IP do Pi.
 Não usa OpenCV nem toca a câmera: tudo passa pela API.
 

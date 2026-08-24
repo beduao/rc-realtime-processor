@@ -1,4 +1,4 @@
-# Worker + API (roda no Raspberry Pi; e também no Mac na Fase 1).
+# Worker + API (roda no Raspberry Pi; e também no seu computador na Fase 1).
 #
 # IMPORTANTE — OpenCV: o detector YuNet "2023mar" usa formas de entrada
 # dinâmicas e SÓ carrega no OpenCV >= 4.8. O `python3-opencv` do apt no
