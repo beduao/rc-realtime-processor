@@ -574,6 +574,47 @@ antigas podem ser reavaliadas — nada foi perdido, os recortes continuam lá.
 > lista essas pessoas separadamente, e vale conferir as trilhas marcadas como
 > "Desconhecido" antes de fechar a chamada.
 
+## 6.55 A chamada no painel, com conferência humana
+
+No painel, aba **Chamada**. É onde a presença deixa de ser saída de máquina e
+passa a ser registro conferido.
+
+Escolha o dia, marque quem esteve presente e salve. A regra: **só as diferenças
+em relação ao que o sistema detectou são gravadas como correção**. Se você
+concorda com o reconhecimento, nada é escrito.
+
+Cada pessoa aparece com a origem da informação:
+
+| Marca | Significado |
+|---|---|
+| ✅ detectado | o reconhecimento identificou |
+| ✏️ marcado presente | você corrigiu: veio, mas o sistema não pegou |
+| ✏️ marcado ausente | você corrigiu: o sistema identificou por engano |
+| ❔ não identificado | não detectado e não corrigido |
+
+**Fechar a chamada** registra que uma pessoa conferiu. Depois disso ela aparece
+como `conferida: true` na API, e as correções ficam travadas até você reabrir.
+Só uma chamada conferida deveria alimentar falta em outro sistema.
+
+Duas travas: não dá para fechar com trilhas aguardando reconhecimento (fecharia
+incompleta), e não dá para corrigir uma chamada já fechada sem reabrir antes.
+
+### As correções medem o sistema
+
+Este é o efeito colateral mais útil da conferência. A correção nunca sobrescreve
+o que o reconhecimento detectou — fica gravada ao lado. Então a diferença entre
+os dois é a **taxa de erro medida**, por tipo:
+
+- presente marcado à mão = o sistema **deixou passar** (falso negativo)
+- ausente marcado à mão = o sistema **identificou errado** (falso positivo)
+
+O painel mostra esses números ao final da página, e o `recognize_batch.py
+--presenca` também. Acumulando alguns dias, eles dizem objetivamente se vale
+mexer no limiar, no enquadramento ou no cadastro — sem depender de impressão.
+
+É também o caminho mais barato para a medição de recall: conferir a chamada
+todos os dias produz o dado, sem ninguém precisar contar crianças com prancheta.
+
 ## 6.6 Integração: endpoint de presença
 
 Para outro sistema (acadêmico, planilha, script) buscar a chamada:

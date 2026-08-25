@@ -47,11 +47,186 @@ if api_up():
 else:
     st.sidebar.error("API offline — suba `uvicorn api:app` e o `worker.py`.")
 
-page = st.sidebar.radio("Menu", ["Cadastrar", "Reconhecimentos", "Pessoas", "Ao vivo"])
+page = st.sidebar.radio(
+    "Menu", ["Chamada", "Cadastrar", "Reconhecimentos", "Pessoas", "Ao vivo"])
 
 
 # --------------------------------------------------------------------------- #
-if page == "Cadastrar":
+if page == "Chamada":
+    import datetime
+
+    st.header("Chamada")
+    ss = st.session_state
+    ss.setdefault("autor", "")
+
+    c1, c2, c3 = st.columns([1, 1, 2])
+    dia = c1.date_input("Dia", value=datetime.date.today(), format="DD/MM/YYYY")
+    dia_iso = dia.strftime("%Y-%m-%d")
+    if c2.button("Atualizar", width="stretch"):
+        st.rerun()
+    ss.autor = c3.text_input(
+        "Quem está conferindo", value=ss.autor,
+        placeholder="seu nome",
+        help="Fica registrado na correção e no fechamento. Não é autenticação — "
+             "serve para saber quem conferiu.")
+
+    try:
+        r = S.get(f"{API}/attendance", params={"dia": dia_iso}, timeout=20)
+    except requests.RequestException as exc:
+        st.error(f"Falha ao falar com a API: {exc}")
+        st.stop()
+    if r.status_code == 404:
+        st.error("A API do Pi não tem o endpoint de chamada — versão antiga.\n\n"
+                 "No Pi: `git pull && sudo systemctl restart facial-api`")
+        st.stop()
+    if not r.ok:
+        st.error(f"A API respondeu {r.status_code}: {r.text}")
+        st.stop()
+
+    d = r.json()
+    presentes, ausentes = d["presentes"], d["ausentes"]
+    corr = d["correcoes"]
+
+    # --- estado da chamada -------------------------------------------------- #
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Presentes", d["total_presentes"], f"de {d['total_cadastrados']}")
+    m2.metric("Ausentes", len(ausentes))
+    m3.metric("Correções", corr["total"])
+    m4.metric("Situação", "Conferida" if d["conferida"] else "Em aberto")
+
+    if not d["completo"]:
+        st.error(f"**{d['trilhas_pendentes']} trilha(s) aguardando reconhecimento.** "
+                 "A chamada está incompleta — rode o lote antes de conferir:\n\n"
+                 "`python scripts/recognize_batch.py`")
+    if d["conferida"]:
+        f = d["fechamento"]
+        quando = f["em"][:16].replace("T", " às ")
+        st.success(f"Conferida em {quando}" +
+                   (f" por {f['autor']}" if f["autor"] else "") +
+                   ". Para alterar, reabra abaixo.")
+    else:
+        st.warning("Chamada **em aberto**. Quem não foi identificado pode ter "
+                   "passado sem ser detectado — confira antes de tratar como falta.")
+
+    st.divider()
+
+    # --- conferência -------------------------------------------------------- #
+    ICONES = {"automatico": "✅ detectado",
+              "manual_presente": "✏️ marcado presente",
+              "manual_ausente": "✏️ marcado ausente",
+              "nao_identificado": "❔ não identificado"}
+
+    def _linha(pessoa, marcado_default):
+        """Uma pessoa na conferência. Devolve o valor do checkbox."""
+        col_a, col_b = st.columns([1, 4])
+        valor = col_a.checkbox("presente", value=marcado_default,
+                               key=f"pres-{dia_iso}-{pessoa['person_id']}",
+                               label_visibility="collapsed",
+                               disabled=d["conferida"])
+        detalhe = [ICONES[pessoa["origem"]]]
+        if pessoa.get("primeira_vez"):
+            detalhe.append(pessoa["primeira_vez"][11:16])
+        if pessoa.get("melhor_score") is not None:
+            detalhe.append(f"score {pessoa['melhor_score']:.2f}")
+        if pessoa.get("correcao") and pessoa["correcao"]["motivo"]:
+            detalhe.append(f"motivo: {pessoa['correcao']['motivo']}")
+        col_b.markdown(f"**{pessoa['nome']}**  \n"
+                       f"<span style='color:gray;font-size:0.85em'>"
+                       f"{' · '.join(detalhe)}</span>", unsafe_allow_html=True)
+        return valor
+
+    with st.form(f"conferencia-{dia_iso}"):
+        st.caption("Marque quem esteve presente. Só as diferenças em relação ao "
+                   "que o sistema detectou são gravadas como correção.")
+
+        if presentes:
+            st.subheader(f"Presentes ({len(presentes)})")
+            marcados = {p["person_id"]: _linha(p, True) for p in presentes}
+        else:
+            marcados = {}
+            st.info("Ninguém registrado como presente neste dia.")
+
+        if ausentes:
+            st.subheader(f"Ausentes ({len(ausentes)})")
+            marcados.update({p["person_id"]: _linha(p, False) for p in ausentes})
+
+        motivo = st.text_input(
+            "Motivo das correções (opcional)",
+            placeholder="ex.: chegou antes da câmera ligar",
+            disabled=d["conferida"])
+        enviar = st.form_submit_button("Salvar correções", type="primary",
+                                       disabled=d["conferida"])
+
+    if enviar:
+        detectado = {p["person_id"]: p["detectado_pelo_sistema"]
+                     for p in presentes + ausentes}
+        criadas = removidas = 0
+        erros = []
+        for pid, marcado in marcados.items():
+            # Regra: correção existe só quando a pessoa discorda da máquina.
+            if marcado != detectado[pid]:
+                resp = S.post(f"{API}/attendance/override", timeout=15, json={
+                    "dia": dia_iso, "person_id": pid, "presente": marcado,
+                    "motivo": motivo, "autor": ss.autor})
+                criadas += 1 if resp.ok else 0
+                if not resp.ok:
+                    erros.append(f"{pid}: {resp.text}")
+            else:
+                resp = S.delete(f"{API}/attendance/override", timeout=15,
+                                params={"dia": dia_iso, "person_id": pid})
+                if resp.ok:
+                    removidas += resp.json().get("removidas", 0)
+        if erros:
+            st.error("Algumas correções falharam:\n\n" + "\n".join(erros))
+        else:
+            st.success(f"{criadas} correção(ões) gravada(s), "
+                       f"{removidas} desfeita(s).")
+            st.rerun()
+
+    st.divider()
+
+    # --- fechamento --------------------------------------------------------- #
+    if d["conferida"]:
+        st.caption("Reabrir permite corrigir de novo. O fechamento anterior é "
+                   "substituído.")
+        if st.button("Reabrir chamada"):
+            resp = S.delete(f"{API}/attendance/close", params={"dia": dia_iso},
+                            timeout=15)
+            if resp.ok:
+                st.rerun()
+            else:
+                st.error(resp.text)
+    else:
+        st.caption("Fechar registra que uma pessoa conferiu esta chamada. Só "
+                   "depois disso ela deveria alimentar falta em outro sistema.")
+        if st.button("Fechar chamada", type="primary",
+                     disabled=not d["completo"]):
+            resp = S.post(f"{API}/attendance/close", timeout=20,
+                          json={"dia": dia_iso, "autor": ss.autor})
+            if resp.ok:
+                st.rerun()
+            else:
+                st.error(resp.json().get("detail", resp.text))
+
+    # --- o que as correções dizem sobre o sistema --------------------------- #
+    if corr["total"]:
+        st.divider()
+        st.subheader("O que isso diz sobre o reconhecimento")
+        total_real = len(presentes)
+        perdidos = corr["marcados_presentes"]
+        errados = corr["marcados_ausentes"]
+        if total_real:
+            st.write(f"Neste dia o sistema **deixou passar {perdidos}** de "
+                     f"{total_real} presentes "
+                     f"({100 * perdidos / total_real:.0f}%) e "
+                     f"**identificou {errados} por engano**.")
+        st.caption("Cada correção sua é um erro medido do reconhecimento. "
+                   "Acumulando alguns dias, esses números dizem se vale ajustar "
+                   "o limiar, o enquadramento ou o cadastro.")
+
+
+# --------------------------------------------------------------------------- #
+elif page == "Cadastrar":
     st.header("Cadastrar pessoa (ao vivo)")
     ss = st.session_state
     ss.setdefault("enroll_session", None)

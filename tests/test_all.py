@@ -940,10 +940,14 @@ def api_presenca_une_as_duas_origens_e_avisa_quando_incompleta():
     assert ana_linha["passagens"] == 2 and "captura" in ana_linha["fontes"]
     bruno_linha = next(p for p in d["presentes"] if p["nome"] == "Bruno")
     assert "realtime" in bruno_linha["fontes"], bruno_linha
-    assert [n["nome"] for n in d["nao_identificados"]] == ["Carla"]
+    assert [n["nome"] for n in d["ausentes"]] == ["Carla"]
+    # quem não foi detectado aparece com origem explícita, não como "ausente" seco
+    assert d["ausentes"][0]["origem"] == "nao_identificado"
+    assert d["ausentes"][0]["detectado_pelo_sistema"] is False
     assert d["completo"] is True and d["trilhas_pendentes"] == 0
     assert d["total_cadastrados"] == 3 and d["total_presentes"] == 2
-    assert d["aviso"], "deveria avisar que 'não identificado' não é ausente"
+    assert d["conferida"] is False, "sem fechamento não pode constar como conferida"
+    assert d["aviso"], "chamada não conferida deve avisar"
 
     # trilha pendente => chamada INCOMPLETA (o campo mais importante)
     db.add_track(meia + 8 * 3600, meia + 8 * 3600 + 1, 5, crop)
@@ -961,10 +965,137 @@ def api_presenca_une_as_duas_origens_e_avisa_quando_incompleta():
 
     # dia sem movimento devolve estrutura válida e vazia, não erro
     d4 = c.get("/attendance", params={"dia": "2020-01-01"}).json()
-    assert d4["total_presentes"] == 0 and len(d4["nao_identificados"]) == 3
+    assert d4["total_presentes"] == 0 and len(d4["ausentes"]) == 3
     assert d4["periodo"]["dia"] == "2020-01-01"
     return ("une captura+realtime, sinaliza chamada incompleta, filtra por "
             "horário e recusa entrada inválida")
+
+
+@teste
+def api_chamada_correcao_manual_preserva_o_automatico():
+    """A correção não pode sobrescrever o que o reconhecimento detectou.
+
+    É dessa diferença que sai a medida de acerto do sistema: presente marcado
+    à mão = falso negativo; ausente marcado à mão = falso positivo.
+    """
+    try:
+        import fastapi.testclient  # noqa: F401
+    except ImportError:
+        return "PULADO: fastapi.testclient indisponível"
+
+    c, pasta = _api_cliente("chamada")
+    from core.database import Database
+    db = Database(os.path.join(pasta, "dados.db"))
+
+    ana = db.add_person("Ana")
+    bruno = db.add_person("Bruno")
+    carla = db.add_person("Carla")
+
+    hoje = time.localtime()
+    meia = time.mktime((hoje.tm_year, hoje.tm_mon, hoje.tm_mday, 0, 0, 0, 0, 0, -1))
+    dia = time.strftime("%Y-%m-%d", time.localtime(meia))
+    crop = [{"path": "x.jpg", "quality": 1.0, "face": "[]"}]
+
+    # Ana e Bruno detectados; Carla não
+    for pid, nome in ((ana, "Ana"), (bruno, "Bruno")):
+        tid = db.add_track(meia + 7.5 * 3600, meia + 7.5 * 3600 + 1, 9, crop)
+        db.resolve_track(tid, pid, nome, 0.8, "[]")
+
+    d = c.get("/attendance", params={"dia": dia}).json()
+    assert d["total_presentes"] == 2 and len(d["ausentes"]) == 1
+    assert d["conferida"] is False and d["aviso"], d
+    assert {p["origem"] for p in d["presentes"]} == {"automatico"}
+
+    # Carla veio mas o sistema não pegou -> falso negativo
+    r = c.post("/attendance/override", json={
+        "dia": dia, "person_id": carla, "presente": True,
+        "motivo": "chegou antes da câmera", "autor": "Beatriz"})
+    assert r.status_code == 200, r.text
+    # Bruno foi identificado por engano -> falso positivo
+    assert c.post("/attendance/override", json={
+        "dia": dia, "person_id": bruno, "presente": False,
+        "autor": "Beatriz"}).status_code == 200
+
+    d = c.get("/attendance", params={"dia": dia}).json()
+    nomes_presentes = {p["nome"] for p in d["presentes"]}
+    assert nomes_presentes == {"Ana", "Carla"}, nomes_presentes
+    assert {p["nome"] for p in d["ausentes"]} == {"Bruno"}
+    assert d["correcoes"] == {"marcados_presentes": 1, "marcados_ausentes": 1,
+                              "total": 2}, d["correcoes"]
+
+    carla_linha = next(p for p in d["presentes"] if p["nome"] == "Carla")
+    assert carla_linha["origem"] == "manual_presente"
+    assert carla_linha["detectado_pelo_sistema"] is False
+    assert carla_linha["correcao"]["motivo"] == "chegou antes da câmera"
+    assert carla_linha["correcao"]["autor"] == "Beatriz"
+
+    bruno_linha = d["ausentes"][0]
+    assert bruno_linha["origem"] == "manual_ausente"
+    # o detectado original SOBREVIVE — é a evidência que mede o erro
+    assert bruno_linha["detectado_pelo_sistema"] is True
+    assert bruno_linha["melhor_score"] == 0.8, "score automático foi perdido"
+
+    # desfazer volta ao automático
+    assert c.delete("/attendance/override",
+                    params={"dia": dia, "person_id": bruno}).json()["removidas"] == 1
+    d = c.get("/attendance", params={"dia": dia}).json()
+    assert "Bruno" in {p["nome"] for p in d["presentes"]}
+    assert next(p for p in d["presentes"]
+                if p["nome"] == "Bruno")["origem"] == "automatico"
+    return ("correção prevalece na chamada, detecção original preservada, "
+            "e os dois tipos de erro contados separadamente")
+
+
+@teste
+def api_chamada_fechamento_trava_edicao_e_exige_lote_vazio():
+    try:
+        import fastapi.testclient  # noqa: F401
+    except ImportError:
+        return "PULADO: fastapi.testclient indisponível"
+
+    c, pasta = _api_cliente("fechar")
+    from core.database import Database
+    db = Database(os.path.join(pasta, "dados.db"))
+    ana = db.add_person("Ana")
+    hoje = time.localtime()
+    meia = time.mktime((hoje.tm_year, hoje.tm_mon, hoje.tm_mday, 0, 0, 0, 0, 0, -1))
+    dia = time.strftime("%Y-%m-%d", time.localtime(meia))
+    crop = [{"path": "x.jpg", "quality": 1.0, "face": "[]"}]
+
+    # trilha PENDENTE deve impedir o fechamento: fecharia chamada incompleta
+    db.add_track(meia + 7 * 3600, meia + 7 * 3600 + 1, 5, crop)
+    r = c.post("/attendance/close", json={"dia": dia, "autor": "Beatriz"})
+    assert r.status_code == 409, f"deixou fechar com pendência: {r.status_code}"
+    assert "recognize_batch" in r.json()["detail"], r.json()
+
+    # resolvida a pendência, fecha
+    pend = db.pending_tracks()[0]
+    db.resolve_track(pend["id"], ana, "Ana", 0.9, "[]")
+    r = c.post("/attendance/close", json={"dia": dia, "autor": "Beatriz"})
+    assert r.status_code == 200, r.text
+
+    d = c.get("/attendance", params={"dia": dia}).json()
+    assert d["conferida"] is True and d["fechamento"]["autor"] == "Beatriz"
+    assert d["aviso"] is None, "chamada conferida não deveria avisar"
+
+    # fechada não aceita mais correção
+    assert c.post("/attendance/override", json={
+        "dia": dia, "person_id": ana, "presente": False}).status_code == 409
+    assert c.delete("/attendance/override",
+                    params={"dia": dia, "person_id": ana}).status_code == 409
+
+    # reabrir libera
+    assert c.delete("/attendance/close", params={"dia": dia}).json()["reaberta"] == 1
+    assert c.post("/attendance/override", json={
+        "dia": dia, "person_id": ana, "presente": False}).status_code == 200
+
+    # validações de entrada
+    assert c.post("/attendance/override", json={
+        "dia": "20/08/2026", "person_id": ana, "presente": True}).status_code == 400
+    assert c.post("/attendance/override", json={
+        "dia": dia, "person_id": 99999, "presente": True}).status_code == 404
+    return ("pendência bloqueia o fechamento; fechada recusa edição; "
+            "reabrir libera; entrada inválida recusada")
 
 
 @teste

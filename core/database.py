@@ -94,6 +94,38 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_tracks_status ON tracks(status);
                 CREATE INDEX IF NOT EXISTS idx_tracks_started ON tracks(started_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_crops_track ON track_crops(track_id);
+
+                -- Correção manual da chamada.
+                --
+                -- Fica em tabela SEPARADA de propósito: sobrescrever eventos ou
+                -- trilhas destruiria o que o sistema detectou, e é justamente a
+                -- diferença entre o automático e o corrigido que mede o acerto
+                -- do reconhecimento. Uma correção só existe quando a pessoa
+                -- DISCORDA da máquina.
+                --   presente=1 -> o sistema não detectou, mas a criança veio
+                --                 (falso negativo do reconhecimento)
+                --   presente=0 -> o sistema detectou, mas era engano
+                --                 (falso positivo do reconhecimento)
+                CREATE TABLE IF NOT EXISTS attendance_overrides (
+                    dia        TEXT    NOT NULL,
+                    person_id  INTEGER NOT NULL,
+                    presente   INTEGER NOT NULL,
+                    motivo     TEXT,
+                    autor      TEXT,
+                    created_at REAL    NOT NULL,
+                    PRIMARY KEY (dia, person_id)
+                );
+
+                -- Fechamento da chamada: separa "dados parciais, ainda em
+                -- conferência" de "conferida por uma pessoa". Sem isso, quem
+                -- consome não distingue rascunho de registro.
+                CREATE TABLE IF NOT EXISTS attendance_closures (
+                    dia         TEXT PRIMARY KEY,
+                    closed_at   REAL NOT NULL,
+                    autor       TEXT,
+                    presentes   INTEGER,
+                    correcoes   INTEGER
+                );
                 """
             )
         self._migrar()
@@ -448,6 +480,63 @@ class Database:
             return con.execute(
                 "DELETE FROM tracks WHERE status != 'pendente' AND started_at < ?",
                 (ts,)).rowcount or 0
+
+    # ---- correção manual da chamada -------------------------------------------
+    def set_attendance_override(self, dia: str, person_id: int, presente: bool,
+                                motivo: str = "", autor: str = "") -> None:
+        """Registra que uma pessoa DISCORDOU do resultado automático naquele dia."""
+        with self._connect() as con:
+            con.execute(
+                """
+                INSERT INTO attendance_overrides
+                       (dia, person_id, presente, motivo, autor, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(dia, person_id) DO UPDATE SET
+                    presente=excluded.presente, motivo=excluded.motivo,
+                    autor=excluded.autor, created_at=excluded.created_at
+                """,
+                (dia, person_id, 1 if presente else 0, motivo, autor, time.time()),
+            )
+
+    def remove_attendance_override(self, dia: str, person_id: int) -> int:
+        """Desfaz a correção — volta a valer o que o reconhecimento disse."""
+        with self._connect() as con:
+            return con.execute(
+                "DELETE FROM attendance_overrides WHERE dia=? AND person_id=?",
+                (dia, person_id)).rowcount or 0
+
+    def attendance_overrides(self, dia: str) -> dict:
+        """person_id -> {presente, motivo, autor, created_at} do dia."""
+        with self._connect() as con:
+            rows = con.execute(
+                "SELECT * FROM attendance_overrides WHERE dia=?", (dia,)).fetchall()
+        return {int(r["person_id"]): dict(r) for r in rows}
+
+    def close_attendance(self, dia: str, autor: str, presentes: int,
+                         correcoes: int) -> None:
+        with self._connect() as con:
+            con.execute(
+                """
+                INSERT INTO attendance_closures
+                       (dia, closed_at, autor, presentes, correcoes)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(dia) DO UPDATE SET
+                    closed_at=excluded.closed_at, autor=excluded.autor,
+                    presentes=excluded.presentes, correcoes=excluded.correcoes
+                """,
+                (dia, time.time(), autor, presentes, correcoes),
+            )
+
+    def reopen_attendance(self, dia: str) -> int:
+        with self._connect() as con:
+            return con.execute(
+                "DELETE FROM attendance_closures WHERE dia=?", (dia,)).rowcount or 0
+
+    def attendance_closure(self, dia: str) -> dict | None:
+        with self._connect() as con:
+            r = con.execute("SELECT * FROM attendance_closures WHERE dia=?",
+                            (dia,)).fetchone()
+        return dict(r) if r else None
 
     def count_events(self) -> int:
         with self._connect() as con:

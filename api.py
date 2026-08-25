@@ -550,6 +550,101 @@ def _janela(dia: str, inicio: str, fim: str):
     return t0, t1
 
 
+def _montar_chamada(dia: str = "", inicio: str = "", fim: str = "") -> dict:
+    """Monta a chamada. Função comum, NÃO rota.
+
+    Existe separada porque a rota tem `Query(...)` nos parâmetros — chamá-la
+    como função Python passaria os objetos de dependência em vez dos valores
+    padrão. O fechamento precisa deste resumo, então ele chama daqui.
+    """
+
+    t0, t1 = _janela(dia, inicio, fim)
+    dia_iso = time.strftime("%Y-%m-%d", time.localtime(t0))
+
+    automatico = {l["person_id"]: l for l in db.attendance(t0, t1)}
+    correcoes = db.attendance_overrides(dia_iso)
+    fechamento = db.attendance_closure(dia_iso)
+    todos = db.list_people()
+    pendentes = db.count_tracks_by_status().get("pendente", 0)
+
+    presentes, ausentes = [], []
+    n_marcados_presentes = n_marcados_ausentes = 0
+
+    for p in todos:
+        pid = p["id"]
+        auto = automatico.get(pid)
+        corr = correcoes.get(pid)
+        detectado = auto is not None
+        # A correção manual, quando existe, prevalece sobre o automático.
+        presente = bool(corr["presente"]) if corr else detectado
+
+        if corr and corr["presente"] and not detectado:
+            origem = "manual_presente"          # falso negativo do reconhecimento
+            n_marcados_presentes += 1
+        elif corr and not corr["presente"] and detectado:
+            origem = "manual_ausente"           # falso positivo do reconhecimento
+            n_marcados_ausentes += 1
+        elif detectado:
+            origem = "automatico"
+        else:
+            origem = "nao_identificado"
+
+        linha = {"person_id": pid, "nome": p["name"], "origem": origem,
+                 "detectado_pelo_sistema": detectado}
+        if corr:
+            linha["correcao"] = {"motivo": corr["motivo"] or None,
+                                 "autor": corr["autor"] or None,
+                                 "em": time.strftime("%Y-%m-%dT%H:%M:%S%z",
+                                                     time.localtime(corr["created_at"]))}
+        if auto:
+            linha.update({
+                "primeira_vez": time.strftime("%Y-%m-%dT%H:%M:%S%z",
+                                              time.localtime(auto["primeira"])),
+                "ultima_vez": time.strftime("%Y-%m-%dT%H:%M:%S%z",
+                                            time.localtime(auto["ultima"])),
+                "passagens": auto["passagens"],
+                "melhor_score": round(auto["melhor_score"], 3),
+                "fontes": (auto["fontes"] or "").split(","),
+            })
+        (presentes if presente else ausentes).append(linha)
+
+    presentes.sort(key=lambda x: (x.get("primeira_vez") or "~", x["nome"]))
+    ausentes.sort(key=lambda x: x["nome"].lower())
+
+    return {
+        "periodo": {
+            "dia": dia_iso,
+            "inicio": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(t0)),
+            "fim": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(t1)),
+            "fuso": time.strftime("%Z", time.localtime(t0)),
+        },
+        "completo": pendentes == 0,
+        "trilhas_pendentes": pendentes,
+        # `conferida` é mais forte que `completo`: significa que uma PESSOA
+        # revisou e fechou. Quem for gravar falta deveria exigir isto.
+        "conferida": fechamento is not None,
+        "fechamento": ({"em": time.strftime("%Y-%m-%dT%H:%M:%S%z",
+                                            time.localtime(fechamento["closed_at"])),
+                        "autor": fechamento["autor"] or None}
+                       if fechamento else None),
+        "total_cadastrados": len(todos),
+        "total_presentes": len(presentes),
+        "correcoes": {
+            # Estes dois números medem o acerto do reconhecimento no dia:
+            # presentes marcados à mão = o sistema deixou passar;
+            # ausentes marcados à mão  = o sistema identificou errado.
+            "marcados_presentes": n_marcados_presentes,
+            "marcados_ausentes": n_marcados_ausentes,
+            "total": len(correcoes),
+        },
+        "presentes": presentes,
+        "ausentes": ausentes,
+        "aviso": (None if fechamento else
+                  "Chamada NÃO conferida. Quem não foi identificado pode ter "
+                  "passado sem ser detectado — revise antes de registrar falta."),
+    }
+
+
 @app.get("/attendance")
 def attendance(dia: str = Query("", description="AAAA-MM-DD; vazio = hoje"),
                inicio: str = Query("", description="HH:MM; vazio = 00:00"),
@@ -558,59 +653,102 @@ def attendance(dia: str = Query("", description="AAAA-MM-DD; vazio = hoje"),
 
     Pontos de atenção para quem integra:
 
-    `completo`  — false quando ainda há trilhas aguardando reconhecimento. A
-      chamada está INCOMPLETA nesse caso: quem consumir e marcar falta vai
-      marcar falta de quem talvez esteja na fila. Sempre verifique este campo
-      antes de gravar ausência.
+    `conferida` — true só depois que uma PESSOA revisou e fechou a chamada.
+      É o campo mais forte da resposta: só uma chamada conferida deveria
+      alimentar registro de falta.
 
-    `nao_identificados` — pessoas cadastradas que não foram vistas na janela.
-      NÃO é o mesmo que ausente: pode ser falha de captura, criança que passou
-      fora do enquadramento, ou reconhecimento que não atingiu o limiar. A
-      decisão de transformar isso em falta é do outro sistema, e deveria passar
-      por conferência humana.
+    `completo` — false quando ainda há trilhas aguardando reconhecimento. A
+      chamada está INCOMPLETA nesse caso.
+
+    `ausentes` — inclui quem o sistema não identificou. NÃO equivale a falta:
+      pode ser falha de captura ou score abaixo do limiar. O campo `origem` de
+      cada pessoa diz se a informação veio do reconhecimento ou de correção
+      manual.
+
+    `correcoes` — mede o acerto do reconhecimento no dia: `marcados_presentes`
+      são falsos negativos (o sistema deixou passar) e `marcados_ausentes` são
+      falsos positivos (identificou errado).
 
     `person_id` é o identificador interno deste sistema. Casar por nome é
       frágil (homônimos, acentuação, digitação); para integração de verdade,
       convém guardar a matrícula do aluno aqui e casar por ela.
     """
-    t0, t1 = _janela(dia, inicio, fim)
-    presentes = db.attendance(t0, t1)
-    todos = db.list_people()
-    vistos = {l["person_id"] for l in presentes}
-    pendentes = db.count_tracks_by_status().get("pendente", 0)
+    return _montar_chamada(dia, inicio, fim)
 
-    return {
-        "periodo": {
-            "dia": time.strftime("%Y-%m-%d", time.localtime(t0)),
-            "inicio": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(t0)),
-            "fim": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(t1)),
-            "fuso": time.strftime("%Z", time.localtime(t0)),
-        },
-        "completo": pendentes == 0,
-        "trilhas_pendentes": pendentes,
-        "total_cadastrados": len(todos),
-        "total_presentes": len(presentes),
-        "presentes": [
-            {
-                "person_id": l["person_id"],
-                "nome": l["name"],
-                "primeira_vez": time.strftime("%Y-%m-%dT%H:%M:%S%z",
-                                              time.localtime(l["primeira"])),
-                "ultima_vez": time.strftime("%Y-%m-%dT%H:%M:%S%z",
-                                            time.localtime(l["ultima"])),
-                "passagens": l["passagens"],
-                "melhor_score": round(l["melhor_score"], 3),
-                "fontes": (l["fontes"] or "").split(","),
-            }
-            for l in presentes
-        ],
-        "nao_identificados": [
-            {"person_id": p["id"], "nome": p["name"]}
-            for p in todos if p["id"] not in vistos
-        ],
-        "aviso": ("'nao_identificados' não significa ausente — confira antes de "
-                  "registrar falta." if len(presentes) < len(todos) else None),
-    }
+
+class OverrideReq(BaseModel):
+    dia: str
+    person_id: int
+    presente: bool
+    motivo: str = ""
+    autor: str = ""
+
+
+def _validar_dia(dia: str) -> str:
+    try:
+        time.strptime(dia, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(400, "Campo 'dia' inválido. Use AAAA-MM-DD.")
+    return dia
+
+
+@app.post("/attendance/override")
+def set_override(req: OverrideReq):
+    """Corrige manualmente a presença de uma pessoa num dia.
+
+    Não altera o que o reconhecimento detectou — grava a discordância à parte.
+    Isso preserva a evidência e, de bônus, produz a medida de acerto do sistema:
+    cada correção é um erro dele, com o tipo identificado.
+    """
+    dia = _validar_dia(req.dia)
+    if db.get_person(req.person_id) is None:
+        raise HTTPException(404, "Pessoa não encontrada.")
+    if db.attendance_closure(dia) is not None:
+        raise HTTPException(
+            409, "A chamada deste dia está fechada. Reabra antes de corrigir: "
+                 "DELETE /attendance/close?dia=" + dia)
+    db.set_attendance_override(dia, req.person_id, req.presente,
+                               req.motivo.strip(), req.autor.strip())
+    return {"ok": True, "dia": dia, "person_id": req.person_id,
+            "presente": req.presente}
+
+
+@app.delete("/attendance/override")
+def del_override(dia: str = Query(...), person_id: int = Query(...)):
+    """Desfaz a correção: volta a valer o que o reconhecimento disse."""
+    dia = _validar_dia(dia)
+    if db.attendance_closure(dia) is not None:
+        raise HTTPException(409, "A chamada deste dia está fechada.")
+    return {"removidas": db.remove_attendance_override(dia, person_id)}
+
+
+class CloseReq(BaseModel):
+    dia: str
+    autor: str = ""
+
+
+@app.post("/attendance/close")
+def close_attendance(req: CloseReq):
+    """Fecha a chamada do dia, marcando que uma pessoa a conferiu."""
+    dia = _validar_dia(req.dia)
+    pendentes = db.count_tracks_by_status().get("pendente", 0)
+    if pendentes:
+        raise HTTPException(
+            409, f"Há {pendentes} trilha(s) aguardando reconhecimento. Rode o "
+                 "lote antes de fechar, senão a chamada fecha incompleta: "
+                 "python scripts/recognize_batch.py")
+
+    resumo = _montar_chamada(dia=dia)
+    db.close_attendance(dia, req.autor.strip(), resumo["total_presentes"],
+                        resumo["correcoes"]["total"])
+    return {"ok": True, "dia": dia, "presentes": resumo["total_presentes"],
+            "correcoes": resumo["correcoes"]["total"]}
+
+
+@app.delete("/attendance/close")
+def reopen_attendance(dia: str = Query(...)):
+    """Reabre a chamada para nova conferência."""
+    return {"reaberta": db.reopen_attendance(_validar_dia(dia))}
 
 
 @app.get("/snapshots/{path:path}")

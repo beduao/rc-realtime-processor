@@ -163,30 +163,60 @@ def presenca(db, dia: str) -> int:
     fim = inicio + 86400
     rotulo = time.strftime("%d/%m/%Y", time.localtime(inicio))
 
-    linhas = db.attendance(inicio, fim)
-    pessoas = {p["id"]: p["name"] for p in db.list_people()}
-    presentes = {l["person_id"] for l in linhas}
+    dia_iso = time.strftime("%Y-%m-%d", time.localtime(inicio))
+    automatico = {l["person_id"]: l for l in db.attendance(inicio, fim)}
+    # As MESMAS correções que o painel grava. Sem isto, CLI e painel dariam
+    # respostas diferentes para o mesmo dia — duas fontes de verdade.
+    correcoes = db.attendance_overrides(dia_iso)
+    fechamento = db.attendance_closure(dia_iso)
+    pessoas = db.list_people()
 
     pend = db.count_tracks_by_status().get("pendente", 0)
     print(f"\n=== Presença de {rotulo} ===")
+    if fechamento:
+        quando = time.strftime("%d/%m %H:%M", time.localtime(fechamento["closed_at"]))
+        autor = f" por {fechamento['autor']}" if fechamento["autor"] else ""
+        print(f"Conferida em {quando}{autor}.")
+    else:
+        print("NÃO conferida — confira no painel antes de tratar como falta.")
     if pend:
         print(f"⚠  {pend} trilha(s) ainda não reconhecida(s). Rode o "
               f"reconhecimento antes de usar este relatório.")
 
-    print(f"\nPRESENTES ({len(linhas)}):")
-    for l in linhas:
-        print(f"  {time.strftime('%H:%M', time.localtime(l['primeira']))}  "
-              f"{l['name']:<28} {l['passagens']} passagem(ns), "
-              f"melhor score {l['melhor_score']:.3f}")
+    presentes, ausentes, perdidos, errados = [], [], 0, 0
+    for p in pessoas:
+        auto = automatico.get(p["id"])
+        corr = correcoes.get(p["id"])
+        detectado = auto is not None
+        presente = bool(corr["presente"]) if corr else detectado
+        if corr and corr["presente"] and not detectado:
+            marca, perdidos = "✏️ manual", perdidos + 1
+        elif corr and not corr["presente"] and detectado:
+            marca, errados = "✏️ manual", errados + 1
+        else:
+            marca = "" if detectado else "não identificado"
+        (presentes if presente else ausentes).append((p["name"], auto, marca))
 
-    ausentes = [n for pid, n in pessoas.items() if pid not in presentes]
-    print(f"\nNÃO IDENTIFICADOS ({len(ausentes)}):")
-    for n in sorted(ausentes, key=str.lower):
-        print(f"  {n}")
-    if ausentes:
-        print("\n  Atenção: 'não identificado' não é o mesmo que 'ausente'. Pode")
-        print("  ser falha de captura. Confira as trilhas marcadas como")
-        print("  Desconhecido antes de tratar como falta.")
+    print(f"\nPRESENTES ({len(presentes)}):")
+    for nome, auto, marca in sorted(presentes,
+                                    key=lambda x: (x[1]["primeira"] if x[1] else 9e9)):
+        if auto:
+            print(f"  {time.strftime('%H:%M', time.localtime(auto['primeira']))}  "
+                  f"{nome:<28} {auto['passagens']} passagem(ns), "
+                  f"score {auto['melhor_score']:.3f} {marca}")
+        else:
+            print(f"  --:--  {nome:<28} {marca}")
+
+    print(f"\nAUSENTES ({len(ausentes)}):")
+    for nome, _, marca in sorted(ausentes, key=lambda x: x[0].lower()):
+        print(f"  {nome:<28} {marca}")
+
+    if perdidos or errados:
+        print(f"\nCorreções do dia: o sistema deixou passar {perdidos} e "
+              f"identificou {errados} por engano.")
+    elif ausentes and not fechamento:
+        print("\n  Atenção: quem não foi identificado pode ter passado sem ser")
+        print("  detectado. Confira no painel antes de tratar como falta.")
     return 0
 
 
