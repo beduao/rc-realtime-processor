@@ -47,6 +47,10 @@ db = Database(cfg.storage.db_path)
 store = SnapshotStore(cfg.storage.snapshots_dir)
 
 SNAP_BASE = project_path(cfg.storage.snapshots_dir).resolve()
+# Os recortes do modo captura ficam em OUTRA base, então a exclusão precisa
+# resolver cada caminho contra a base correta.
+TRACKS_BASE = project_path(
+    (cfg.get("tracking") or {}).get("crops_dir", "data/tracks")).resolve()
 LIVE_PATH = live_image_path(cfg)
 STATUS_PATH = LIVE_PATH.with_name("facial-status.json")
 FRAME_PATH = frame_image_path(cfg)
@@ -371,25 +375,55 @@ def people():
     return db.list_people()
 
 
-@app.delete("/people/{person_id}")
-def delete_person(person_id: int):
-    """Apaga a pessoa, seus embeddings E as fotos das amostras dela.
+def _apagar_arquivo(base, rel: str) -> bool:
+    """Remove um arquivo dentro de `base`, recusando caminho que escape dela."""
+    if not rel:
+        return False
+    alvo = (base / rel).resolve()
+    if not str(alvo).startswith(str(base)) or not alvo.is_file():
+        return False
+    alvo.unlink(missing_ok=True)
+    return True
 
-    Antes as imagens ficavam no disco depois da exclusão. Para dado biométrico
-    isso é problema: 'excluir' precisa excluir de fato.
+
+@app.delete("/people/{person_id}")
+def delete_person(person_id: int,
+                  anonimizar: bool = Query(
+                      False, description="preserva as passagens sem identificar "
+                                         "quem passou, em vez de apagá-las")):
+    """Exclusão completa: pessoa, embeddings, histórico e TODAS as imagens.
+
+    Antes isso deixava para trás os eventos, os snapshots das passagens e os
+    recortes das trilhas — ou seja, imagem de rosto continuava no disco depois
+    de um pedido de exclusão. Para dado biométrico de criança, 'excluir' precisa
+    excluir de fato.
+
+    Com `?anonimizar=true`, as linhas de passagem ficam com `person_id` nulo e
+    nome neutro: a contagem de "alguém passou às 7:42" sobrevive para
+    estatística, sem identificar. As IMAGENS são apagadas nos dois modos, porque
+    a foto do rosto é justamente o dado que identifica.
     """
-    caminhos = db.delete_person(person_id)
-    removidas = 0
-    for rel in caminhos:
-        arq = (SNAP_BASE / rel).resolve()
-        if str(arq).startswith(str(SNAP_BASE)) and arq.is_file():
-            arq.unlink(missing_ok=True)
-            removidas += 1
+    if db.get_person(person_id) is None:
+        raise HTTPException(404, "Pessoa não encontrada.")
+
+    arquivos = db.delete_person(person_id, anonimizar=anonimizar)
+
+    removidas = sum(_apagar_arquivo(SNAP_BASE, r) for r in arquivos["snapshots"])
+    removidos_recortes = sum(_apagar_arquivo(TRACKS_BASE, r)
+                             for r in arquivos["tracks"])
+
     pasta = (SNAP_BASE / AMOSTRAS_SUBDIR / str(person_id)).resolve()
     if str(pasta).startswith(str(SNAP_BASE)) and pasta.is_dir():
         shutil.rmtree(pasta, ignore_errors=True)
-    return {"deleted": person_id, "fotos_removidas": removidas,
-            "aviso": "O histórico de reconhecimentos (eventos) foi mantido."}
+
+    return {
+        "deleted": person_id,
+        "modo": "anonimizado" if anonimizar else "apagado",
+        "fotos_removidas": removidas,
+        "recortes_removidos": removidos_recortes,
+        "historico": ("preservado sem identificação" if anonimizar
+                      else "apagado junto com a pessoa"),
+    }
 
 
 class RenameReq(BaseModel):

@@ -721,22 +721,57 @@ O worker imprime um resumo de saúde a cada 5 minutos no journal:
 
 ## 9. Manutenção e cartão SD
 
-O Pi grava em cartão SD, que tem número finito de escritas. O que este projeto
-já faz para poupá-lo:
+O Pi grava em cartão SD, que tem número finito de escritas. O preview ao vivo
+vai para `/dev/shm` (memória RAM), não para o cartão — são ~172 mil escritas por
+dia evitadas.
 
-- O preview ao vivo vai para `/dev/shm` (memória RAM), não para o cartão —
-  configurado em `storage.live_path`. São ~172 mil escritas por dia evitadas.
-- `facial-cleanup.timer` roda todo dia às 03:30 e apaga snapshots antigos
-  (padrão: 30 dias / teto de 2 GB), removendo também os registros
-  correspondentes no banco.
+### Os três acervos de imagem, e por que têm prazos diferentes
 
-Ajustar a retenção:
+| Onde | O que é | Prazo |
+|---|---|---|
+| `data/snapshots/AAAAMMDD/` | foto de cada passagem registrada | `--days` (padrão 30) |
+| `data/tracks/AAAAMMDD/` | recortes que o lote usa para reconhecer | `--dias-trilhas` (padrão 7) |
+| `data/snapshots/amostras/<id>/` | fotos do cadastro de cada pessoa | sem prazo — saem quando a pessoa é excluída |
+
+Os recortes de trilha têm prazo curto porque são **evidência transitória**:
+depois que o lote processou a trilha, servem só para auditoria. Já as fotos do
+cadastro precisam durar enquanto a pessoa estiver cadastrada, senão o
+reconhecimento perderia a referência visual para revisão.
+
+No banco, `events` e `tracks` seguem o prazo longo (`--days`), porque ali mora o
+histórico de presença.
+
+O `facial-cleanup.timer` roda todo dia às 03:30. Para ajustar:
 
 ```bash
-sudo systemctl edit --full facial-cleanup.service   # mude --days e --max-mb
+sudo systemctl edit --full facial-cleanup.service   # mude --days e --dias-trilhas
 sudo systemctl restart facial-cleanup.timer
 systemctl list-timers facial-cleanup.timer          # confirmar o próximo disparo
 ```
+
+Conferir antes de aplicar:
+
+```bash
+.venv/bin/python scripts/cleanup_snapshots.py --dry-run
+```
+
+> **Uma trava importante:** se houver trilhas **pendentes** mais antigas que o
+> prazo, a limpeza **não** apaga os recortes e avisa. Trilha pendente antiga
+> significa que o reconhecimento em lote parou de rodar — apagar os recortes
+> nesse caso jogaria fora dado que nunca foi aproveitado. O aviso aponta para
+> `systemctl status facial-batch.timer`.
+
+### Excluir uma pessoa
+
+Pelo painel, em **Pessoas**, com duas opções:
+
+- **Anonimizar** — remove a pessoa, os embeddings e **todas as fotos**, mas
+  mantém as linhas de passagem com identificação removida. A estatística de
+  "alguém passou às 7:42" sobrevive; quem passou, não.
+- **Apagar tudo** — remove também os registros de passagem. Sem desfazer.
+
+Nos dois casos as imagens saem do disco, nas duas pastas — snapshots e recortes
+de trilha. Para dado biométrico de criança, "excluir" precisa excluir de fato.
 
 Backup do que importa (cadastros e histórico):
 

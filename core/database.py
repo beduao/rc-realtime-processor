@@ -19,6 +19,10 @@ import numpy as np
 from .config import project_path
 
 
+# Nome usado nas linhas cujo titular foi removido com anonimização.
+ANONIMO = "(removido)"
+
+
 @dataclass
 class Gallery:
     matrix: np.ndarray | None = None          # (N, 128) normalizado
@@ -178,20 +182,65 @@ class Database:
         with self._connect() as con:
             con.execute("UPDATE people SET name=? WHERE id=?", (name, person_id))
 
-    def delete_person(self, person_id: int) -> list[str]:
-        """Apaga pessoa e embeddings. Devolve os caminhos de foto que ficaram órfãos.
+    def delete_person(self, person_id: int, anonimizar: bool = False) -> dict:
+        """Apaga a pessoa e TODO o rastro dela. Devolve os arquivos a remover.
 
         Quem chama é responsável por remover os arquivos — o banco não conhece o
         sistema de arquivos. Devolver a lista evita deixar imagens de rosto no
         disco depois de um pedido de exclusão.
+
+        `anonimizar=True` preserva as linhas de eventos e trilhas com
+        `person_id` nulo e nome neutro — a estatística de "alguém passou às
+        7:42" continua, sem identificar quem. As IMAGENS são apagadas nos dois
+        modos, porque a imagem do rosto é o dado identificante.
+
+        Devolve os caminhos por base, já que as imagens moram em dois lugares:
+            {"snapshots": [...],   # relativos a storage.snapshots_dir
+             "tracks":    [...]}   # relativos a tracking.crops_dir
         """
         with self._connect() as con:
-            caminhos = [r["snapshot_path"] for r in con.execute(
-                "SELECT snapshot_path FROM embeddings WHERE person_id=?",
-                (person_id,)) if r["snapshot_path"]]
+            snapshots = [r["p"] for r in con.execute(
+                """
+                SELECT snapshot_path AS p FROM embeddings
+                 WHERE person_id=? AND snapshot_path IS NOT NULL
+                UNION ALL
+                SELECT snapshot_path AS p FROM events
+                 WHERE person_id=? AND snapshot_path IS NOT NULL
+                """, (person_id, person_id))]
+            tracks = [r["path"] for r in con.execute(
+                """
+                SELECT tc.path FROM track_crops tc
+                JOIN tracks t ON t.id = tc.track_id
+                WHERE t.person_id = ?
+                """, (person_id,))]
+
+            # embeddings e a pessoa saem sempre — sem eles não há reconhecimento
             con.execute("DELETE FROM embeddings WHERE person_id=?", (person_id,))
+
+            if anonimizar:
+                con.execute(
+                    "UPDATE events SET person_id=NULL, name=?, snapshot_path=NULL, "
+                    "is_known=0 WHERE person_id=?", (ANONIMO, person_id))
+                con.execute(
+                    "UPDATE tracks SET person_id=NULL, name=? WHERE person_id=?",
+                    (ANONIMO, person_id))
+                # os recortes das trilhas viram órfãos: removemos as linhas
+                con.execute(
+                    """
+                    DELETE FROM track_crops WHERE track_id IN
+                        (SELECT id FROM tracks WHERE name = ? AND person_id IS NULL)
+                    """, (ANONIMO,))
+            else:
+                con.execute(
+                    """
+                    DELETE FROM track_crops WHERE track_id IN
+                        (SELECT id FROM tracks WHERE person_id = ?)
+                    """, (person_id,))
+                con.execute("DELETE FROM tracks WHERE person_id=?", (person_id,))
+                con.execute("DELETE FROM events WHERE person_id=?", (person_id,))
+
             con.execute("DELETE FROM people WHERE id=?", (person_id,))
-        return caminhos
+        return {"snapshots": snapshots, "tracks": tracks}
 
     def list_people(self) -> list[dict]:
         with self._connect() as con:
@@ -353,6 +402,52 @@ class Database:
                 (day_start, day_end, day_start, day_end),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    # ---- retenção das trilhas -------------------------------------------------
+    def pending_tracks_before(self, ts: float) -> int:
+        """Trilhas pendentes mais antigas que `ts`.
+
+        Serve de trava de segurança na limpeza: trilha pendente antiga significa
+        que o reconhecimento em lote parou de rodar. Apagar os recortes dela
+        destruiria dado que ainda não foi aproveitado.
+        """
+        with self._connect() as con:
+            return int(con.execute(
+                "SELECT COUNT(*) FROM tracks WHERE status='pendente' AND started_at < ?",
+                (ts,)).fetchone()[0])
+
+    def drop_track_crops_before(self, ts: float) -> int:
+        """Remove as LINHAS de recorte de trilhas já resolvidas antes de `ts`.
+
+        Só as imagens: a linha em `tracks` fica, porque ela é o registro de
+        presença. Recorte é evidência transitória; trilha é o dado.
+        """
+        with self._connect() as con:
+            return con.execute(
+                """
+                DELETE FROM track_crops WHERE track_id IN (
+                    SELECT id FROM tracks
+                     WHERE status IN ('processado','descartado') AND started_at < ?
+                )
+                """, (ts,)).rowcount or 0
+
+    def purge_tracks_before(self, ts: float) -> int:
+        """Apaga as trilhas (o registro em si) anteriores a `ts`.
+
+        Prazo mais longo que o dos recortes: aqui mora o histórico de presença.
+        Pendentes são preservadas de propósito, para não perder o que o lote
+        ainda não processou.
+        """
+        with self._connect() as con:
+            con.execute(
+                """
+                DELETE FROM track_crops WHERE track_id IN (
+                    SELECT id FROM tracks WHERE status != 'pendente' AND started_at < ?
+                )
+                """, (ts,))
+            return con.execute(
+                "DELETE FROM tracks WHERE status != 'pendente' AND started_at < ?",
+                (ts,)).rowcount or 0
 
     def count_events(self) -> int:
         with self._connect() as con:

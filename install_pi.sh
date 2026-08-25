@@ -13,7 +13,8 @@
 #     --reinstall           recria o ambiente virtual do zero
 #     --no-services         instala tudo mas não mexe no systemd
 #     --port 8000           porta da API (padrão 8000)
-#     --retention-days 30   dias de snapshots mantidos pela limpeza diária
+#     --retention-days 30   dias de snapshots e registros mantidos
+#     --track-days 7        dias de recortes do modo captura
 #     --max-mb 2000         teto de tamanho da pasta de snapshots
 #
 set -euo pipefail
@@ -38,6 +39,7 @@ REINSTALL=0
 DO_SERVICES=1
 API_PORT=8000
 RETENTION_DAYS=30
+TRACK_DAYS=7
 MAX_MB=2000
 
 while [[ $# -gt 0 ]]; do
@@ -49,6 +51,7 @@ while [[ $# -gt 0 ]]; do
     --no-services)     DO_SERVICES=0; shift ;;
     --port)            API_PORT="${2:-8000}"; shift 2 ;;
     --retention-days)  RETENTION_DAYS="${2:-30}"; shift 2 ;;
+    --track-days)      TRACK_DAYS="${2:-7}"; shift 2 ;;
     --max-mb)          MAX_MB="${2:-2000}"; shift 2 ;;
     -h|--help)         sed -n '3,17p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)                 die "opção desconhecida: $1  (use --help)" ;;
@@ -248,6 +251,7 @@ else
         -e "s|__DIR__|$PROJ|g" \
         -e "s|__PORT__|$API_PORT|g" \
         -e "s|__RETENTION_DAYS__|$RETENTION_DAYS|g" \
+        -e "s|__TRACK_DAYS__|$TRACK_DAYS|g" \
         -e "s|__MAX_MB__|$MAX_MB|g" \
         > "$TMP/$unit"
   done

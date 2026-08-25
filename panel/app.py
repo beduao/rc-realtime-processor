@@ -337,11 +337,25 @@ elif page == "Pessoas":
             else:
                 st.error(r.json().get("detail", r.text))
     with cd:
-        st.caption("Apaga a pessoa, as amostras e as fotos dela. O histórico de "
-                   "reconhecimentos é mantido.")
-        if st.button("Remover pessoa", key=f"del-{p['id']}"):
-            r = S.delete(f"{API}/people/{p['id']}", timeout=15)
+        st.caption("**Excluir pessoa**")
+        modo = st.radio(
+            "O que fazer com o histórico de passagens?",
+            ["Anonimizar", "Apagar tudo"],
+            key=f"modo-{p['id']}",
+            captions=["Mantém a contagem das passagens sem identificar quem "
+                      "passou. As fotos são apagadas.",
+                      "Remove também os registros de passagem. Não há como "
+                      "desfazer."])
+        confirmo = st.checkbox("Confirmo a exclusão", key=f"conf-{p['id']}")
+        if st.button("Excluir", key=f"del-{p['id']}", disabled=not confirmo,
+                     type="secondary"):
+            anon = modo == "Anonimizar"
+            r = S.delete(f"{API}/people/{p['id']}",
+                         params={"anonimizar": str(anon).lower()}, timeout=20)
             if r.ok:
+                d = r.json()
+                st.success(f"Excluída ({d['modo']}): {d['fotos_removidas']} foto(s) "
+                           f"e {d['recortes_removidos']} recorte(s) removidos.")
                 st.rerun()
             else:
                 st.error(r.text)

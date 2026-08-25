@@ -582,6 +582,8 @@ Registradas para quem for dar manutenção:
 
 1. **A fila não tem reivindicação atômica.** Um consumidor só, hoje. Múltiplos
    consumidores exigem marcar `processando` no mesmo `UPDATE` que seleciona.
+   Enquanto isso não existir, a limpeza tem uma trava: trilha pendente antiga
+   bloqueia a remoção dos recortes, porque indica lote parado.
 2. **O rastreador pode trocar identidades** quando duas pessoas se cruzam com
    oclusão. A votação mitiga, mas não elimina.
 3. **`match()` é max-pooling sobre amostras**, então cadastro inflado aumenta

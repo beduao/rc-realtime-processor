@@ -8,8 +8,10 @@ Type=oneshot
 User=__USER__
 Group=__USER__
 WorkingDirectory=__DIR__
-# Ajuste --days conforme o prazo de retenção definido para o seu caso (LGPD).
-ExecStart=__DIR__/.venv/bin/python scripts/cleanup_snapshots.py --days __RETENTION_DAYS__ --max-mb __MAX_MB__
+# Ajuste os prazos conforme a retenção definida para o seu caso (LGPD).
+#   --days         snapshots de passagem e registros no banco
+#   --dias-trilhas recortes do modo captura (evidência transitória, prazo curto)
+ExecStart=__DIR__/.venv/bin/python scripts/cleanup_snapshots.py --days __RETENTION_DAYS__ --dias-trilhas __TRACK_DAYS__ --max-mb __MAX_MB__
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=facial-cleanup

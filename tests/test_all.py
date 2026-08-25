@@ -1005,6 +1005,166 @@ def api_token_opcional_protege_sem_trancar_o_health():
     return "health aberto; token exigido via X-API-Token e Bearer; token errado = 401"
 
 
+def _cenario_completo(nome):
+    """Pessoa com amostra, evento e trilha — cada um com sua imagem em disco."""
+    from core.database import Database
+    pasta = os.path.join(TMP, nome)
+    snaps = os.path.join(pasta, "snaps")
+    tracks = os.path.join(pasta, "tracks")
+    os.makedirs(snaps, exist_ok=True)
+    os.makedirs(tracks, exist_ok=True)
+    db = Database(os.path.join(pasta, "dados.db"))
+
+    def img(base, rel):
+        caminho = os.path.join(base, rel)
+        os.makedirs(os.path.dirname(caminho), exist_ok=True)
+        cv2.imwrite(caminho, np.full((40, 40, 3), 128, np.uint8))
+        return rel
+
+    pid = db.add_person("Alvo")
+    v = np.ones(128, np.float32)
+    v /= np.linalg.norm(v)
+    db.add_embedding(pid, v, img(snaps, "amostras/1/a.jpg"), 100.0)
+    db.add_event(pid, "Alvo", 0.9, img(snaps, "20260820/ev.jpg"), 1)
+    tid = db.add_track(time.time(), time.time() + 1, 8,
+                       [{"path": img(tracks, "20260820/t.jpg"),
+                         "quality": 1.0, "face": "[]"}])
+    db.resolve_track(tid, pid, "Alvo", 0.88, "[]")
+    return db, pasta, snaps, tracks, pid
+
+
+@teste
+def exclusao_apaga_historico_e_imagens_das_duas_bases():
+    """Pedido de exclusão precisa alcançar eventos, trilhas e as duas pastas."""
+    db, pasta, snaps, tracks, pid = _cenario_completo("excl")
+
+    assert os.path.exists(os.path.join(snaps, "20260820/ev.jpg"))
+    assert os.path.exists(os.path.join(tracks, "20260820/t.jpg"))
+
+    arquivos = db.delete_person(pid)
+    assert len(arquivos["snapshots"]) == 2, arquivos      # amostra + evento
+    assert len(arquivos["tracks"]) == 1, arquivos
+
+    # o banco não conhece o disco: quem chama apaga. Aqui simulamos a API.
+    for rel in arquivos["snapshots"]:
+        os.remove(os.path.join(snaps, rel))
+    for rel in arquivos["tracks"]:
+        os.remove(os.path.join(tracks, rel))
+
+    assert not db.list_people()
+    assert db.count_events() == 0, "evento sobreviveu à exclusão"
+    assert db.count_tracks_by_status() == {}, "trilha sobreviveu à exclusão"
+    assert not os.path.exists(os.path.join(snaps, "20260820/ev.jpg"))
+    assert not os.path.exists(os.path.join(tracks, "20260820/t.jpg"))
+    return "eventos, trilhas e imagens das duas bases removidos"
+
+
+@teste
+def exclusao_anonimizada_preserva_contagem_sem_identificar():
+    from core.database import ANONIMO
+    db, pasta, snaps, tracks, pid = _cenario_completo("anon")
+
+    arquivos = db.delete_person(pid, anonimizar=True)
+    assert len(arquivos["snapshots"]) == 2 and len(arquivos["tracks"]) == 1
+
+    assert not db.list_people(), "a pessoa deveria sair da lista"
+    # as passagens ficam, mas sem identificar quem
+    eventos = db.list_events(limit=10)
+    assert len(eventos) == 1, eventos
+    assert eventos[0]["person_id"] is None and eventos[0]["name"] == ANONIMO
+    assert eventos[0]["snapshot_path"] is None, "referência de foto deveria sumir"
+    assert eventos[0]["is_known"] == 0
+    # a trilha permanece para estatística, sem dono e sem recortes
+    assert db.count_tracks_by_status().get("processado") == 1
+    hoje = time.localtime()
+    meia = time.mktime((hoje.tm_year, hoje.tm_mon, hoje.tm_mday, 0, 0, 0, 0, 0, -1))
+    assert db.attendance(meia, meia + 86400) == [], \
+        "anonimizada não pode mais aparecer na chamada"
+    return "pessoa sai da chamada; contagem de passagens sobrevive sem identificação"
+
+
+@teste
+def retencao_alcanca_a_pasta_de_trilhas():
+    """A limpeza varria só data/snapshots — os recortes ficavam para sempre."""
+    import subprocess
+    from core.database import Database
+
+    pasta = os.path.join(TMP, "retencao")
+    snaps = os.path.join(pasta, "snaps")
+    tracks = os.path.join(pasta, "tracks")
+    for base in (snaps, tracks):
+        for dia in ("20200101", "20991231"):
+            d = os.path.join(base, dia)
+            os.makedirs(d, exist_ok=True)
+            cv2.imwrite(os.path.join(d, "x.jpg"), np.full((40, 40, 3), 90, np.uint8))
+
+    db = Database(os.path.join(pasta, "dados.db"))
+    antigo = time.time() - 400 * 86400
+    tid = db.add_track(antigo, antigo + 1, 5,
+                       [{"path": "20200101/x.jpg", "quality": 1.0, "face": "[]"}])
+    db.resolve_track(tid, None, "Desconhecido", 0.2, "[]")
+
+    cfg = yaml.safe_load(open(os.path.join(RAIZ, "config.pi.example.yaml")))
+    cfg["storage"]["db_path"] = os.path.join(pasta, "dados.db")
+    cfg["storage"]["snapshots_dir"] = snaps
+    cfg["storage"]["live_path"] = os.path.join(pasta, "live.jpg")
+    cfg["tracking"]["crops_dir"] = tracks
+    caminho = os.path.join(pasta, "cfg.yaml")
+    yaml.safe_dump(cfg, open(caminho, "w"))
+
+    env = dict(os.environ, FACIAL_CONFIG=caminho, PYTHONPATH=RAIZ)
+    r = subprocess.run([sys.executable, "scripts/cleanup_snapshots.py",
+                        "--days", "30", "--dias-trilhas", "7"],
+                       cwd=RAIZ, env=env, capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+
+    assert not os.path.isdir(os.path.join(tracks, "20200101")), \
+        f"pasta de trilhas antiga NÃO foi removida:\n{r.stdout}"
+    assert not os.path.isdir(os.path.join(snaps, "20200101"))
+    assert os.path.isdir(os.path.join(tracks, "20991231")), "removeu dia futuro"
+    assert os.path.isdir(os.path.join(snaps, "20991231"))
+    assert not db.track_crops(tid), "referência de recorte ficou no banco"
+    return "recortes antigos removidos do disco e do banco; dias recentes intactos"
+
+
+@teste
+def retencao_nao_apaga_recortes_de_trilha_pendente():
+    """Se o lote parou, apagar recorte pendente jogaria fora dado não usado."""
+    import subprocess
+    from core.database import Database
+
+    pasta = os.path.join(TMP, "pendente")
+    snaps = os.path.join(pasta, "snaps")
+    tracks = os.path.join(pasta, "tracks")
+    d = os.path.join(tracks, "20200101")
+    os.makedirs(d, exist_ok=True)
+    os.makedirs(snaps, exist_ok=True)
+    cv2.imwrite(os.path.join(d, "x.jpg"), np.full((40, 40, 3), 90, np.uint8))
+
+    db = Database(os.path.join(pasta, "dados.db"))
+    antigo = time.time() - 400 * 86400
+    db.add_track(antigo, antigo + 1, 5,                   # fica PENDENTE
+                 [{"path": "20200101/x.jpg", "quality": 1.0, "face": "[]"}])
+    assert db.pending_tracks_before(time.time() - 7 * 86400) == 1
+
+    cfg = yaml.safe_load(open(os.path.join(RAIZ, "config.pi.example.yaml")))
+    cfg["storage"]["db_path"] = os.path.join(pasta, "dados.db")
+    cfg["storage"]["snapshots_dir"] = snaps
+    cfg["storage"]["live_path"] = os.path.join(pasta, "live.jpg")
+    cfg["tracking"]["crops_dir"] = tracks
+    caminho = os.path.join(pasta, "cfg.yaml")
+    yaml.safe_dump(cfg, open(caminho, "w"))
+
+    env = dict(os.environ, FACIAL_CONFIG=caminho, PYTHONPATH=RAIZ)
+    r = subprocess.run([sys.executable, "scripts/cleanup_snapshots.py",
+                        "--dias-trilhas", "7"],
+                       cwd=RAIZ, env=env, capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert os.path.isdir(d), "apagou recorte de trilha PENDENTE"
+    assert "PENDENTES" in r.stdout and "facial-batch" in r.stdout, r.stdout
+    return "recorte pendente preservado e o motivo explicado na saída"
+
+
 @teste
 def monitor_identifica_o_worker_sem_falso_positivo():
     """Casar a substring 'worker.py' na linha de comando pega o shell errado."""
