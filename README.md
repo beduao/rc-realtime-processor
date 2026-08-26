@@ -35,7 +35,7 @@ Câmera Intelbras ──RTSP──► worker.py ──┐
 | `core/storage.py` | Salva snapshots em `data/snapshots/AAAAMMDD/` |
 | `worker.py` | Loop de reconhecimento contínuo |
 | `api.py` | API HTTP (cadastro, pessoas, eventos, snapshots, live) |
-| `panel/app.py` | Painel Streamlit |
+| `panel/app.py` | Painel Streamlit — chamada com correção manual, cadastro, histórico |
 | `scripts/test_camera.py` | Testa a conexão (RTSP, webcam USB ou arquivo) |
 | `scripts/find_camera.py` | Varre a rede e descobre se a câmera expõe RTSP |
 | `scripts/check_pi.py` | Diagnóstico do Pi + medição de FPS real (abre a câmera) |

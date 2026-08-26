@@ -472,6 +472,35 @@ GROUP BY person_id
 custaria uma ordenação. O `GROUP_CONCAT(DISTINCT fonte)` preserva a procedência,
 o que permite auditar um dia em que os dois modos foram usados.
 
+### 6.55 A correção manual como fonte separada
+
+Duas tabelas pequenas guardam a intervenção humana na chamada:
+
+```sql
+attendance_overrides (dia, person_id, presente, motivo, autor, created_at)
+attendance_closures  (dia, closed_at, autor, presentes, correcoes)
+```
+
+A chave primária composta `(dia, person_id)` garante uma correção por pessoa por
+dia, e o `ON CONFLICT ... DO UPDATE` faz o upsert sem precisar consultar antes.
+
+**Por que tabela separada em vez de uma coluna em `events`.** Se a correção
+sobrescrevesse o resultado do reconhecimento, o dado original desapareceria — e
+com ele a possibilidade de medir o acerto do sistema. Mantendo os dois lados, a
+presença efetiva é calculada na leitura:
+
+```
+presente = correção, quando existe;  senão, detecção automática
+```
+
+E a diferença entre os dois vira métrica: `presente` marcado à mão onde não houve
+detecção é falso negativo; `ausente` marcado à mão onde houve detecção é falso
+positivo. É a mesma ideia do `calibrate_threshold.py`, mas aplicada ao nível da
+chamada em vez do evento individual.
+
+A regra "correção existe só na discordância" também mantém a tabela pequena: num
+dia em que o reconhecimento acerta tudo, ela fica vazia.
+
 ### 6.6 VACUUM fora de transação
 
 ```python
