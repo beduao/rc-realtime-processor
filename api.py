@@ -36,7 +36,8 @@ from pydantic import BaseModel
 from core.camera import Camera, camera_from_config
 from core.config import (frame_image_path, live_image_path, load_config,
                          project_path)
-from core.database import Database
+from core.database import (Database, InepDuplicado, inep_suspeito,
+                          normalizar_inep)
 from core.draw import crop_face, draw_face
 from core.face_engine import FaceEngine
 from core.storage import SnapshotStore
@@ -203,6 +204,9 @@ def _redundancia(amostras: list[dict]) -> list[dict]:
 # ---- modelos de request --------------------------------------------------- #
 class StartReq(BaseModel):
     name: str
+    # ID INEP do aluno. Opcional no cadastro para não travar o
+    # piloto, mas sem ele o sistema da escola não consegue casar.
+    inep_id: str = ""
 
 
 class SessionReq(BaseModel):
@@ -261,7 +265,8 @@ def enroll_start(req: StartReq):
         _get_camera()
     sid = uuid.uuid4().hex[:12]
     with _lock:
-        _sessions[sid] = {"name": name, "samples": []}
+        _sessions[sid] = {"name": name, "samples": [],
+                          "inep_id": normalizar_inep(req.inep_id)}
     return {"session_id": sid, "name": name, "target": ENROLL_TARGET}
 
 
@@ -337,7 +342,10 @@ def enroll_finish(req: SessionReq):
         raise HTTPException(404, "Sessão inválida ou expirada.")
     if not sess["samples"]:
         raise HTTPException(422, "Capture pelo menos uma amostra antes de concluir.")
-    person_id = db.add_person(sess["name"])
+    try:
+        person_id = db.add_person(sess["name"], sess.get("inep_id"))
+    except InepDuplicado as exc:
+        raise HTTPException(409, str(exc)) from None
 
     # Move os recortes da pasta temporária da sessão para a pasta definitiva da
     # pessoa. Assim cada embedding fica ligado à sua foto (é o que permite
@@ -427,18 +435,52 @@ def delete_person(person_id: int,
 
 
 class RenameReq(BaseModel):
-    name: str
+    name: str | None = None
+    inep_id: str | None = None
 
 
 @app.patch("/people/{person_id}")
-def rename_person(person_id: int, req: RenameReq):
-    nome = req.name.strip()
-    if not nome:
-        raise HTTPException(400, "Nome não pode ficar vazio.")
+def update_person(person_id: int, req: RenameReq):
+    """Altera nome e/ou ID INEP. Campo ausente fica como está.
+
+    O ID INEP é a identificação única do aluno no Censo Escolar, e é por ele
+    que o sistema de gestão da escola casa os registros. Casar por nome é
+    frágil: homônimos, acentuação e digitação divergente quebram a associação.
+
+    Enviar `inep_id: ""` limpa o campo.
+    """
     if db.get_person(person_id) is None:
         raise HTTPException(404, "Pessoa não encontrada.")
-    db.rename_person(person_id, nome)
-    return {"id": person_id, "name": nome}
+
+    resposta = {"id": person_id}
+
+    if req.name is not None:
+        nome = req.name.strip()
+        if not nome:
+            raise HTTPException(400, "Nome não pode ficar vazio.")
+        db.rename_person(person_id, nome)
+        resposta["name"] = nome
+
+    if req.inep_id is not None:
+        try:
+            gravado = db.set_person_inep(person_id, req.inep_id)
+        except InepDuplicado as exc:
+            raise HTTPException(409, str(exc)) from None
+        resposta["inep_id"] = gravado
+        aviso = inep_suspeito(gravado or "")
+        if aviso:
+            resposta["aviso"] = f"ID INEP {aviso}"
+
+    return resposta
+
+
+@app.get("/people/by-inep/{inep_id}")
+def person_by_inep(inep_id: str):
+    """Busca aluno pelo ID INEP — o caminho de entrada para outro sistema."""
+    pessoa = db.person_by_inep(inep_id)
+    if pessoa is None:
+        raise HTTPException(404, "Nenhum aluno cadastrado com este ID INEP.")
+    return pessoa
 
 
 @app.get("/people/{person_id}/samples")
@@ -589,7 +631,8 @@ def _montar_chamada(dia: str = "", inicio: str = "", fim: str = "") -> dict:
         else:
             origem = "nao_identificado"
 
-        linha = {"person_id": pid, "nome": p["name"], "origem": origem,
+        linha = {"person_id": pid, "inep_id": p.get("inep_id"),
+                 "nome": p["name"], "origem": origem,
                  "detectado_pelo_sistema": detectado}
         if corr:
             linha["correcao"] = {"motivo": corr["motivo"] or None,
@@ -629,6 +672,9 @@ def _montar_chamada(dia: str = "", inicio: str = "", fim: str = "") -> dict:
                        if fechamento else None),
         "total_cadastrados": len(todos),
         "total_presentes": len(presentes),
+        # Quem está sem ID INEP não pode ser casado pelo sistema da escola.
+        # Exposto aqui para o problema aparecer antes de virar falta errada.
+        "sem_inep": sum(1 for p in todos if not p.get("inep_id")),
         "correcoes": {
             # Estes dois números medem o acerto do reconhecimento no dia:
             # presentes marcados à mão = o sistema deixou passar;

@@ -637,10 +637,30 @@ captura, criança que passou fora do enquadramento, ou score abaixo do limiar.
 Transformar isso em falta é decisão do outro sistema, e deveria passar por
 conferência humana.
 
-**`person_id`** — identificador interno deste sistema. Casar por **nome** é
-frágil: homônimos, acentuação e digitação divergente quebram a associação. Para
-integração de verdade, o próximo passo é guardar a matrícula do aluno aqui e
-casar por ela.
+**`inep_id`** — identificação única do aluno no Censo Escolar, e o campo pelo
+qual o sistema de gestão da escola casa os registros. É o identificador certo
+para integração: nacional e estável entre escolas e anos, ao contrário de
+matrícula, que é local. O `person_id` continua na resposta, mas é interno deste
+sistema e não serve para o outro lado.
+
+Casar por **nome** não é opção: homônimos, acentuação e digitação divergente
+quebram a associação silenciosamente.
+
+O campo é **opcional no cadastro**, para não travar o piloto — mas a resposta
+traz `sem_inep` com a contagem de quem está sem, e o painel avisa. Aluno sem ID
+INEP não pode ser casado pelo outro sistema, então esse número precisa chegar a
+zero antes da integração valer.
+
+Preencher: no painel, em **Pessoas**, selecione o aluno e edite o campo. Pontos e
+traços são removidos automaticamente, e zeros à esquerda são preservados — o
+valor é guardado como texto, não número. Dois alunos não podem ter o mesmo ID; a
+tentativa é recusada com o nome de quem já usa.
+
+Para o outro sistema consultar um aluno pelo ID:
+
+```
+GET /people/by-inep/000123456789
+```
 
 A resposta une as duas origens possíveis — trilhas do modo captura e eventos do
 modo realtime — e o campo `fontes` de cada pessoa diz de onde veio. Isso importa

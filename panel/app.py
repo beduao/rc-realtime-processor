@@ -59,7 +59,9 @@ if page == "Chamada":
     ss = st.session_state
     ss.setdefault("autor", "")
 
-    c1, c2, c3 = st.columns([1, 1, 2])
+    # vertical_alignment="bottom": sem isso o botão sobe até o topo da coluna,
+    # porque ele não tem rótulo e os campos ao lado têm.
+    c1, c2, c3 = st.columns([1, 1, 2], vertical_alignment="bottom")
     dia = c1.date_input("Dia", value=datetime.date.today(), format="DD/MM/YYYY")
     dia_iso = dia.strftime("%Y-%m-%d")
     if c2.button("Atualizar", width="stretch"):
@@ -89,7 +91,9 @@ if page == "Chamada":
 
     # --- estado da chamada -------------------------------------------------- #
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Presentes", d["total_presentes"], f"de {d['total_cadastrados']}")
+    # "de N" como valor, não como delta: delta desenha seta e cor de variação,
+    # o que sugeria alta/baixa onde não há comparação nenhuma.
+    m1.metric("Presentes", f"{d['total_presentes']} de {d['total_cadastrados']}")
     m2.metric("Ausentes", len(ausentes))
     m3.metric("Correções", corr["total"])
     m4.metric("Situação", "Conferida" if d["conferida"] else "Em aberto")
@@ -98,9 +102,14 @@ if page == "Chamada":
         st.error(f"**{d['trilhas_pendentes']} trilha(s) aguardando reconhecimento.** "
                  "A chamada está incompleta — rode o lote antes de conferir:\n\n"
                  "`python scripts/recognize_batch.py`")
+    if d.get("sem_inep"):
+        st.warning(f"**{d['sem_inep']} aluno(s) sem ID INEP.** O sistema de gestão "
+                   "da escola não consegue casar esses registros. Preencha em "
+                   "**Pessoas**.")
     if d["conferida"]:
         f = d["fechamento"]
-        quando = f["em"][:16].replace("T", " às ")
+        # ISO -> "26/08 às 11:29"
+        quando = f"{f['em'][8:10]}/{f['em'][5:7]} às {f['em'][11:16]}"
         st.success(f"Conferida em {quando}" +
                    (f" por {f['autor']}" if f["autor"] else "") +
                    ". Para alterar, reabra abaixo.")
@@ -117,22 +126,28 @@ if page == "Chamada":
               "nao_identificado": "❔ não identificado"}
 
     def _linha(pessoa, marcado_default):
-        """Uma pessoa na conferência. Devolve o valor do checkbox."""
-        col_a, col_b = st.columns([1, 4])
-        valor = col_a.checkbox("presente", value=marcado_default,
-                               key=f"pres-{dia_iso}-{pessoa['person_id']}",
-                               label_visibility="collapsed",
-                               disabled=d["conferida"])
+        """Uma pessoa na conferência. Devolve o valor do checkbox.
+
+        O nome é o RÓTULO da caixa, não uma coluna ao lado. Com colunas, a
+        largura sobrando na coluna da caixa virava um vão vazio — e a área de
+        clique ficava restrita ao quadradinho. Assim o nome inteiro é clicável.
+        """
+        valor = st.checkbox(f"**{pessoa['nome']}**", value=marcado_default,
+                            key=f"pres-{dia_iso}-{pessoa['person_id']}",
+                            disabled=d["conferida"])
         detalhe = [ICONES[pessoa["origem"]]]
+        if not pessoa.get("inep_id"):
+            detalhe.append("⚠ sem ID INEP")
         if pessoa.get("primeira_vez"):
             detalhe.append(pessoa["primeira_vez"][11:16])
         if pessoa.get("melhor_score") is not None:
             detalhe.append(f"score {pessoa['melhor_score']:.2f}")
         if pessoa.get("correcao") and pessoa["correcao"]["motivo"]:
             detalhe.append(f"motivo: {pessoa['correcao']['motivo']}")
-        col_b.markdown(f"**{pessoa['nome']}**  \n"
-                       f"<span style='color:gray;font-size:0.85em'>"
-                       f"{' · '.join(detalhe)}</span>", unsafe_allow_html=True)
+        # recuo alinha o detalhe com o texto do rótulo, não com a caixa
+        st.markdown(
+            f"<div style='color:gray;font-size:0.85em;margin:-0.7rem 0 0.6rem 2rem'>"
+            f"{' · '.join(detalhe)}</div>", unsafe_allow_html=True)
         return valor
 
     with st.form(f"conferencia-{dia_iso}"):
@@ -237,10 +252,17 @@ elif page == "Cadastrar":
     # --- sem sessão: pedir nome e iniciar ---
     if ss.enroll_session is None:
         st.write("Informe o nome e inicie o cadastro para abrir o preview da câmera.")
-        name = st.text_input("Nome")
+        cn, ci = st.columns([2, 1])
+        name = cn.text_input("Nome")
+        inep = ci.text_input(
+            "ID INEP", placeholder="12 dígitos",
+            help="Identificação única do aluno no Censo Escolar. É por ela que o "
+                 "sistema de gestão da escola casa os registros — casar por nome "
+                 "é frágil. Pode ficar em branco e ser preenchida depois.")
         if st.button("Iniciar cadastro", type="primary", disabled=not name.strip()):
             try:
-                r = S.post(f"{API}/enroll/start", json={"name": name.strip()}, timeout=30)
+                r = S.post(f"{API}/enroll/start", timeout=30,
+                           json={"name": name.strip(), "inep_id": inep.strip()})
             except requests.RequestException as exc:
                 st.error(f"Falha ao falar com a API: {exc}")
             else:
@@ -373,7 +395,10 @@ elif page == "Pessoas":
 
     st.caption(f"{len(people)} pessoa(s) cadastrada(s). "
                "Selecione uma para ver e gerenciar as amostras.")
-    rotulos = {f"{p['name']}  ({p['embeddings']} amostra(s))": p for p in people}
+    def _rotulo(p):
+        inep = p.get("inep_id") or "sem ID INEP"
+        return f"{p['name']}  —  {inep}  ({p['embeddings']} amostra(s))"
+    rotulos = {_rotulo(p): p for p in people}
     escolhido = st.selectbox("Pessoa", list(rotulos))
     p = rotulos[escolhido]
 
@@ -503,11 +528,20 @@ elif page == "Pessoas":
     cr, cd = st.columns([3, 1])
     with cr:
         novo = st.text_input("Nome", value=p["name"], key=f"nome-{p['id']}")
-        if st.button("Renomear", key=f"ren-{p['id']}",
-                     disabled=not novo.strip() or novo.strip() == p["name"]):
-            r = S.patch(f"{API}/people/{p['id']}",
-                               json={"name": novo.strip()}, timeout=10)
+        novo_inep = st.text_input(
+            "ID INEP", value=p.get("inep_id") or "", key=f"inep-{p['id']}",
+            help="Deixe em branco para limpar. Dois alunos não podem ter o mesmo.")
+        mudou = (novo.strip() != p["name"] or
+                 novo_inep.strip() != (p.get("inep_id") or ""))
+        if st.button("Salvar", key=f"ren-{p['id']}",
+                     disabled=not novo.strip() or not mudou):
+            r = S.patch(f"{API}/people/{p['id']}", timeout=10,
+                        json={"name": novo.strip(), "inep_id": novo_inep.strip()})
             if r.ok:
+                d = r.json()
+                if d.get("aviso"):
+                    st.warning(d["aviso"])
+                    time.sleep(2)
                 st.rerun()
             else:
                 st.error(r.json().get("detail", r.text))

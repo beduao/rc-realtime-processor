@@ -22,6 +22,45 @@ from .config import project_path
 # Nome usado nas linhas cujo titular foi removido com anonimização.
 ANONIMO = "(removido)"
 
+# Quantidade de dígitos esperada na identificação única do Censo Escolar.
+# É só para AVISAR — nunca para rejeitar. Se a realidade do dado for outra,
+# o cadastro precisa funcionar mesmo assim.
+INEP_DIGITOS = 12
+
+
+class InepDuplicado(Exception):
+    """Outro aluno já tem esse ID INEP."""
+
+    def __init__(self, person_id: int, nome: str):
+        self.person_id, self.nome = person_id, nome
+        super().__init__(f"ID INEP já usado por '{nome}' (id {person_id}).")
+
+
+def normalizar_inep(valor) -> str | None:
+    """Limpa o ID INEP: tira espaços, pontos e traços. Vazio vira None.
+
+    Normalizar na entrada evita o problema clássico de o mesmo aluno entrar
+    duas vezes porque alguém digitou com ponto e outra pessoa sem.
+    """
+    if valor is None:
+        return None
+    limpo = "".join(c for c in str(valor) if c.isdigit())
+    return limpo or None
+
+
+def inep_suspeito(valor: str) -> str | None:
+    """Devolve um aviso se o valor não parecer um ID INEP — ou None se parecer.
+
+    Aviso, não erro: eu não tenho certeza absoluta do formato oficial, então
+    bloquear seria pior que sinalizar.
+    """
+    if not valor:
+        return None
+    if len(valor) != INEP_DIGITOS:
+        return (f"tem {len(valor)} dígitos; o esperado no Censo Escolar é "
+                f"{INEP_DIGITOS}. Confira se copiou o campo certo.")
+    return None
+
 
 @dataclass
 class Gallery:
@@ -147,12 +186,50 @@ class Database:
                 if coluna not in existentes:
                     con.execute(f"ALTER TABLE embeddings ADD COLUMN {coluna} {tipo}")
 
+            # ID INEP do aluno: identificador do Censo Escolar, usado pelo
+            # sistema de gestão da escola. Guardado como TEXT, não INTEGER —
+            # é identificador, não quantidade, e zero à esquerda tem que
+            # sobreviver. Índice único PARCIAL: dois alunos não podem
+            # compartilhar o mesmo ID, mas vários podem estar sem preencher.
+            pessoas = {r["name"] for r in con.execute("PRAGMA table_info(people)")}
+            if "inep_id" not in pessoas:
+                con.execute("ALTER TABLE people ADD COLUMN inep_id TEXT")
+            con.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_people_inep "
+                "ON people(inep_id) WHERE inep_id IS NOT NULL")
+
     # ---- pessoas / embeddings -------------------------------------------------
-    def add_person(self, name: str) -> int:
+    def person_by_inep(self, inep_id: str) -> dict | None:
+        alvo = normalizar_inep(inep_id)
+        if not alvo:
+            return None
+        with self._connect() as con:
+            r = con.execute(
+                "SELECT id, name, inep_id, created_at FROM people WHERE inep_id=?",
+                (alvo,)).fetchone()
+        return dict(r) if r else None
+
+    def set_person_inep(self, person_id: int, inep_id) -> str | None:
+        """Define (ou limpa) o ID INEP. Levanta InepDuplicado se já for de outro."""
+        alvo = normalizar_inep(inep_id)
+        if alvo:
+            dono = self.person_by_inep(alvo)
+            if dono and dono["id"] != person_id:
+                raise InepDuplicado(dono["id"], dono["name"])
+        with self._connect() as con:
+            con.execute("UPDATE people SET inep_id=? WHERE id=?", (alvo, person_id))
+        return alvo
+
+    def add_person(self, name: str, inep_id=None) -> int:
+        alvo = normalizar_inep(inep_id)
+        if alvo:
+            dono = self.person_by_inep(alvo)
+            if dono:
+                raise InepDuplicado(dono["id"], dono["name"])
         with self._connect() as con:
             cur = con.execute(
-                "INSERT INTO people(name, created_at) VALUES(?, ?)",
-                (name, time.time()),
+                "INSERT INTO people(name, created_at, inep_id) VALUES(?, ?, ?)",
+                (name, time.time(), alvo),
             )
             return int(cur.lastrowid)
 
@@ -206,8 +283,9 @@ class Database:
 
     def get_person(self, person_id: int) -> dict | None:
         with self._connect() as con:
-            r = con.execute("SELECT id, name, created_at FROM people WHERE id=?",
-                            (person_id,)).fetchone()
+            r = con.execute(
+                "SELECT id, name, inep_id, created_at FROM people WHERE id=?",
+                (person_id,)).fetchone()
         return dict(r) if r else None
 
     def rename_person(self, person_id: int, name: str) -> None:
@@ -278,7 +356,7 @@ class Database:
         with self._connect() as con:
             rows = con.execute(
                 """
-                SELECT p.id, p.name, p.created_at, COUNT(e.id) AS embeddings
+                SELECT p.id, p.name, p.inep_id, p.created_at, COUNT(e.id) AS embeddings
                 FROM people p
                 LEFT JOIN embeddings e ON e.person_id = p.id
                 GROUP BY p.id

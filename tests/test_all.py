@@ -1099,6 +1099,106 @@ def api_chamada_fechamento_trava_edicao_e_exige_lote_vazio():
 
 
 @teste
+def inep_normalizacao_e_unicidade():
+    """O ID INEP é a chave de casamento com o sistema da escola."""
+    from core.database import (Database, InepDuplicado, inep_suspeito,
+                               normalizar_inep)
+
+    # normalização: mesma pessoa não pode entrar duas vezes por causa de pontuação
+    assert normalizar_inep(" 123.456.789-012 ") == "123456789012"
+    assert normalizar_inep("") is None and normalizar_inep(None) is None
+    assert normalizar_inep("abc") is None
+    # zero à esquerda tem que sobreviver — daí TEXT e não INTEGER
+    assert normalizar_inep("000123456789") == "000123456789"
+
+    # formato improvável avisa, mas não bloqueia
+    assert inep_suspeito("123456789012") is None
+    assert "12" in (inep_suspeito("123") or "")
+
+    pasta = os.path.join(TMP, "inep")
+    os.makedirs(pasta, exist_ok=True)
+    db = Database(os.path.join(pasta, "dados.db"))
+
+    ana = db.add_person("Ana", "000123456789")
+    assert db.get_person(ana)["inep_id"] == "000123456789"
+    achado = db.person_by_inep("000.123.456-789")     # busca normaliza também
+    assert achado and achado["id"] == ana
+
+    # duplicidade recusada, tanto no cadastro novo...
+    try:
+        db.add_person("Outra", "000123456789")
+        raise AssertionError("aceitou ID INEP duplicado no cadastro")
+    except InepDuplicado as exc:
+        assert exc.person_id == ana and "Ana" in str(exc)
+    # ...quanto na edição
+    bruno = db.add_person("Bruno")
+    assert db.get_person(bruno)["inep_id"] is None
+    try:
+        db.set_person_inep(bruno, "000123456789")
+        raise AssertionError("aceitou duplicado na edição")
+    except InepDuplicado:
+        pass
+
+    # atribuir o próprio valor de novo é permitido (não é conflito consigo)
+    assert db.set_person_inep(ana, "000123456789") == "000123456789"
+    # limpar é permitido, e libera o valor
+    assert db.set_person_inep(ana, "") is None
+    assert db.set_person_inep(bruno, "000123456789") == "000123456789"
+    # vários sem ID coexistem — o índice único é PARCIAL, senão o segundo NULL
+    # bateria com o primeiro. Ana ficou sem ID no passo acima, mais Carla e Diana.
+    db.add_person("Carla")
+    db.add_person("Diana")
+    sem_id = [p["name"] for p in db.list_people() if not p["inep_id"]]
+    assert sorted(sem_id) == ["Ana", "Carla", "Diana"], sem_id
+    return ("pontuação normalizada, zero à esquerda preservado, duplicidade "
+            "recusada, vários sem ID coexistem")
+
+
+@teste
+def api_inep_na_chamada_e_busca():
+    try:
+        import fastapi.testclient  # noqa: F401
+    except ImportError:
+        return "PULADO: fastapi.testclient indisponível"
+
+    c, pasta = _api_cliente("inepapi")
+    from core.database import Database
+    db = Database(os.path.join(pasta, "dados.db"))
+    ana = db.add_person("Ana", "000123456789")
+    db.add_person("Bruno")            # sem ID
+
+    hoje = time.localtime()
+    meia = time.mktime((hoje.tm_year, hoje.tm_mon, hoje.tm_mday, 0, 0, 0, 0, 0, -1))
+    dia = time.strftime("%Y-%m-%d", time.localtime(meia))
+    tid = db.add_track(meia + 7.5 * 3600, meia + 7.5 * 3600 + 1, 9,
+                       [{"path": "x.jpg", "quality": 1.0, "face": "[]"}])
+    db.resolve_track(tid, ana, "Ana", 0.8, "[]")
+
+    d = c.get("/attendance", params={"dia": dia}).json()
+    assert d["sem_inep"] == 1, d["sem_inep"]
+    presente = d["presentes"][0]
+    assert presente["inep_id"] == "000123456789", presente
+    assert d["ausentes"][0]["inep_id"] is None
+
+    # busca pelo ID — porta de entrada do outro sistema
+    r = c.get("/people/by-inep/000.123.456-789")
+    assert r.status_code == 200 and r.json()["name"] == "Ana", r.text
+    assert c.get("/people/by-inep/999999999999").status_code == 404
+
+    # edição pela API, com aviso de formato e recusa de duplicidade
+    bruno = next(p["id"] for p in db.list_people() if p["name"] == "Bruno")
+    r = c.patch(f"/people/{bruno}", json={"inep_id": "123"})
+    assert r.status_code == 200 and "aviso" in r.json(), r.json()
+    assert c.patch(f"/people/{bruno}",
+                   json={"inep_id": "000123456789"}).status_code == 409
+    # nome sozinho não mexe no ID
+    r = c.patch(f"/people/{bruno}", json={"name": "Bruno Lima"})
+    assert r.status_code == 200 and "inep_id" not in r.json()
+    assert db.get_person(bruno)["inep_id"] == "123", "nome mexeu no ID INEP"
+    return "ID INEP na chamada, contagem de faltantes, busca e validações"
+
+
+@teste
 def api_token_opcional_protege_sem_trancar_o_health():
     try:
         import fastapi.testclient  # noqa: F401
