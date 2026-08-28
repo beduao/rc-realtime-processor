@@ -1,19 +1,36 @@
-"""Calibra o `recognition.cosine_threshold` a partir dos eventos reais.
+"""Calibra o `recognition.cosine_threshold` a partir dos reconhecimentos reais.
 
 O limiar decide entre "é a Maria" e "é um desconhecido". O valor de fábrica
-(0.363) é o ponto de partida do SFace, não uma verdade para o seu ambiente:
-iluminação, ângulo e distância mudam a distribuição dos scores. Calibrar no
-chute costuma trocar um problema pelo outro.
+(0.363) é o ponto de partida do SFace, medido num conjunto de fotos de
+referência — não no seu corredor. Iluminação, ângulo, distância e a qualidade do
+cadastro deslocam toda a distribuição. Calibrar no chute costuma trocar um
+problema pelo outro.
+
+De onde vêm os DADOS
+--------------------
+Das duas origens, unidas: `events` (modo realtime) e `tracks` (modo captura).
+Ler só uma deixava a calibração cega no modo usado em produção.
+
+De onde vem a VERDADE
+---------------------
+Duas fontes, em ordem de preferência:
+
+1. **Chamadas conferidas** (aba Chamada do painel). É a fonte principal, porque
+   sai da operação normal, sem trabalho extra:
+     - aluno marcado AUSENTE numa chamada fechada -> as detecções dele naquele
+       dia foram identificação equivocada (falso positivo);
+     - aluno SEM correção numa chamada FECHADA -> alguém revisou e concordou,
+       então as detecções dele estão confirmadas.
+   A exigência de a chamada estar **fechada** é essencial: em chamada aberta, a
+   ausência de correção significa "ninguém olhou", não "está correto".
+
+2. **Revisão manual** (`--review`), evento por evento. Serve para dias que não
+   foram conferidos. Tem precedência sobre o item 1 por ser mais específica.
 
 Uso:
-    python scripts/calibrate_threshold.py              # relatório dos scores
-    python scripts/calibrate_threshold.py --review     # marca acerto/erro e sugere limiar
+    python scripts/calibrate_threshold.py              # relatório e sugestão
+    python scripts/calibrate_threshold.py --review     # marca acerto/erro à mão
     python scripts/calibrate_threshold.py --simular 0.45   # efeito de um limiar
-
-Como funciona o --review: ele mostra cada reconhecimento (com o link da foto) e
-pergunta se acertou. Com isso separa duas distribuições — a dos acertos e a dos
-erros — e propõe um limiar entre elas. As respostas ficam salvas, então dá para
-revisar aos poucos.
 """
 
 import argparse
@@ -21,6 +38,7 @@ import json
 import os
 import socket
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -28,6 +46,11 @@ from core.config import load_config_or_exit, project_path  # noqa: E402
 from core.database import Database  # noqa: E402
 
 LABELS_FILE = "data/calibracao.json"
+
+
+def chave(d: dict) -> str:
+    """Identificador de uma detecção. `id` repete entre origens, então precisa do par."""
+    return f"{d['fonte']}:{d['id']}"
 
 
 def _local_ip() -> str:
@@ -42,16 +65,54 @@ def _local_ip() -> str:
 
 
 def _load_labels() -> dict:
+    """Rótulos manuais. Aceita chave antiga (só o número) como evento."""
     path = project_path(LABELS_FILE)
-    if path.exists():
-        return json.loads(path.read_text(encoding="utf-8"))
-    return {}
+    if not path.exists():
+        return {}
+    cru = json.loads(path.read_text(encoding="utf-8"))
+    return {(k if ":" in k else f"evento:{k}"): v for k, v in cru.items()}
 
 
 def _save_labels(labels: dict) -> None:
     path = project_path(LABELS_FILE)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(labels, indent=2), encoding="utf-8")
+
+
+def rotulos_da_chamada(db: Database, deteccoes: list[dict]) -> dict:
+    """Deriva certo/errado das chamadas CONFERIDAS.
+
+    O dia de uma detecção é calculado no fuso local, igual ao que o painel usa
+    ao gravar a correção — comparar com UTC jogaria detecções da noite para o
+    dia seguinte.
+    """
+    fechados = db.closed_days()
+    overrides = db.all_overrides()
+    labels = {}
+    for d in deteccoes:
+        if not d["person_id"]:
+            continue                     # desconhecido não tem identidade a confirmar
+        dia = time.strftime("%Y-%m-%d", time.localtime(d["ts"]))
+        if dia not in fechados:
+            continue                     # ninguém conferiu: silêncio não é aprovação
+        corr = overrides.get((dia, int(d["person_id"])))
+        if corr is None:
+            labels[chave(d)] = "certo"   # conferido e não corrigido = confirmado
+        elif corr == 0:
+            labels[chave(d)] = "errado"  # marcado ausente = identificou errado
+        # corr == 1 (marcado presente) não rotula detecção: não houve detecção
+    return labels
+
+
+def juntar_rotulos(db: Database, deteccoes: list[dict]) -> tuple[dict, dict]:
+    """Combina as duas fontes. Manual vence, por ser mais específica."""
+    derivados = rotulos_da_chamada(db, deteccoes)
+    manuais = _load_labels()
+    combinado = dict(derivados)
+    combinado.update(manuais)
+    origem = {"chamada": len(derivados), "manual": len(manuais),
+              "total": len(combinado)}
+    return combinado, origem
 
 
 def _histogram(scores: list[float], largura: int = 40) -> None:
@@ -71,22 +132,30 @@ def _histogram(scores: list[float], largura: int = 40) -> None:
         print(f"      {a:.3f}–{b:.3f}  {barra} {n}")
 
 
-def relatorio(db: Database, cfg) -> list[dict]:
+def relatorio(db: Database, cfg, limite: int) -> list[dict]:
     limiar = float(cfg.recognition.cosine_threshold)
-    eventos = db.list_events(limit=500)
-    conhecidos = [e for e in eventos if e["is_known"]]
-    desconhecidos = [e for e in eventos if not e["is_known"]]
+    deteccoes = db.list_detections(limit=limite)
+    conhecidos = [e for e in deteccoes if e["is_known"]]
+    desconhecidos = [e for e in deteccoes if not e["is_known"]]
+    por_fonte = {}
+    for d in deteccoes:
+        por_fonte[d["fonte"]] = por_fonte.get(d["fonte"], 0) + 1
 
     print(f"\nLimiar atual: {limiar}")
-    print(f"Eventos analisados: {len(eventos)} "
-          f"({len(conhecidos)} reconhecidos, {len(desconhecidos)} desconhecidos)")
+    print(f"Reconhecimentos analisados: {len(deteccoes)} "
+          f"({len(conhecidos)} identificados, {len(desconhecidos)} desconhecidos)")
+    if por_fonte:
+        print("  origem: " + ", ".join(f"{v} de {k}" for k, v in por_fonte.items()))
+    if not deteccoes:
+        print("\n  Nada registrado ainda. Deixe o worker rodando e, no modo "
+              "captura, rode o lote:  python scripts/recognize_batch.py")
 
     if conhecidos:
         scores = sorted(e["score"] for e in conhecidos)
-        print(f"\nScores dos RECONHECIDOS (min {scores[0]:.3f} / "
+        print(f"\nScores dos IDENTIFICADOS (min {scores[0]:.3f} / "
               f"mediana {scores[len(scores) // 2]:.3f} / max {scores[-1]:.3f}):")
         _histogram(scores)
-        print("\n  Um falso positivo aparece aqui como um score BAIXO — é o rosto")
+        print("\n  Um falso positivo aparece aqui como score BAIXO — é o rosto")
         print("  de outra pessoa que mesmo assim passou do limiar.")
 
     if desconhecidos:
@@ -95,28 +164,38 @@ def relatorio(db: Database, cfg) -> list[dict]:
         print("  Se você reconhece alguém cadastrado entre estes, o limiar está")
         print("  alto demais (falso negativo).")
 
-    return conhecidos
+    return deteccoes
 
 
-def review(db: Database, cfg, ip: str, porta: int) -> None:
-    eventos = relatorio(db, cfg)
-    if not eventos:
-        print("\nSem reconhecimentos para revisar ainda.")
+def review(db: Database, cfg, deteccoes: list[dict], ip: str, porta: int) -> None:
+    conhecidos = [d for d in deteccoes if d["is_known"]]
+    if not conhecidos:
+        print("\nSem identificações para revisar ainda.")
         return
 
-    labels = _load_labels()
-    # Do menor para o maior score: os falsos positivos costumam estar no início.
-    eventos.sort(key=lambda e: e["score"])
-    pendentes = [e for e in eventos if str(e["id"]) not in labels]
+    combinado, _ = juntar_rotulos(db, deteccoes)
+    manuais = _load_labels()
+    # Do menor para o maior score: os erros se concentram no início, então você
+    # encontra os problemas nas primeiras respostas.
+    conhecidos.sort(key=lambda d: d["score"])
+    pendentes = [d for d in conhecidos if chave(d) not in combinado]
 
-    print(f"\n{len(pendentes)} evento(s) a revisar "
-          f"({len(labels)} já revisado(s)).")
+    print(f"\n{len(pendentes)} a revisar à mão "
+          f"({len(combinado)} já rotulados, sendo {len(manuais)} manuais e o "
+          f"resto vindo de chamadas conferidas).")
+    if not pendentes:
+        print("  Nada pendente — as chamadas conferidas já cobriram tudo.")
     print("Responda:  s = acertou   n = ERROU (outra pessoa)   p = pular   q = sair\n")
 
-    for ev in pendentes:
-        url = f"http://{ip}:{porta}/snapshots/{ev['snapshot_path']}"
-        print(f"  score {ev['score']:.3f}  ->  identificou como '{ev['name']}'")
-        print(f"  foto: {url}")
+    for d in pendentes:
+        print(f"  score {d['score']:.3f}  ->  identificou como '{d['name']}' "
+              f"({d['fonte']})")
+        if d["snapshot_path"]:
+            if d["fonte"] == "evento":
+                print(f"  foto: http://{ip}:{porta}/snapshots/{d['snapshot_path']}")
+            else:
+                # recortes de trilha não são servidos pela API; caminho local
+                print(f"  recorte: data/tracks/{d['snapshot_path']}")
         try:
             resp = input("  acertou? [s/n/p/q] ").strip().lower()
         except (EOFError, KeyboardInterrupt):
@@ -125,21 +204,32 @@ def review(db: Database, cfg, ip: str, porta: int) -> None:
         if resp == "q":
             break
         if resp in ("s", "n"):
-            labels[str(ev["id"])] = "certo" if resp == "s" else "errado"
-            _save_labels(labels)
+            manuais[chave(d)] = "certo" if resp == "s" else "errado"
+            _save_labels(manuais)
         print()
 
-    sugerir(eventos, labels, float(cfg.recognition.cosine_threshold))
+    combinado, origem = juntar_rotulos(db, deteccoes)
+    sugerir(deteccoes, combinado, origem, float(cfg.recognition.cosine_threshold))
 
 
-def sugerir(eventos: list[dict], labels: dict, limiar_atual: float) -> None:
-    certos = [e["score"] for e in eventos if labels.get(str(e["id"])) == "certo"]
-    errados = [e["score"] for e in eventos if labels.get(str(e["id"])) == "errado"]
+def sugerir(deteccoes: list[dict], labels: dict, origem: dict,
+            limiar_atual: float) -> None:
+    por_chave = {chave(d): d for d in deteccoes}
+    certos = [por_chave[k]["score"] for k, v in labels.items()
+              if v == "certo" and k in por_chave]
+    errados = [por_chave[k]["score"] for k, v in labels.items()
+               if v == "errado" and k in por_chave]
 
     print("\n--- Sugestão de limiar ---")
-    print(f"  acertos marcados: {len(certos)} | erros marcados: {len(errados)}")
+    print(f"  rótulos: {origem['chamada']} de chamadas conferidas + "
+          f"{origem['manual']} manuais")
+    print(f"  acertos: {len(certos)} | erros: {len(errados)}")
+
     if not certos and not errados:
-        print("  Marque alguns eventos com --review para eu poder sugerir.")
+        print("\n  Sem rótulo nenhum, não há o que calcular. Dois caminhos:")
+        print("    1. Confira e FECHE chamadas no painel (recomendado — sai da")
+        print("       operação normal e cobre os dois modos).")
+        print("    2. Rotule evento por evento: --review")
         return
 
     if certos:
@@ -148,12 +238,12 @@ def sugerir(eventos: list[dict], labels: dict, limiar_atual: float) -> None:
         print(f"  maior score de um ERRO:    {max(errados):.3f}")
 
     if not errados:
-        print("\n  Nenhum falso positivo marcado. Se eles acontecem mas você ainda")
-        print("  não os marcou, rode --review de novo depois de mais passagens.")
+        print("\n  Nenhum falso positivo entre os rotulados. Se eles acontecem,")
+        print("  marque o aluno como ausente na chamada do dia e feche-a.")
         return
     if not certos:
-        print(f"\n  Só há erros marcados. Suba o limiar acima de {max(errados):.3f}")
-        print("  e verifique se você continua sendo reconhecida.")
+        print(f"\n  Só há erros rotulados. Suba o limiar acima de {max(errados):.3f}")
+        print("  e verifique se as pessoas certas continuam sendo reconhecidas.")
         return
 
     pior_erro, pior_acerto = max(errados), min(certos)
@@ -162,50 +252,61 @@ def sugerir(eventos: list[dict], labels: dict, limiar_atual: float) -> None:
         print(f"\n  As duas distribuições estão SEPARADAS "
               f"({pior_erro:.3f} < {pior_acerto:.3f}).")
         print(f"  Limiar sugerido: {sugerido}   (atual: {limiar_atual})")
+        print("  Ponto médio: fica o mais longe possível do pior caso de cada")
+        print("  lado, o que dá a maior tolerância a variação futura.")
         print("\n  No config.yaml:")
         print("    recognition:")
         print(f"      cosine_threshold: {sugerido}")
-        print("\n  Depois:  sudo systemctl restart facial-worker")
+        print("\n  Confira o efeito antes de aplicar:")
+        print(f"    python scripts/calibrate_threshold.py --simular {sugerido}")
+        print("  Depois:  sudo systemctl restart facial-worker")
     else:
         print(f"\n  ⚠ As distribuições se SOBREPÕEM "
               f"({pior_acerto:.3f} <= {pior_erro:.3f}).")
         print("  Nenhum limiar separa os dois casos — mexer nele só troca")
         print("  falso positivo por falso negativo. O que resolve de verdade:")
-        print("    1. cadastrar MAIS amostras suas, com ângulos e luz variados;")
+        print("    1. cadastrar MAIS amostras da pessoa, com ângulos e luz variados;")
         print("    2. cadastrar também as outras pessoas que passam — assim o")
-        print("       rosto delas casa com elas, não com você;")
+        print("       rosto delas casa com elas, não com quem já está cadastrado;")
         print("    3. aumentar recognition.min_face_size (rosto pequeno gera")
         print("       embedding ruim e é fonte clássica de confusão);")
         print("    4. melhorar o enquadramento: rosto de frente, sem contraluz.")
 
 
-def simular(db: Database, cfg, novo: float) -> None:
-    eventos = db.list_events(limit=500)
-    labels = _load_labels()
-    conhecidos = [e for e in eventos if e["is_known"]]
-    rejeitados = [e for e in conhecidos if e["score"] < novo]
+def simular(db: Database, cfg, limite: int, novo: float) -> None:
+    deteccoes = db.list_detections(limit=limite)
+    labels, _ = juntar_rotulos(db, deteccoes)
+    conhecidos = [d for d in deteccoes if d["is_known"]]
+    rejeitados = [d for d in conhecidos if d["score"] < novo]
 
-    print(f"\nCom cosine_threshold = {novo} (atual: {cfg.recognition.cosine_threshold}):")
-    print(f"  {len(rejeitados)} dos {len(conhecidos)} reconhecimentos passariam a "
+    print(f"\nCom cosine_threshold = {novo} "
+          f"(atual: {cfg.recognition.cosine_threshold}):")
+    print(f"  {len(rejeitados)} das {len(conhecidos)} identificações passariam a "
           f"'Desconhecido'.")
 
-    certos = sum(1 for e in rejeitados if labels.get(str(e["id"])) == "certo")
-    errados = sum(1 for e in rejeitados if labels.get(str(e["id"])) == "errado")
+    certos = sum(1 for d in rejeitados if labels.get(chave(d)) == "certo")
+    errados = sum(1 for d in rejeitados if labels.get(chave(d)) == "errado")
     if certos or errados:
-        print(f"  Dentre os revisados: eliminaria {errados} erro(s) "
+        print(f"  Dentre as rotuladas: eliminaria {errados} erro(s) "
               f"e perderia {certos} acerto(s).")
         if errados and not certos:
             print("  Ou seja: só ganho, sem perda — bom candidato.")
+        elif certos:
+            print("  Perder acerto significa criança presente virando não "
+                  "identificada. Pese isso contra o ganho.")
     else:
-        print("  (rode --review para saber quais desses eram erros de verdade)")
+        print("  (nenhuma das afetadas está rotulada — confira e feche chamadas "
+              "no painel para saber quais eram erro de verdade)")
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Calibra o limiar de reconhecimento.")
     ap.add_argument("--review", action="store_true",
-                    help="revisa os eventos um a um e sugere o limiar")
+                    help="revisa à mão o que as chamadas conferidas não cobriram")
     ap.add_argument("--simular", type=float, metavar="LIMIAR",
                     help="mostra o efeito de um limiar sem aplicá-lo")
+    ap.add_argument("--limite", type=int, default=500,
+                    help="quantos reconhecimentos analisar (padrão 500)")
     args = ap.parse_args()
 
     cfg = load_config_or_exit()
@@ -213,14 +314,14 @@ def main() -> int:
     porta = int(cfg.api.get("port", 8000))
 
     if args.simular is not None:
-        simular(db, cfg, args.simular)
+        simular(db, cfg, args.limite, args.simular)
     elif args.review:
-        review(db, cfg, _local_ip(), porta)
+        deteccoes = relatorio(db, cfg, args.limite)
+        review(db, cfg, deteccoes, _local_ip(), porta)
     else:
-        eventos = relatorio(db, cfg)
-        sugerir(eventos, _load_labels(), float(cfg.recognition.cosine_threshold))
-        print("\nPara marcar quais foram erros:  "
-              "python scripts/calibrate_threshold.py --review")
+        deteccoes = relatorio(db, cfg, args.limite)
+        labels, origem = juntar_rotulos(db, deteccoes)
+        sugerir(deteccoes, labels, origem, float(cfg.recognition.cosine_threshold))
     return 0
 
 

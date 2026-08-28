@@ -616,6 +616,48 @@ class Database:
                             (dia,)).fetchone()
         return dict(r) if r else None
 
+    # ---- leitura unificada para calibração ------------------------------------
+    def list_detections(self, limit: int = 500) -> list[dict]:
+        """Reconhecimentos das DUAS origens, num formato só.
+
+        O modo realtime grava em `events`, o captura em `tracks`. Ler apenas uma
+        delas fazia a calibração ficar cega justamente no modo usado em
+        produção. A coluna `fonte` diz de onde veio cada linha, e `id` não é
+        único entre as origens — a chave é o par (fonte, id).
+        """
+        with self._connect() as con:
+            rows = con.execute(
+                """
+                SELECT 'evento' AS fonte, id, person_id, name, score, ts,
+                       snapshot_path, is_known
+                FROM events
+                UNION ALL
+                SELECT 'trilha' AS fonte, t.id, t.person_id, t.name, t.score,
+                       t.started_at AS ts,
+                       (SELECT path FROM track_crops c WHERE c.track_id = t.id
+                         ORDER BY quality DESC LIMIT 1) AS snapshot_path,
+                       CASE WHEN t.person_id IS NOT NULL THEN 1 ELSE 0 END AS is_known
+                FROM tracks t
+                WHERE t.status = 'processado'
+                ORDER BY ts DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def closed_days(self) -> set:
+        with self._connect() as con:
+            return {r["dia"] for r in con.execute(
+                "SELECT dia FROM attendance_closures")}
+
+    def all_overrides(self) -> dict:
+        """(dia, person_id) -> presente(0/1), de todas as chamadas."""
+        with self._connect() as con:
+            return {(r["dia"], int(r["person_id"])): int(r["presente"])
+                    for r in con.execute(
+                        "SELECT dia, person_id, presente FROM attendance_overrides")}
+
     def count_events(self) -> int:
         with self._connect() as con:
             return int(con.execute("SELECT COUNT(*) FROM events").fetchone()[0])

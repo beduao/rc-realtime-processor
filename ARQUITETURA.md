@@ -495,11 +495,48 @@ presente = correção, quando existe;  senão, detecção automática
 
 E a diferença entre os dois vira métrica: `presente` marcado à mão onde não houve
 detecção é falso negativo; `ausente` marcado à mão onde houve detecção é falso
-positivo. É a mesma ideia do `calibrate_threshold.py`, mas aplicada ao nível da
-chamada em vez do evento individual.
+positivo.
 
 A regra "correção existe só na discordância" também mantém a tabela pequena: num
 dia em que o reconhecimento acerta tudo, ela fica vazia.
+
+### 6.56 De correção da chamada a rótulo de calibração
+
+O `calibrate_threshold.py` precisa de pares (score, acertou?). Essa é exatamente
+a informação que a conferência da chamada produz, então ela é derivada em vez de
+pedida de novo:
+
+```python
+for d in deteccoes:
+    dia = data_local(d["ts"])
+    if dia not in fechados:            # ninguém conferiu esse dia
+        continue
+    corr = overrides.get((dia, d["person_id"]))
+    if corr is None:  labels[chave(d)] = "certo"     # conferido e mantido
+    elif corr == 0:   labels[chave(d)] = "errado"    # marcado ausente
+```
+
+**A condição `dia not in fechados` é o cuidado central.** A ausência de correção
+só carrega informação se alguém revisou aquele dia. Em chamada aberta ela
+significa "ninguém olhou", e tratar as duas situações igual encheria a calibração
+de confirmações inventadas — que puxariam o limiar para baixo, na direção errada.
+O fechamento é o registro explícito de "eu revisei este dia"; é o que transforma
+silêncio em concordância.
+
+**A chave é composta.** `list_detections()` faz `UNION ALL` de `events` e
+`tracks`, e os dois têm autoincremento próprio, então o `id` sozinho colide:
+
+```python
+def chave(d):  return f"{d['fonte']}:{d['id']}"   # "evento:12", "trilha:12"
+```
+
+Sem isso, um rótulo do modo tempo real sobrescreveria um do modo captura. Foi
+essa unificação que tirou a calibração da cegueira no modo `captura`, onde antes
+ela lia só `events` e via zero reconhecimento.
+
+O `--review`, que pergunta evento por evento, continua existindo para dias não
+conferidos, e o rótulo manual tem precedência sobre o derivado — quem olhou o
+recorte específico viu mais do que quem fechou a chamada.
 
 ### 6.6 VACUUM fora de transação
 

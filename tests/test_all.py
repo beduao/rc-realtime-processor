@@ -1430,25 +1430,131 @@ def find_camera_classifica_sem_afirmar_demais():
     return "roteador não é chamado de câmera; MAC validado por formato"
 
 
+def _cenario_calibracao(nome):
+    """Detecções nas duas origens, no dia de hoje."""
+    from core.database import Database
+    pasta = os.path.join(TMP, nome)
+    os.makedirs(pasta, exist_ok=True)
+    db = Database(os.path.join(pasta, "dados.db"))
+    ana = db.add_person("Ana")
+    bruno = db.add_person("Bruno")
+
+    hoje = time.localtime()
+    meia = time.mktime((hoje.tm_year, hoje.tm_mon, hoje.tm_mday, 0, 0, 0, 0, 0, -1))
+    dia = time.strftime("%Y-%m-%d", time.localtime(meia))
+    crop = [{"path": "20260826/c.jpg", "quality": 1.0, "face": "[]"}]
+
+    # Ana pelo modo realtime (events), com dois scores
+    for sc in (0.88, 0.71):
+        db.add_event(ana, "Ana", sc, "20260826/e.jpg", 1)
+    # Bruno pelo modo captura (tracks) — invisível para a versão anterior
+    tid = db.add_track(meia + 7.5 * 3600, meia + 7.5 * 3600 + 1, 9, crop)
+    db.resolve_track(tid, bruno, "Bruno", 0.41, "[]")
+    return db, pasta, dia, ana, bruno
+
+
+@teste
+def calibracao_le_as_duas_origens():
+    """A versão anterior lia só `events` e ficava cega no modo captura."""
+    from core.database import Database  # noqa: F401
+    db, pasta, dia, ana, bruno = _cenario_calibracao("calfonte")
+
+    det = db.list_detections(limit=100)
+    fontes = {d["fonte"] for d in det}
+    assert fontes == {"evento", "trilha"}, f"faltou uma origem: {fontes}"
+    assert len(det) == 3, det
+    trilha = next(d for d in det if d["fonte"] == "trilha")
+    assert trilha["name"] == "Bruno" and trilha["is_known"] == 1
+    assert trilha["snapshot_path"] == "20260826/c.jpg", "recorte não veio"
+
+    # a chave precisa distinguir origens: id repete entre as tabelas
+    from scripts.calibrate_threshold import chave
+    assert len({chave(d) for d in det}) == 3, "chaves colidiram entre origens"
+    return "events + tracks unidos, com recorte e chave sem colisão"
+
+
+@teste
+def calibracao_so_confia_em_chamada_fechada():
+    """Chamada aberta sem correção significa 'ninguém olhou', não 'está certo'."""
+    from scripts.calibrate_threshold import chave, rotulos_da_chamada
+    db, pasta, dia, ana, bruno = _cenario_calibracao("calfech")
+    det = db.list_detections(limit=100)
+
+    # chamada AINDA NÃO conferida -> nenhum rótulo derivado
+    assert rotulos_da_chamada(db, det) == {}, \
+        "tratou chamada aberta como confirmação"
+
+    # marca Bruno como ausente (identificação equivocada) e fecha
+    db.set_attendance_override(dia, bruno, False, "não era ele", "Beatriz")
+    db.close_attendance(dia, "Beatriz", 1, 1)
+
+    labels = rotulos_da_chamada(db, det)
+    por_fonte = {chave(d): d for d in det}
+    # Ana: conferida e sem correção -> confirmada
+    for d in det:
+        if d["person_id"] == ana:
+            assert labels[chave(d)] == "certo", labels
+    # Bruno: marcado ausente -> identificação errada
+    trilha = next(d for d in det if d["person_id"] == bruno)
+    assert labels[chave(trilha)] == "errado", labels
+
+    # sugestão sai daí, sem ninguém rotular à mão
+    import io
+    from contextlib import redirect_stdout
+    from scripts.calibrate_threshold import juntar_rotulos, sugerir
+    combinado, origem = juntar_rotulos(db, det)
+    assert origem["chamada"] == 3 and origem["manual"] == 0, origem
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        sugerir(det, combinado, origem, 0.363)
+    saida = buf.getvalue()
+    # erro em 0.41, pior acerto em 0.71 -> ponto médio 0.56
+    assert "SEPARADAS" in saida and "0.56" in saida, saida
+    assert "3 de chamadas conferidas" in saida, saida
+
+    # correção "presente" (falso negativo) não rotula detecção — não houve
+    db.reopen_attendance(dia)
+    db.set_attendance_override(dia, ana, True, "", "Beatriz")
+    db.close_attendance(dia, "Beatriz", 2, 2)
+    labels2 = rotulos_da_chamada(db, det)
+    assert all(labels2[chave(d)] == "certo" or d["person_id"] == bruno
+               for d in det if chave(d) in labels2)
+    return ("chamada aberta não confirma; fechada rende rótulos automáticos; "
+            "ponto médio calculado sem revisão manual")
+
+
 @teste
 def calibracao_nao_inventa_limiar_quando_ha_sobreposicao():
     import io
     from contextlib import redirect_stdout
     from scripts.calibrate_threshold import sugerir
-    ev = [{"id": 1, "score": 0.42}, {"id": 2, "score": 0.85}, {"id": 3, "score": 0.88}]
-    buf = io.StringIO()
-    with redirect_stdout(buf):
-        sugerir(ev, {"1": "errado", "2": "certo", "3": "certo"}, 0.363)
-    saida = buf.getvalue()
+
+    def det(*scores):
+        return [{"fonte": "evento", "id": i + 1, "score": s}
+                for i, s in enumerate(scores)]
+
+    def rodar(deteccoes, rotulos):
+        origem = {"chamada": len(rotulos), "manual": 0, "total": len(rotulos)}
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            sugerir(deteccoes, rotulos, origem, 0.363)
+        return buf.getvalue()
+
+    # separadas: pior erro 0.42, pior acerto 0.85 -> ponto médio 0.635
+    saida = rodar(det(0.42, 0.85, 0.88),
+                  {"evento:1": "errado", "evento:2": "certo", "evento:3": "certo"})
     assert "SEPARADAS" in saida and "0.635" in saida, saida
 
-    ev2 = [{"id": 1, "score": 0.50}, {"id": 2, "score": 0.80}, {"id": 3, "score": 0.60}]
-    buf2 = io.StringIO()
-    with redirect_stdout(buf2):
-        sugerir(ev2, {"1": "certo", "2": "errado", "3": "certo"}, 0.363)
-    s2 = buf2.getvalue()
+    # sobrepostas: erro 0.80 acima de acertos 0.50 e 0.60 -> não sugere número
+    s2 = rodar(det(0.50, 0.80, 0.60),
+               {"evento:1": "certo", "evento:2": "errado", "evento:3": "certo"})
     assert "SOBREP" in s2 and "Limiar sugerido" not in s2, s2
-    return "separadas -> sugere 0.635; sobrepostas -> explica sem inventar número"
+
+    # sem rótulo nenhum: aponta os dois caminhos, não chuta
+    s3 = rodar(det(0.5, 0.6), {})
+    assert "Sem rótulo nenhum" in s3 and "FECHE chamadas" in s3, s3
+    return ("separadas -> 0.635; sobrepostas -> explica sem inventar; "
+            "sem rótulo -> orienta a conferir chamadas")
 
 
 # --------------------------------------------------------------------------- #

@@ -707,22 +707,55 @@ verdade universal. Ele decide entre "é a Maria" e "é um desconhecido".
   virando "Desconhecido".
 - Descer (ex.: 0.30): reconhece mais, com risco de confundir pessoas parecidas.
 
-Calibre com os seus dados, não por palpite. Deixe rodar algumas horas e use:
+Calibre com os seus dados, não por palpite:
 
 ```bash
-.venv/bin/python scripts/calibrate_threshold.py            # distribuição dos scores
-.venv/bin/python scripts/calibrate_threshold.py --review    # marca acerto/erro e sugere
+.venv/bin/python scripts/calibrate_threshold.py            # relatório e sugestão
 .venv/bin/python scripts/calibrate_threshold.py --simular 0.55   # efeito antes de aplicar
+.venv/bin/python scripts/calibrate_threshold.py --review    # rotular à mão (só se precisar)
 ```
 
-No `--review` ele mostra cada reconhecimento com o link da foto e pergunta se
-acertou. Com isso separa a distribuição dos acertos da dos erros e propõe um
-limiar entre as duas. As respostas ficam salvas, então dá para revisar aos poucos.
+### De onde ele tira a verdade
 
-Se as distribuições **se sobrepõem**, ele avisa em vez de inventar um número —
-e com razão: nesse caso nenhum limiar separa os dois casos, e mexer nele só
-troca falso positivo por falso negativo. O que resolve aí é cadastro e
-enquadramento (veja abaixo).
+**Das chamadas que você conferiu e fechou.** É a fonte principal, e não exige
+trabalho extra nenhum além de usar a aba Chamada normalmente:
+
+- aluno marcado **ausente** numa chamada fechada → as detecções dele naquele dia
+  foram identificação equivocada;
+- aluno **sem correção** numa chamada **fechada** → alguém revisou e concordou,
+  então as detecções dele estão confirmadas.
+
+A exigência de a chamada estar **fechada** é o ponto delicado. Em chamada aberta,
+não haver correção significa "ninguém olhou", não "está correto" — tratar as duas
+situações igual encheria a calibração de confirmações falsas.
+
+Ou seja: **conferir e fechar a chamada todos os dias alimenta a calibração
+sozinho.** O `--review`, que pergunta evento por evento, existe só para dias que
+não foram conferidos.
+
+O relatório diz de onde vieram os rótulos:
+
+```
+rótulos: 12 de chamadas conferidas + 0 manuais
+```
+
+### Como ele chega no número
+
+Calcula duas coisas: o **maior score entre os erros** e o **menor score entre os
+acertos**. Se o pior erro ficou abaixo do pior acerto, existe uma faixa livre
+entre eles e qualquer valor ali separa os dois casos. Ele sugere o **ponto
+médio**, que fica o mais longe possível do pior caso de cada lado — a maior
+tolerância a variação futura.
+
+Se as distribuições **se sobrepõem**, ele avisa em vez de inventar um número.
+Nesse caso nenhum limiar separa os casos, e mexer nele só troca falso positivo
+por falso negativo. O que resolve é cadastro e enquadramento (veja abaixo).
+
+> Uma consequência que vale entender: se o sistema identifica a pessoa **certa**
+> com score muito baixo, esse valor entra como acerto e passa a limitar o quanto
+> o limiar pode subir. Está correto — subir além dele faria essa criança deixar
+> de ser reconhecida. Mas indica que o caminho não é o limiar, é melhorar o
+> cadastro dela para que os acertos pontuem mais alto.
 
 ### Falso positivo: identifica outra pessoa como alguém cadastrado
 
