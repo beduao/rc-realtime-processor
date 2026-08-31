@@ -1009,12 +1009,12 @@ def api_chamada_correcao_manual_preserva_o_automatico():
     # Carla veio mas o sistema não pegou -> falso negativo
     r = c.post("/attendance/override", json={
         "dia": dia, "person_id": carla, "presente": True,
-        "motivo": "chegou antes da câmera", "autor": "Beatriz"})
+        "motivo": "chegou antes da câmera", "autor": "Operador"})
     assert r.status_code == 200, r.text
     # Bruno foi identificado por engano -> falso positivo
     assert c.post("/attendance/override", json={
         "dia": dia, "person_id": bruno, "presente": False,
-        "autor": "Beatriz"}).status_code == 200
+        "autor": "Operador"}).status_code == 200
 
     d = c.get("/attendance", params={"dia": dia}).json()
     nomes_presentes = {p["nome"] for p in d["presentes"]}
@@ -1027,7 +1027,7 @@ def api_chamada_correcao_manual_preserva_o_automatico():
     assert carla_linha["origem"] == "manual_presente"
     assert carla_linha["detectado_pelo_sistema"] is False
     assert carla_linha["correcao"]["motivo"] == "chegou antes da câmera"
-    assert carla_linha["correcao"]["autor"] == "Beatriz"
+    assert carla_linha["correcao"]["autor"] == "Operador"
 
     bruno_linha = d["ausentes"][0]
     assert bruno_linha["origem"] == "manual_ausente"
@@ -1064,18 +1064,18 @@ def api_chamada_fechamento_trava_edicao_e_exige_lote_vazio():
 
     # trilha PENDENTE deve impedir o fechamento: fecharia chamada incompleta
     db.add_track(meia + 7 * 3600, meia + 7 * 3600 + 1, 5, crop)
-    r = c.post("/attendance/close", json={"dia": dia, "autor": "Beatriz"})
+    r = c.post("/attendance/close", json={"dia": dia, "autor": "Operador"})
     assert r.status_code == 409, f"deixou fechar com pendência: {r.status_code}"
     assert "recognize_batch" in r.json()["detail"], r.json()
 
     # resolvida a pendência, fecha
     pend = db.pending_tracks()[0]
     db.resolve_track(pend["id"], ana, "Ana", 0.9, "[]")
-    r = c.post("/attendance/close", json={"dia": dia, "autor": "Beatriz"})
+    r = c.post("/attendance/close", json={"dia": dia, "autor": "Operador"})
     assert r.status_code == 200, r.text
 
     d = c.get("/attendance", params={"dia": dia}).json()
-    assert d["conferida"] is True and d["fechamento"]["autor"] == "Beatriz"
+    assert d["conferida"] is True and d["fechamento"]["autor"] == "Operador"
     assert d["aviso"] is None, "chamada conferida não deveria avisar"
 
     # fechada não aceita mais correção
@@ -1485,8 +1485,8 @@ def calibracao_so_confia_em_chamada_fechada():
         "tratou chamada aberta como confirmação"
 
     # marca Bruno como ausente (identificação equivocada) e fecha
-    db.set_attendance_override(dia, bruno, False, "não era ele", "Beatriz")
-    db.close_attendance(dia, "Beatriz", 1, 1)
+    db.set_attendance_override(dia, bruno, False, "não era ele", "Operador")
+    db.close_attendance(dia, "Operador", 1, 1)
 
     labels = rotulos_da_chamada(db, det)
     por_fonte = {chave(d): d for d in det}
@@ -1514,8 +1514,8 @@ def calibracao_so_confia_em_chamada_fechada():
 
     # correção "presente" (falso negativo) não rotula detecção — não houve
     db.reopen_attendance(dia)
-    db.set_attendance_override(dia, ana, True, "", "Beatriz")
-    db.close_attendance(dia, "Beatriz", 2, 2)
+    db.set_attendance_override(dia, ana, True, "", "Operador")
+    db.close_attendance(dia, "Operador", 2, 2)
     labels2 = rotulos_da_chamada(db, det)
     assert all(labels2[chave(d)] == "certo" or d["person_id"] == bruno
                for d in det if chave(d) in labels2)
@@ -1555,6 +1555,163 @@ def calibracao_nao_inventa_limiar_quando_ha_sobreposicao():
     assert "Sem rótulo nenhum" in s3 and "FECHE chamadas" in s3, s3
     return ("separadas -> 0.635; sobrepostas -> explica sem inventar; "
             "sem rótulo -> orienta a conferir chamadas")
+
+
+def _banco_recall(nome):
+    """Banco com pessoas e um helper para plantar trilhas."""
+    from core.database import Database
+    pasta = os.path.join(TMP, nome)
+    os.makedirs(pasta, exist_ok=True)
+    db = Database(os.path.join(pasta, "r.db"))
+    ids = {n: db.add_person(n) for n in ("Alfa", "Beta", "Gama", "Delta")}
+    crop = [{"path": "c.jpg", "quality": 1.0, "face": "[]"}]
+
+    def trilha(ts, nome_visto, score, status="processado"):
+        t = db.add_track(ts, ts + 1, 8, crop)
+        pid = ids.get(nome_visto)
+        db.resolve_track(t, pid, nome_visto or "Desconhecido", score, "[]",
+                         status)
+        return t
+
+    return db, ids, trilha
+
+
+@teste
+def recall_classifica_cada_degrau_do_funil():
+    """Protocolo espaçado: o horário atribui sozinho, sem ambiguidade."""
+    from collections import Counter
+    from scripts.measure_recall import atribuir
+
+    db, ids, trilha = _banco_recall("recall_funil")
+    base = 1_700_000_000.0
+    pessoas = {p["name"].lower(): p["id"] for p in db.list_people()}
+
+    # Uma passagem a cada 60s, cada uma com um desfecho diferente.
+    plano = [("Alfa", "acerto"), ("Beta", "desconhecido"), ("Gama", "errada"),
+             ("Delta", "sem_recorte"), ("Alfa", "nao_detectada")]
+    passagens = []
+    for i, (nome, desfecho) in enumerate(plano):
+        ts = base + i * 60
+        passagens.append({"nome": nome, "ts": ts, "rodada": "sozinho"})
+        if desfecho == "acerto":
+            trilha(ts + 2, nome, 0.70)
+        elif desfecho == "desconhecido":
+            trilha(ts + 2, None, 0.30)
+        elif desfecho == "errada":
+            trilha(ts + 2, "Delta", 0.45)          # Gama identificada como Delta
+        elif desfecho == "sem_recorte":
+            trilha(ts + 2, None, 0.0, "descartado")
+        # nao_detectada: não planta nada
+
+    dets = db.detections_between(base - 30, base + 400)
+    sobraram = atribuir(passagens, dets, pessoas, 10.0)
+    obtido = Counter(p["resultado"] for p in passagens)
+
+    esperado = {"acerto": 1, "desconhecido": 1, "errada": 1,
+                "sem_recorte": 1, "nao_detectada": 1}
+    assert dict(obtido) == esperado, f"{dict(obtido)} != {esperado}"
+    assert sobraram == 0, f"sobraram {sobraram} detecções"
+    assert not any(p["ambiguo"] for p in passagens), "não devia haver ambíguo"
+
+    errada = next(p for p in passagens if p["resultado"] == "errada")
+    assert errada["nome"] == "Gama" and errada["visto"] == "Delta", errada
+    return "5 degraus reconhecidos; nada sobrando; nenhuma ambiguidade"
+
+
+@teste
+def recall_nao_inventa_erro_com_passagens_vizinhas():
+    """O bug que o teste pegou: vizinha próxima virava 'pessoa errada'.
+
+    Alfa e Beta atravessam com 2s de diferença e AMBOS são identificados
+    certo. Classificando isolado, a detecção da Alfa cai na janela do Beta e
+    é contada como 'Beta identificado como Alfa' — erro inventado.
+    """
+    from collections import Counter
+    from scripts.measure_recall import atribuir
+
+    db, ids, trilha = _banco_recall("recall_vizinha")
+    base = 1_700_100_000.0
+    pessoas = {p["name"].lower(): p["id"] for p in db.list_people()}
+
+    passagens = [{"nome": "Alfa", "ts": base, "rodada": "grupo"},
+                 {"nome": "Beta", "ts": base + 2, "rodada": "grupo"}]
+    trilha(base + 1, "Alfa", 0.71)
+    trilha(base + 3, "Beta", 0.69)
+
+    dets = db.detections_between(base - 30, base + 60)
+    atribuir(passagens, dets, pessoas, 10.0)
+    obtido = Counter(p["resultado"] for p in passagens)
+
+    assert obtido["acerto"] == 2, f"esperava 2 acertos, veio {dict(obtido)}"
+    assert obtido["errada"] == 0, "inventou erro com vizinha na janela"
+    return "duas passagens a 2s, ambas certas, zero erro inventado"
+
+
+@teste
+def recall_marca_ambiguidade_em_travessia_simultanea():
+    """Horário idêntico não decide de quem é o rosto — e o script diz isso."""
+    import io
+    from contextlib import redirect_stdout
+    from scripts.measure_recall import atribuir, _relatorio_funil
+
+    db, ids, trilha = _banco_recall("recall_ambiguo")
+    base = 1_700_200_000.0
+    pessoas = {p["name"].lower(): p["id"] for p in db.list_people()}
+
+    # Três pessoas atravessam JUNTAS; sai uma detecção nomeando a Alfa.
+    passagens = [{"nome": n, "ts": base, "rodada": "grupo"}
+                 for n in ("Alfa", "Beta", "Gama")]
+    trilha(base + 1, "Alfa", 0.70)
+
+    dets = db.detections_between(base - 30, base + 60)
+    atribuir(passagens, dets, pessoas, 10.0)
+
+    acerto = next(p for p in passagens if p["resultado"] == "acerto")
+    assert acerto["ambiguo"], "devia marcar ambíguo: horários empatados"
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        _relatorio_funil(passagens, 0.363)
+    saida = buf.getvalue()
+    assert "não é" in saida and "mensurável" in saida, saida
+    assert "UM POR VEZ" in saida, "devia indicar a rodada espaçada"
+    return "empate de horário marca ambíguo e o relatório recusa o número"
+
+
+@teste
+def recall_da_chamada_conta_falso_negativo():
+    """Presente marcado à mão sem detecção nenhuma = o sistema perdeu."""
+    import io
+    from contextlib import redirect_stdout
+    from scripts.measure_recall import medir_chamada
+
+    db, ids, trilha = _banco_recall("recall_chamada")
+    hoje = time.strftime("%Y-%m-%d")
+    base = time.mktime(time.strptime(f"{hoje} 07:30:00", "%Y-%m-%d %H:%M:%S"))
+
+    for i, n in enumerate(("Alfa", "Beta")):          # sistema pegou 2
+        trilha(base + i * 20, n, 0.70)
+    # conferência: Delta estava lá e o sistema não pegou
+    db.set_attendance_override(hoje, ids["Delta"], True, "vi entrar", "Alfa")
+    db.close_attendance(hoje, "Alfa", 3, 1)
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = medir_chamada(db)
+    saida = buf.getvalue()
+
+    assert rc == 0, saida
+    assert "2 de 3" in saida, saida            # 2 identificados de 3 presentes
+    assert "Delta" in saida, "devia nomear quem foi perdido"
+    assert "66.7%" in saida, saida
+
+    # dia aberto não conta: reabre e a medição não deve mais achar nada
+    db.reopen_attendance(hoje)
+    buf2 = io.StringIO()
+    with redirect_stdout(buf2):
+        rc2 = medir_chamada(db)
+    assert rc2 == 1 and "Nenhuma chamada fechada" in buf2.getvalue()
+    return "recall 2/3 com Delta nomeado; chamada reaberta deixa de contar"
 
 
 # --------------------------------------------------------------------------- #

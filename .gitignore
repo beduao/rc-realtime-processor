@@ -11,5 +11,10 @@ data/
 # Modelos baixados
 models/*.onnx
 
+# Registros do teste de passagem: contêm NOMES de pessoas reais.
+# Quando o piloto virar operação, nomes de crianças — não vão para o repositório.
+registro*.csv
+*passagens*.csv
 
+# Notas internas
 MUDANCAS.md

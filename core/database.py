@@ -646,6 +646,34 @@ class Database:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def detections_between(self, inicio: float, fim: float) -> list[dict]:
+        """Detecções de um intervalo, das duas origens e de TODOS os status.
+
+        Difere de `list_detections()` em dois pontos, ambos exigidos pela medição
+        de recall: filtra por tempo (a medição cruza janelas de passagem) e não
+        descarta trilha com `status != 'processado'`. Trilha `descartado` é um
+        degrau próprio do funil — o rosto foi detectado e rastreado, mas nenhum
+        recorte ficou legível. Escondê-la faria essa falha ser contada como
+        "nunca detectado", que tem causa e solução completamente diferentes.
+        """
+        with self._connect() as con:
+            rows = con.execute(
+                """
+                SELECT 'evento' AS fonte, id, person_id, name, score, ts,
+                       'processado' AS status, snapshot_path AS crop
+                FROM events WHERE ts BETWEEN ? AND ?
+                UNION ALL
+                SELECT 'trilha' AS fonte, t.id, t.person_id, t.name, t.score,
+                       t.started_at AS ts, t.status,
+                       (SELECT path FROM track_crops c WHERE c.track_id = t.id
+                         ORDER BY quality DESC LIMIT 1) AS crop
+                FROM tracks t WHERE t.started_at BETWEEN ? AND ?
+                ORDER BY ts
+                """,
+                (inicio, fim, inicio, fim),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
     def closed_days(self) -> set:
         with self._connect() as con:
             return {r["dia"] for r in con.execute(

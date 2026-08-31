@@ -41,6 +41,7 @@ Câmera Intelbras ──RTSP──► worker.py ──┐
 | `scripts/check_pi.py` | Diagnóstico do Pi + medição de FPS real (abre a câmera) |
 | `scripts/monitor.py` | Acompanha CPU, temperatura, memória e fila **com o worker rodando** |
 | `scripts/calibrate_threshold.py` | Calibra o limiar usando as chamadas já conferidas como referência |
+| `scripts/measure_recall.py` | Mede quantas pessoas o sistema deixa passar (falso negativo) |
 | `scripts/recognize_batch.py` | Fase 2 do modo captura: reconhece por votação e gera a presença |
 | `scripts/set_mode.py` | Alterna entre `realtime` e `captura` sem reiniciar o serviço |
 | `tests/test_all.py` | Suíte de regressão (roda sem câmera e sem os modelos) |

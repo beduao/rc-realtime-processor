@@ -300,7 +300,7 @@ Copie a pasta do projeto para o Pi (do seu PC):
 # ATENÇÃO: não copie a pasta .venv nem data/ do PC — o .venv não funciona em
 # outra máquina e é a causa nº 1 de "no PC funcionava".
 rsync -av --exclude .venv --exclude __pycache__ --exclude .git \
-      ./rc-realtime-processor/ beatriz@IP_DO_PI:~/rc-realtime-processor/
+      ./rc-realtime-processor/ USUARIO@IP_DO_PI:~/rc-realtime-processor/
 ```
 
 No Pi, via SSH:
@@ -700,7 +700,7 @@ curl -H "X-API-Token: SEU_TOKEN" http://IP_DO_PI:8000/attendance
 ## 7. Calibrar o limiar de reconhecimento
 
 `recognition.cosine_threshold: 0.363` é o valor de referência do SFace, não uma
-verdade universal. Ele decide entre "é a Maria" e "é um desconhecido".
+verdade universal. Ele decide entre "é a Aluno D" e "é um desconhecido".
 
 - Score **alto** = rostos parecidos. `>= limiar` → mesma pessoa.
 - Subir o limiar (ex.: 0.45): menos falsos positivos, mais gente conhecida
@@ -772,6 +772,120 @@ Em ordem de eficácia:
    gera embedding ruim e é fonte clássica de confusão.
 5. **Melhore o enquadramento**: rosto de frente, sem contraluz, na altura dos
    olhos.
+
+---
+
+## 7.5 Medir o recall — quantas crianças o sistema deixa passar
+
+Falso positivo aparece sozinho: alguém é identificado errado e você vê. Falso
+negativo **não aparece**. A criança que passou e não foi detectada não deixa
+evento, não deixa trilha, não deixa log — ela é invisível justamente por ter
+falhado. Então medir recall exige uma lista de fora: quem de fato estava lá.
+
+```bash
+.venv/bin/python scripts/measure_recall.py --chamada
+.venv/bin/python scripts/measure_recall.py --passagens registro.csv
+```
+
+### Duas métricas, e a diferença entre elas importa
+
+**Recall por passagem** — de cada travessia do corredor, o sistema identificou?
+Diagnostica o pipeline.
+
+**Recall por dia** — de cada criança presente, o sistema pegou ao menos uma vez?
+**É este que decide se a chamada sai certa.** A criança passa muitas vezes na
+frente da câmera; basta acertar uma. 60% por passagem pode ser 99% por dia.
+
+Olhar só o primeiro assusta sem motivo. Olhar só o segundo esconde que o
+pipeline está no limite e vai quebrar no primeiro dia de chuva.
+
+### Em operação: `--chamada`
+
+A lista de fora é a sua conferência. Aluno que você marcou **presente** à mão e
+que o sistema não detectou é falso negativo. Só conta dia **fechado**, pela mesma
+razão da calibração. Saída:
+
+```
+dia           presentes  perdidos  quem o sistema perdeu
+2026-08-29            4         1  Aluno C
+2026-08-30            3         1  Aluno C
+  Recall: 66.7%
+  Perdidos em mais de um dia: Aluno C
+```
+
+Falha repetida na mesma pessoa é problema do cadastro **dela**, não do sistema —
+vale recadastrar com mais ângulos.
+
+### No piloto: teste de passagem controlado
+
+Pessoas conhecidas atravessam o corredor um número combinado de vezes e você
+anota. CSV com `nome;hora;rodada`:
+
+```
+nome;hora;rodada
+Aluno A;07:32:10;sozinho
+Aluno B;07:32:18;sozinho
+Aluno A;07:40:00;grupo
+Aluno B;07:40:00;grupo
+```
+
+**Duas rodadas, e a diferença entre elas é a informação mais útil:**
+
+| rodada | como | o que mede |
+|---|---|---|
+| `sozinho` | um por vez, ~5s de intervalo | o teto do sistema, e o único número de identificação por passagem que é confiável |
+| `grupo` | 4 ou 5 juntos, correndo | a condição real de manhã |
+
+Se `sozinho` der 95% e `grupo` 50%, o gargalo é aglomeração e enquadramento —
+mexer em cadastro não resolve. Se `sozinho` já der 60%, o problema é o
+reconhecimento e a rodada em grupo nem importa ainda.
+
+**Por que só a rodada espaçada dá o número de identificação.** Se três crianças
+atravessam no mesmo instante e sai uma detecção dizendo "Aluno A", ela pode ser a
+Aluno A certa ou outra criança confundida com ela. Horário anotado à mão não
+separa os dois casos — é indecidível, e o script avisa em vez de escolher o caso
+favorável e inflar o resultado. Ele lista os recortes contestados com o link para
+você olhar a foto, que é a única fonte que resolve.
+
+O que **continua válido** na rodada em grupo são os degraus de detecção (nunca
+detectada, sem recorte legível, não reconhecida): esses não dependem de saber de
+quem é o rosto.
+
+### O funil
+
+O relatório separa a falha em quatro degraus, porque cada um tem solução
+diferente e um número só não diz o que fazer:
+
+| degrau | o que resolve |
+|---|---|
+| Nunca detectada | posição/altura da câmera, iluminação, `min_face_size`, resolução |
+| Rastreada, sem recorte legível | qualidade da captura, `top_k` |
+| Detectada, não reconheceu | cadastro: mais amostras, ângulos e luz variados |
+| Identificada como outra pessoa | cadastrar quem **não** está na galeria; limiar |
+
+A última conta duas vezes: falso negativo de quem passou e falso positivo de quem
+foi nomeado.
+
+Entre as não reconhecidas, ele separa quem chegou a menos de 0.08 do limiar de
+quem ficou muito abaixo. A primeira faixa é recuperável com mais amostras; a
+segunda é rosto irreconhecível (borrão, perfil, escuro) e limiar não conserta.
+
+### Quantas passagens
+
+```
+ passagens | se observar 80%, o valor real está entre
+        10 |  55% a 105%   (inútil)
+        30 |  66% a  94%
+       100 |  72% a  88%
+```
+
+Umas 30 por rodada já dizem se está na casa dos 60 ou dos 90. 100 por rodada é
+medição de verdade — com 4 pessoas dá 25 travessias cada, meia hora de trabalho.
+O relatório sempre mostra o intervalo de confiança, para não sugerir precisão que
+a amostra não tem.
+
+**Antes de começar, cadastre todos os participantes** — inclusive quem não é
+alvo do teste. Galeria com uma pessoa só força todo rosto a casar com ela.
 
 ---
 
