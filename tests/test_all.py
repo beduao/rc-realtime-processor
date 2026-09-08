@@ -734,8 +734,16 @@ def cadastro_usa_o_frame_do_worker_quando_ele_esta_no_ar():
             "frame velho é descartado")
 
 
-def _api_cliente(nome="api"):
-    """Sobe a API com engine falsa e frame vindo de 'worker'. Devolve (client, cfg)."""
+def _api_cliente(nome="api", host="127.0.0.1", **over):
+    """Sobe a API com engine falsa e frame vindo de 'worker'. Devolve (client, cfg).
+
+    `host` é o IP que a API verá como origem da requisição. O padrão é
+    127.0.0.1 porque a autenticação por exposição libera a máquina local, e
+    estes testes exercitam funcionalidade, não credencial. Os testes de
+    autenticação passam um IP remoto de propósito.
+
+    `over` aceita chaves "secao.chave" para mexer no config (ex.: api.token).
+    """
     import importlib
     import core.config as cc
     import core.face_engine as fe
@@ -746,6 +754,9 @@ def _api_cliente(nome="api"):
     cfg["storage"]["db_path"] = os.path.join(pasta, "dados.db")
     cfg["storage"]["snapshots_dir"] = os.path.join(pasta, "snaps")
     cfg["storage"]["live_path"] = os.path.join(pasta, "live.jpg")
+    for k, v in over.items():
+        sec, _, chave = k.partition(".")
+        cfg.setdefault(sec, {})[chave] = v
     caminho = os.path.join(pasta, "cfg.yaml")
     yaml.safe_dump(cfg, open(caminho, "w"))
     os.environ["FACIAL_CONFIG"] = caminho
@@ -785,7 +796,7 @@ def _api_cliente(nome="api"):
     api = importlib.import_module("api")
     importlib.reload(api)
     from fastapi.testclient import TestClient
-    return TestClient(api.app), pasta
+    return TestClient(api.app, client=(host, 45678)), pasta
 
 
 @teste
@@ -1712,6 +1723,256 @@ def recall_da_chamada_conta_falso_negativo():
         rc2 = medir_chamada(db)
     assert rc2 == 1 and "Nenhuma chamada fechada" in buf2.getvalue()
     return "recall 2/3 com Delta nomeado; chamada reaberta deixa de contar"
+
+
+@teste
+def auth_libera_local_e_recusa_remoto_sem_token():
+    """A regra por exposição: local passa, rede sem token é RECUSADA."""
+    try:
+        import fastapi.testclient  # noqa: F401
+    except ImportError:
+        return "PULADO: fastapi.testclient indisponível"
+
+    # mesma máquina, nenhum token no config -> tudo liberado
+    c, _ = _api_cliente("auth_local", host="127.0.0.1")
+    assert c.get("/health").status_code == 200
+    assert c.get("/people").status_code == 200, "local não devia exigir token"
+    assert c.get("/docs").status_code == 200, "/docs local devia abrir"
+
+    import importlib
+    api = importlib.import_module("api")
+    # As formas de endereço local que uma lista fixa deixaria de fora.
+    # ::ffff:127.0.0.1 é conexão IPv4 chegando por socket IPv6 (dual-stack);
+    # 127.0.0.2 porque o loopback é o /8 inteiro, não só o .1.
+    for local in ("127.0.0.1", "::1", "127.0.0.2", "::ffff:127.0.0.1",
+                  "127.255.255.254"):
+        assert api.endereco_local(local), f"{local} devia contar como local"
+    for remoto in ("10.0.0.9", "192.168.1.7", "0.0.0.0", "", "testclient",
+                   "::ffff:10.0.0.9"):
+        assert not api.endereco_local(remoto), f"{remoto} NÃO devia ser local"
+
+    # pela rede, nenhum token configurado -> 503 (antes isto era 200 aberto)
+    c2, _ = _api_cliente("auth_remoto_sem", host="10.0.0.9")
+    assert c2.get("/health").status_code == 200, "/health fica aberta"
+    r = c2.get("/people")
+    assert r.status_code == 503, f"esperava 503, veio {r.status_code}"
+    assert "token" in r.json()["detail"].lower(), r.json()
+    assert "secrets.token_urlsafe" in r.json()["detail"], "devia ensinar a gerar"
+
+    # a forma IPv6-mapeada precisa passar como local, senão o teste local
+    # numa máquina em dual-stack tomaria 503
+    c3, _ = _api_cliente("auth_v6", host="::ffff:127.0.0.1")
+    assert c3.get("/people").status_code == 200, "IPv4 via socket IPv6 travou"
+    return ("local sem token: 200 (inclui ::ffff:127.0.0.1) | "
+            "rede sem token: 503 com instrução")
+
+
+@teste
+def auth_valida_token_e_protege_o_docs():
+    """Token certo passa, errado não, e /docs deixa de vazar o mapa da API."""
+    try:
+        import fastapi.testclient  # noqa: F401
+    except ImportError:
+        return "PULADO: fastapi.testclient indisponível"
+
+    c, _ = _api_cliente("auth_token", host="10.0.0.9", **{"api.token": "s3gr3d0"})
+
+    assert c.get("/people").status_code == 401, "sem cabeçalho devia dar 401"
+    assert c.get("/people", headers={"x-api-token": "errado"}).status_code == 401
+    assert c.get("/people", headers={"x-api-token": "s3gr3d0"}).status_code == 200
+    # Bearer é a forma que o sistema da escola provavelmente vai usar
+    assert c.get("/people",
+                 headers={"authorization": "Bearer s3gr3d0"}).status_code == 200
+
+    # /docs, /openapi.json e /redoc: registradas no nível do Starlette, não
+    # executam dependências do router. Com `dependencies=[Depends(...)]` no app
+    # elas respondiam 200 para cliente remoto sem token — o middleware corrige.
+    for rota in ("/docs", "/openapi.json", "/redoc"):
+        assert c.get(rota).status_code == 401, f"{rota} vazou sem token"
+        assert c.get(rota, headers={"x-api-token": "s3gr3d0"}).status_code == 200
+
+    return "401 sem/com token errado; 200 via header e Bearer; /docs protegido"
+
+
+@teste
+def auth_tokens_por_consumidor_e_compatibilidade():
+    """Mapa nome->token funciona, identifica quem chamou, e revoga em separado."""
+    try:
+        import fastapi.testclient  # noqa: F401
+    except ImportError:
+        return "PULADO: fastapi.testclient indisponível"
+
+    import importlib
+    api = importlib.import_module("api")
+
+    # forma nova
+    assert api._carregar_tokens({"tokens": {"painel": "a", "escola": "b"}}) == \
+        {"painel": "a", "escola": "b"}
+    # forma antiga continua valendo
+    assert api._carregar_tokens({"token": "x"}) == {"padrao": "x"}
+    # as duas juntas
+    assert api._carregar_tokens({"token": "x", "tokens": {"escola": "b"}}) == \
+        {"padrao": "x", "escola": "b"}
+    # vazio e lixo são ignorados, não viram token válido
+    assert api._carregar_tokens({"token": "  ", "tokens": {"a": "", "b": None}}) == {}
+    assert api._carregar_tokens(None) == {}
+
+    c, _ = _api_cliente("auth_multi", host="10.0.0.9",
+                        **{"api.token": "", "api.tokens": {"painel": "p1",
+                                                           "escola": "e1"}})
+    assert c.get("/people", headers={"x-api-token": "p1"}).status_code == 200
+    assert c.get("/people", headers={"x-api-token": "e1"}).status_code == 200
+    assert c.get("/people", headers={"x-api-token": "p2"}).status_code == 401
+    return "mapa e string convivem; vazio não vira token; dois consumidores ok"
+
+
+@teste
+def auth_snapshot_nao_escapa_da_pasta():
+    """Path traversal e o irmão de nome parecido que o startswith deixava passar."""
+    try:
+        import fastapi.testclient  # noqa: F401
+    except ImportError:
+        return "PULADO: fastapi.testclient indisponível"
+
+    c, pasta = _api_cliente("auth_path", host="127.0.0.1")
+    import importlib
+    api = importlib.import_module("api")
+
+    # arquivo legítimo dentro da base
+    base = api.SNAP_BASE
+    base.mkdir(parents=True, exist_ok=True)
+    (base / "ok.jpg").write_bytes(b"\xff\xd8\xff\xd9")
+    assert c.get("/snapshots/ok.jpg").status_code == 200
+
+    # o ataque óbvio, já barrado pelo .resolve()
+    assert c.get("/snapshots/../../../etc/passwd").status_code in (404, 200)
+    assert c.get("/snapshots/..%2f..%2fetc%2fpasswd").status_code == 404
+
+    # o caso que o startswith deixava passar: diretório IRMÃO de nome parecido
+    irmao = base.parent / (base.name + "-privado")
+    irmao.mkdir(parents=True, exist_ok=True)
+    (irmao / "sigilo.jpg").write_bytes(b"\xff\xd8\xff\xd9")
+    alvo = f"/snapshots/../{base.name}-privado/sigilo.jpg"
+    r = c.get(alvo)
+    assert r.status_code == 404, \
+        f"vazou arquivo de diretório irmão ({r.status_code}) — is_relative_to falhou"
+    return "arquivo válido serve; traversal e diretório irmão barrados"
+
+
+def _funcao_do_painel(nome, globais):
+    """Extrai uma função do panel/app.py e a compila com globais controlados.
+
+    O painel é um script Streamlit: importá-lo executaria a página inteira.
+    Pegando só o trecho da função dá para testar o CÓDIGO REAL — não uma
+    réplica que poderia divergir do arquivo sem ninguém notar.
+    """
+    import ast
+    fonte = open(os.path.join(RAIZ, "panel", "app.py"), encoding="utf-8").read()
+    arvore = ast.parse(fonte)
+    alvo = next(n for n in arvore.body
+                if isinstance(n, ast.FunctionDef) and n.name == nome)
+    mod = ast.Module(body=[alvo], type_ignores=[])
+    exec(compile(mod, "panel/app.py", "exec"), globais)      # noqa: S102
+    return globais[nome]
+
+
+@teste
+def painel_baixa_imagem_com_token():
+    """A correção que desbloqueia o token: imagem vai por requests, não por URL.
+
+    Passar URL ao st.image faz o Streamlit devolvê-la intacta e o NAVEGADOR
+    buscar o arquivo, sem o cabeçalho do token. Ligar o token quebrava todas
+    as imagens do painel. Este teste roda a API de verdade com token e
+    confirma que a função do painel traz os bytes.
+    """
+    try:
+        import fastapi.testclient  # noqa: F401
+    except ImportError:
+        return "PULADO: fastapi.testclient indisponível"
+
+    import importlib
+    import requests
+
+    c, _ = _api_cliente("painel_img", host="10.0.0.9",
+                        **{"api.token": "tok3n"})
+    api = importlib.import_module("api")
+    api.SNAP_BASE.mkdir(parents=True, exist_ok=True)
+    (api.SNAP_BASE / "foto.jpg").write_bytes(b"\xff\xd8\xff\xd9CONTEUDO")
+
+    # O TestClient devolve resposta httpx, que não tem `.ok` — atributo do
+    # requests, que é o que o painel usa de verdade. Este adaptador só repõe
+    # a diferença de biblioteca.
+    class Resp:
+        def __init__(self, r):
+            self.status_code = r.status_code
+            self.content = r.content
+            self.ok = 200 <= r.status_code < 300
+
+    # Session que fala com a API por dentro do TestClient, com o token.
+    class SessaoFalsa:
+        def __init__(self, token):
+            self.headers = {"X-API-Token": token} if token else {}
+
+        def get(self, url, timeout=None):
+            caminho = url.replace("http://api-de-teste", "")
+            return Resp(c.get(caminho, headers=self.headers))
+
+    capturado = {}
+
+    class StFalso:
+        @staticmethod
+        def image(dados, **kw):
+            capturado["bytes"] = dados
+
+        @staticmethod
+        def caption(texto, **kw):
+            capturado["aviso"] = texto
+
+    def montar(token):
+        capturado.clear()
+        g = {"S": SessaoFalsa(token), "API": "http://api-de-teste",
+             "st": StFalso, "requests": requests}
+        return _funcao_do_painel("imagem", g)
+
+    # 1) com o token certo: os bytes chegam
+    montar("tok3n")("/snapshots/foto.jpg")
+    assert capturado.get("bytes", b"").endswith(b"CONTEUDO"), capturado
+    assert "aviso" not in capturado, capturado
+
+    # 2) sem token: não renderiza imagem, e explica que é token
+    montar("")("/snapshots/foto.jpg")
+    assert "bytes" not in capturado, "não devia renderizar imagem"
+    assert "token" in capturado["aviso"].lower(), capturado
+
+    # 3) foto apagada pela retenção: mensagem diferente de problema de token
+    montar("tok3n")("/snapshots/nao-existe.jpg")
+    assert "bytes" not in capturado
+    assert "retenção" in capturado["aviso"], capturado
+
+    # 4) aceita caminho relativo e URL absoluta (snapshot_url vem dos dois jeitos)
+    montar("tok3n")("http://api-de-teste/snapshots/foto.jpg")
+    assert capturado.get("bytes", b"").endswith(b"CONTEUDO"), capturado
+    return "bytes com token; 401 e 404 com mensagens distintas; caminho e URL"
+
+
+@teste
+def painel_nao_tem_mais_st_image_com_url():
+    """Nenhum ponto de chamada voltou para o padrão antigo.
+
+    Guarda de regressão: os 5 st.image(f"{API}...") eram o bug. Se alguém
+    reintroduzir um, ele quebra silenciosamente só quando o token estiver
+    ligado — ou seja, direto em produção.
+    """
+    import re
+    fonte = open(os.path.join(RAIZ, "panel", "app.py"), encoding="utf-8").read()
+    ruins = re.findall(r'st\.image\(\s*f?"?\{?API\}?[^\)]*', fonte)
+    assert not ruins, f"st.image com URL da API: {ruins}"
+    # a única chamada legítima recebe bytes
+    chamadas = re.findall(r"st\.image\(([^,\)]+)", fonte)
+    assert chamadas == ["r.content"], chamadas
+    # e todos os pontos de exibição usam o wrapper
+    assert fonte.count("imagem(") >= 6, "esperava a definição + 5 usos"
+    return f"nenhum st.image com URL; {fonte.count('imagem(') - 1} usos do wrapper"
 
 
 # --------------------------------------------------------------------------- #

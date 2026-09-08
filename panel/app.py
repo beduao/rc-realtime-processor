@@ -27,6 +27,12 @@ API = cfg.api.base_url.rstrip("/")
 # arquivos precisam do mesmo valor em api.token.
 S = requests.Session()
 _token = str((cfg.get("api") or {}).get("token") or "").strip()
+if not _token:
+    # Aceita a forma por consumidor, usando o token chamado "painel" (ou o
+    # primeiro, se houver outro nome).
+    _tokens = (cfg.get("api") or {}).get("tokens") or {}
+    _token = str(_tokens.get("painel")
+                 or next(iter(_tokens.values()), "") or "").strip()
 if _token:
     S.headers["X-API-Token"] = _token
 
@@ -38,6 +44,40 @@ def api_up() -> bool:
         return S.get(f"{API}/health", timeout=3).ok
     except requests.RequestException:
         return False
+
+
+def imagem(caminho: str, **kwargs):
+    """Baixa a imagem COM o token e entrega bytes para o `st.image`.
+
+    Passar URL para o `st.image` faz o Streamlit devolvê-la sem modificação
+    (verificado na fonte: `if isinstance(image, str)` e a URL é retornada
+    direto), então quem busca o arquivo é o NAVEGADOR — sem o cabeçalho
+    X-API-Token que está nesta Session. Resultado: bastava ligar o token para
+    todas as imagens do painel quebrarem.
+
+    Baixando aqui, três coisas melhoram de uma vez:
+      1. o token é enviado, então o painel funciona com a API protegida;
+      2. com HTTPS, só este processo precisa confiar no certificado — nada a
+         instalar no navegador nem no sistema operacional;
+      3. o navegador deixa de precisar alcançar o Pi, então o painel passa a
+         funcionar em qualquer topologia de rede (VPN, sub-rede diferente).
+    """
+    url = caminho if caminho.startswith("http") else f"{API}{caminho}"
+    try:
+        r = S.get(url, timeout=10)
+    except requests.RequestException as exc:
+        st.caption(f"⚠ imagem indisponível ({type(exc).__name__})")
+        return
+    if not r.ok:
+        # Distingue os casos, porque cada um tem causa diferente: 401/503 é
+        # token, 404 é arquivo que a retenção já apagou.
+        motivo = {401: "token inválido ou ausente neste computador",
+                  503: "API sem token configurado",
+                  404: "foto não está mais no disco (retenção)"}.get(
+                      r.status_code, f"HTTP {r.status_code}")
+        st.caption(f"⚠ {motivo}")
+        return
+    st.image(r.content, **kwargs)
 
 
 st.sidebar.title("📷 Reconhecimento Facial")
@@ -287,8 +327,8 @@ elif page == "Cadastrar":
         with col_preview:
             @st.fragment(run_every="0.8s")
             def _preview():
-                st.image(f"{API}/enroll/preview?t={time.time()}", width="stretch",
-                         caption="Preview ao vivo — caixa verde = rosto detectado")
+                imagem(f"/enroll/preview?t={time.time()}", width="stretch",
+                       caption="Preview ao vivo — caixa verde = rosto detectado")
             _preview()
 
             if st.button(f"📸 Capturar amostra {n + 1}", type="primary",
@@ -311,7 +351,7 @@ elif page == "Cadastrar":
             if not ss.samples:
                 st.write("_nenhuma ainda_")
             for s in ss.samples:
-                st.image(f"{API}{s['snapshot_url']}", width=110)
+                imagem(s["snapshot_url"], width=110)
                 if st.button("🗑 remover", key=f"rm-{s['index']}"):
                     r = S.post(f"{API}/enroll/sample/delete",
                                       json={"session_id": ss.enroll_session, "index": s["index"]},
@@ -359,7 +399,7 @@ elif page == "Reconhecimentos":
         for i, ev in enumerate(events):
             with cols[i % 4]:
                 if ev.get("snapshot_path"):
-                    st.image(f"{API}/snapshots/{ev['snapshot_path']}", width="stretch")
+                    imagem(f"/snapshots/{ev['snapshot_path']}", width="stretch")
                 quando = time.strftime("%d/%m %H:%M:%S", time.localtime(ev["ts"]))
                 tag = "✅" if ev["is_known"] else "❓"
                 st.caption(f"{tag} **{ev['name']}** · {ev['score']:.2f}\n\n{quando}")
@@ -454,7 +494,7 @@ elif page == "Pessoas":
         col = colunas[i % 4]
         with col:
             if a["snapshot_url"]:
-                st.image(f"{API}{a['snapshot_url']}", width="stretch")
+                imagem(a["snapshot_url"], width="stretch")
             else:
                 st.info("sem foto")
 
@@ -518,8 +558,8 @@ elif page == "Pessoas":
             if st.button("Atualizar prévia", key=f"prev-{p['id']}"):
                 st.rerun()
         with cb:
-            st.image(f"{API}/enroll/preview?t={time.time()}",
-                     caption="prévia da câmera", width="stretch")
+            imagem(f"/enroll/preview?t={time.time()}",
+                   caption="prévia da câmera", width="stretch")
 
     st.divider()
 

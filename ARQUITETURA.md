@@ -661,5 +661,11 @@ Registradas para quem for dar manutenção:
    preencher para todos os alunos já cadastrados.
 5. **A câmera V4L2 é exclusiva.** Worker e API não podem abrir o mesmo
    `/dev/video0`; contornado com o worker publicando o frame em tmpfs.
-6. **Sem HTTPS.** O token opcional protege contra acesso casual, não contra
-   captura de tráfego.
+6. **Sem HTTPS.** O token protege contra acesso casual, não contra captura de
+   tráfego: sobre HTTP ele vai em texto claro em toda requisição, então quem
+   escuta a rede o obtém na primeira e passa a estar autenticado. Adivinhar é
+   inviável (2²⁵⁶); interceptar é trivial.
+7. **A regra de autenticação confia no IP de origem.** Loopback dispensa token.
+   Se algum dia entrar um proxy reverso na frente, tudo passará a chegar de
+   `127.0.0.1` e a regra liberaria geral — nesse caso é obrigatório
+   `--forwarded-allow-ips` no uvicorn.

@@ -20,6 +20,7 @@ Observações:
 Subir com:  uvicorn api:app --host 0.0.0.0 --port 8000
 """
 
+import ipaddress
 import json
 import secrets
 import shutil
@@ -29,8 +30,8 @@ import uuid
 
 import cv2
 import numpy as np
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import FileResponse, Response
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel
 
 from core.camera import Camera, camera_from_config
@@ -59,38 +60,154 @@ FRAME_MAX_AGE = 5.0        # acima disso o frame do worker é velho demais
 ENROLL_TARGET = int(cfg.enroll.frames_to_capture)  # amostras sugeridas por pessoa
 
 # --------------------------------------------------------------------------- #
-# Autenticação opcional por token.
+# Autenticação por EXPOSIÇÃO, não por flag.
 #
-# Sem `api.token` no config.yaml, nada muda — a API segue aberta, como sempre.
-# Definindo o token, TODAS as rotas passam a exigi-lo, exceto /health (que
-# precisa ficar aberta para monitoramento e para o painel detectar a API).
-# É opcional porque ligar de repente trancaria o painel; e existe porque um
-# endpoint que devolve nomes de crianças por HTTP não deveria ficar sem
-# nenhuma barreira quando for consumido por outro sistema.
+# A regra é decidida por requisição, olhando de onde ela veio:
+#
+#   cliente em 127.0.0.1/::1  -> libera. Nada fora da máquina alcança isso,
+#                                então exigir credencial não protegeria nada e
+#                                só atrapalharia quem testa tudo local.
+#   cliente remoto, com token -> valida.
+#   cliente remoto, SEM token configurado -> 503. RECUSA.
+#
+# A última linha é a inversão que importa. Antes, token vazio significava "API
+# aberta", e a proteção dependia de alguém lembrar de preencher o config. Agora
+# o esquecimento resulta em porta fechada, não em porta escancarada.
+#
+# Amarrar a regra ao IP de origem, e não ao `api.host` do config, é proposital:
+# o bind real vem da linha de comando do uvicorn (`--host`), então o config pode
+# discordar da realidade. O IP de origem não mente.
+#
+# Por que não "recusar subir sem token": no Pi a API roda sob systemd com
+# Restart=always. Morrer na inicialização produziria um laço de reinício com a
+# causa escondida no journal — e um serviço morto é pior de diagnosticar que um
+# 503 com mensagem explicando o que falta.
+#
+# ATENÇÃO para o futuro: se algum dia entrar um proxy reverso na frente, todas
+# as requisições passarão a chegar de 127.0.0.1 e esta regra liberaria tudo. Aí
+# é obrigatório usar `--forwarded-allow-ips` no uvicorn e ler o IP real.
 # --------------------------------------------------------------------------- #
-API_TOKEN = str((cfg.get("api") or {}).get("token") or "").strip()
+def _carregar_tokens(bloco) -> dict:
+    """Monta {nome: token} aceitando as duas formas de configuração.
+
+    `api.token: "abc"`            -> {"padrao": "abc"}      (compatibilidade)
+    `api.tokens: {painel: "x"}`   -> {"painel": "x"}        (por consumidor)
+
+    Token por consumidor existe porque vazamento é o cenário realista, não
+    força bruta: com um token por consumidor você revoga o suspeito sem
+    derrubar a integração com o sistema da escola. E o log passa a dizer QUEM
+    chamou, que é o que permite auditar depois.
+    """
+    bloco = bloco or {}
+    tokens = {}
+    unico = str(bloco.get("token") or "").strip()
+    if unico:
+        tokens["padrao"] = unico
+    for nome, valor in (bloco.get("tokens") or {}).items():
+        valor = str(valor or "").strip()
+        if valor:
+            tokens[str(nome)] = valor
+    return tokens
 
 
-ROTAS_ABERTAS = {"/health", "/docs", "/openapi.json", "/redoc"}
+API_TOKENS = _carregar_tokens(cfg.get("api"))
+
+# Rotas liberadas mesmo para cliente remoto autenticado-ou-não.
+# Só /health: o painel a usa para detectar se a API está viva antes de ter
+# token, e o monitoramento precisa dela. Devolve contagem de pessoas, nunca
+# nomes. /docs, /openapi.json e /redoc SAÍRAM daqui: não vazam dado, mas
+# entregam o mapa completo da API para quem estiver na rede.
+ROTAS_ABERTAS = {"/health"}
+
+DICA_TOKEN = (
+    "Gere um com:  python -c \"import secrets;print(secrets.token_urlsafe(32))\"  "
+    "e coloque em api.token no config.yaml do Pi e no do computador do painel."
+)
 
 
-def exigir_token(request: Request,
-                 x_api_token: str = Header(default=""),
-                 authorization: str = Header(default="")):
-    if not API_TOKEN or request.url.path in ROTAS_ABERTAS:
-        return
-    fornecido = x_api_token or ""
-    if not fornecido and authorization.lower().startswith("bearer "):
-        fornecido = authorization[7:]
-    # compare_digest evita vazar informação pelo tempo de comparação
-    if not secrets.compare_digest(fornecido, API_TOKEN):
-        raise HTTPException(
-            401, "Token ausente ou inválido. Envie o cabeçalho "
-                 "'X-API-Token: <token>' ou 'Authorization: Bearer <token>'.")
+def endereco_local(host: str) -> bool:
+    """True se o endereço é loopback — inalcançável de fora da máquina.
+
+    Usa `ipaddress` em vez de uma lista fixa {"127.0.0.1", "::1"} porque a
+    lista deixava dois casos legítimos de fora:
+
+      ::ffff:127.0.0.1  conexão IPv4 local chegando por socket IPv6 (uvicorn
+                        em dual-stack). `is_loopback` devolve False para essa
+                        forma, então é preciso desembrulhar o `ipv4_mapped`
+                        antes de perguntar.
+      127.0.0.2         todo o 127.0.0.0/8 é loopback, não só o .1.
+
+    Qualquer um dos dois cairia como "remoto" e tomaria 503 em teste local —
+    justamente a fricção que a regra por exposição existe para evitar.
+
+    Endereço que não é IP (o TestClient usa "testclient") não é local: falha
+    para o lado fechado, que é o certo.
+    """
+    if not host:
+        return False
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    mapeado = getattr(addr, "ipv4_mapped", None)
+    if mapeado is not None:
+        addr = mapeado
+    return addr.is_loopback
 
 
-app = FastAPI(title="Reconhecimento Facial — API",
-              dependencies=[Depends(exigir_token)])
+def cliente_local(request: Request) -> bool:
+    return endereco_local(request.client.host if request.client else "")
+
+
+def autorizar(request: Request):
+    """Devolve (consumidor, erro). `erro` é (status, detalhe) ou None."""
+    if cliente_local(request):
+        return "local", None
+    if request.url.path in ROTAS_ABERTAS:
+        return None, None
+    if not API_TOKENS:
+        return None, (503, "Esta API está acessível pela rede e nenhum token "
+                           "foi configurado, então o acesso remoto está "
+                           f"recusado. {DICA_TOKEN}")
+
+    fornecido = request.headers.get("x-api-token", "")
+    if not fornecido:
+        auth = request.headers.get("authorization", "")
+        if auth.lower().startswith("bearer "):
+            fornecido = auth[7:]
+
+    # compare_digest em TODOS os candidatos, sem interromper no primeiro acerto:
+    # sair mais cedo faria o tempo de resposta revelar quantos tokens existem.
+    consumidor = None
+    for nome, valor in API_TOKENS.items():
+        if secrets.compare_digest(fornecido, valor):
+            consumidor = nome
+    if consumidor is None:
+        return None, (401, "Token ausente ou inválido. Envie o cabeçalho "
+                           "'X-API-Token: <token>' ou "
+                           "'Authorization: Bearer <token>'.")
+    return consumidor, None
+
+
+app = FastAPI(title="Reconhecimento Facial — API")
+
+
+# Middleware, e não `dependencies=[Depends(...)]` no app: as rotas /docs,
+# /openapi.json e /redoc são registradas pelo FastAPI no nível do Starlette e
+# NÃO executam dependências do router. Verificado em teste — com a dependência,
+# as três respondiam 200 para cliente remoto sem token, entregando o mapa
+# completo da API a quem estivesse na rede. O middleware roda antes do
+# roteamento e cobre tudo com um mecanismo só.
+@app.middleware("http")
+async def autenticacao(request: Request, call_next):
+    consumidor, erro = autorizar(request)
+    if erro:
+        status, detalhe = erro
+        # Mesmo formato que o FastAPI usa em HTTPException, para o painel poder
+        # ler `detail` sem tratar dois casos.
+        return JSONResponse({"detail": detalhe}, status_code=status)
+    request.state.consumidor = consumidor
+    return await call_next(request)
 
 # ---- estado das sessões de cadastro --------------------------------------- #
 _lock = threading.Lock()
@@ -800,7 +917,11 @@ def reopen_attendance(dia: str = Query(...)):
 @app.get("/snapshots/{path:path}")
 def snapshot(path: str):
     full = (SNAP_BASE / path).resolve()
-    if not str(full).startswith(str(SNAP_BASE)) or not full.is_file():
+    # is_relative_to compara COMPONENTES de caminho. O `startswith` anterior
+    # comparava prefixo de string, e um diretório irmão de nome parecido
+    # ("snapshots-privado" ao lado de "snapshots") passaria na verificação.
+    # O `.resolve()` acima já barra o ataque óbvio de "../../etc/passwd".
+    if not full.is_relative_to(SNAP_BASE) or not full.is_file():
         raise HTTPException(404, "Snapshot não encontrado.")
     return FileResponse(str(full), media_type="image/jpeg")
 

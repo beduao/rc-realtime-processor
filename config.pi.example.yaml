@@ -23,15 +23,30 @@ camera:
 api:
   host: "0.0.0.0"
   port: 8000
-  # Token de acesso. VAZIO = API aberta (comportamento padrão).
-  # Preenchido, TODAS as rotas passam a exigir o cabeçalho
-  #   X-API-Token: <token>        (ou Authorization: Bearer <token>)
-  # exceto /health, que fica aberta para monitoramento.
-  # Gere um valor forte com:  python -c "import secrets;print(secrets.token_urlsafe(32))"
-  # ATENÇÃO: o config do PC (painel) precisa do MESMO valor, senão o painel
-  # recebe 401. E token só protege de verdade sobre HTTPS — em rede local
-  # aberta ele ainda trafega em texto claro.
+  # Token de acesso para quem chama a API DE OUTRA MÁQUINA.
+  #
+  # A regra é por exposição, não por flag:
+  #   requisição de 127.0.0.1  -> liberada sempre, token nenhum é exigido
+  #                               (nada fora da máquina alcança isso)
+  #   requisição pela rede     -> exige X-API-Token ou Authorization: Bearer
+  #   pela rede e SEM token configurado -> RECUSADA com 503
+  #
+  # Ou seja: esquecer de preencher fecha a porta, não escancara. E testar tudo
+  # numa máquina só continua funcionando sem configurar nada.
+  #
+  # Gere um valor forte com:
+  #   python -c "import secrets;print(secrets.token_urlsafe(32))"
+  # O install_pi.sh já gera um automaticamente.
+  #
+  # O config do PC (painel) precisa do MESMO valor, senão o painel recebe 401.
+  # E token só protege de verdade sobre HTTPS — em HTTP ele trafega em texto
+  # claro e quem escutar a rede o captura na primeira requisição.
   token: ""
+  # Alternativa: um token por consumidor, para revogar um sem derrubar o outro
+  # e para o log dizer quem chamou. Se preenchido, substitui o `token` acima.
+  #   tokens:
+  #     painel: "..."
+  #     escola: "..."
   # No Pi a API fala consigo mesma. O PAINEL (no seu PC) usa o IP do Pi
   # no config.yaml DELE — não aqui.
   base_url: "http://localhost:8000"

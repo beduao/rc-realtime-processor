@@ -205,6 +205,33 @@ print("      rtsp_url atualizada" if n else "      AVISO: nao achei a linha rtsp
 EOF
 fi
 
+# Token de acesso: gerado aqui para o Pi nunca ficar exposto sem credencial.
+# A API recusa acesso remoto sem token, então sem isto o painel no PC tomaria
+# 503 na primeira tentativa — melhor já entregar pronto.
+TOKEN_GERADO=""
+if "$PY" -c "
+import sys,re
+t=open(sys.argv[1],encoding='utf-8').read()
+m=re.search(r'(?m)^\s*token:\s*\"(.*)\"\s*$', t)
+sys.exit(0 if (m and not m.group(1).strip()) else 1)
+" "$CFG"; then
+  TOKEN_GERADO="$("$PY" -c 'import secrets;print(secrets.token_urlsafe(32))')"
+  "$PY" - "$CFG" "$TOKEN_GERADO" <<'EOF'
+import re, sys
+path, tok = sys.argv[1], sys.argv[2]
+text = open(path, encoding="utf-8").read()
+new, n = re.subn(r'(?m)^(\s*token:\s*)".*"\s*$',
+                 lambda m: m.group(1) + '"' + tok + '"', text, count=1)
+open(path, "w", encoding="utf-8").write(new)
+print("      token de acesso gerado" if n else "      AVISO: nao achei a linha token")
+EOF
+else
+  ok "token de acesso já configurado (mantido)"
+fi
+
+# O config guarda credencial: fora do alcance de outros usuários do Pi.
+chmod 600 "$CFG" 2>/dev/null && ok "permissão do config.yaml restrita (600)"
+
 if [[ "$USE_INT8" -eq 1 ]]; then
   sed -i \
     -e 's#^\(\s*detector:\s*\).*#\1"models/face_detection_yunet_2023mar_int8.onnx"#' \
@@ -293,11 +320,28 @@ cat <<EOF
 
   ${BOLD}API do Pi:${RESET}    http://${IP:-IP_DO_PI}:${API_PORT}
   ${BOLD}Saúde:${RESET}        http://${IP:-IP_DO_PI}:${API_PORT}/health
-  ${BOLD}Preview:${RESET}      http://${IP:-IP_DO_PI}:${API_PORT}/live.jpg
+EOF
+
+if [[ -n "$TOKEN_GERADO" ]]; then
+cat <<EOF
+
+  ${BOLD}Token de acesso gerado${RESET} — a API recusa acesso pela rede sem ele.
+  Copie estas DUAS linhas para o config.yaml ${BOLD}do seu PC${RESET}, na seção api:
+
+     api:
+       base_url: "http://${IP:-IP_DO_PI}:${API_PORT}"
+       token: "${TOKEN_GERADO}"
+
+  Trate como senha: não coloque em print, e-mail ou repositório.
+  Sobre HTTP o token trafega em texto claro — veja HTTPS no guia antes de
+  operar com crianças reais.
+EOF
+fi
+
+cat <<EOF
 
   ${BOLD}No seu PC${RESET} (painel de cadastro e histórico):
      pip install -r requirements-panel.txt
-     # no config.yaml do PC:  api.base_url: "http://${IP:-IP_DO_PI}:${API_PORT}"
      streamlit run panel/app.py
 
   ${BOLD}Comandos úteis no Pi${RESET}

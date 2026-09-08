@@ -8,9 +8,16 @@ camera:
   reconnect_delay_seconds: 3
 
 api:
-  # Onde o uvicorn escuta (no Pi/Mac que roda a API).
-  host: "0.0.0.0"
+  # Onde o uvicorn escuta. Informativo: o valor real vem do `--host` na linha
+  # de comando. Para testar tudo numa máquina só, use 127.0.0.1 no uvicorn —
+  # assim a API não fica exposta na rede e nenhum token é exigido.
+  host: "127.0.0.1"
   port: 8000
+  # Token para acesso DE OUTRA MÁQUINA. Testando tudo local (127.0.0.1), pode
+  # deixar vazio: requisição da própria máquina é sempre liberada. Ao apontar
+  # o painel para o IP do Pi, os dois configs precisam do mesmo valor aqui.
+  #   python -c "import secrets;print(secrets.token_urlsafe(32))"
+  token: ""
   # Endereço que o PAINEL usa para falar com a API.
   #   Fase 1 (tudo no Mac): http://localhost:8000
   #   Fase 2 (painel no PC): http://IP_DO_PI:8000

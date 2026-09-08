@@ -669,33 +669,76 @@ vazia dependendo do modo em uso naquele dia.
 
 ### Protegendo o acesso
 
-A API nasceu sem autenticação. Como este endpoint devolve nomes de crianças com
-horário, há agora um token opcional. No `config.yaml` do Pi:
+A API entrega nomes de crianças, fotos de rosto e **a que horas cada uma chegou
+na escola**. Esse conjunto — nome, foto e rotina de horário de um menor — é
+exatamente o que alguém com má intenção em relação àquela criança procuraria.
+Numa rede de escola, com Wi-Fi que funcionários e visitantes acessam, não basta
+contar com ninguém saber o IP.
 
-```yaml
-api:
-  token: "cole-aqui-um-valor-forte"
+A regra é decidida **por requisição, pela origem**:
+
+| quem chama | exige token? |
+|---|---|
+| a própria máquina (loopback) | não — nada de fora alcança isso |
+| pela rede, com token válido | sim, e passa |
+| pela rede, com token errado | **401** |
+| pela rede, e nenhum token configurado | **503, recusado** |
+
+A última linha é a que mudou. Antes, token vazio significava "API aberta": a
+proteção dependia de alguém lembrar de preencher o config. Agora esquecer
+**fecha** a porta.
+
+**Testar tudo numa máquina só continua sem configurar nada.** Suba o uvicorn em
+`127.0.0.1` e nenhum token é exigido — nem para `/docs`.
+
+```bash
+# ambiente de teste: nada exposto, nada a configurar
+uvicorn api:app --host 127.0.0.1 --port 8000
 ```
 
-Gere o valor com:
+**No Pi, o `install_pi.sh` já gera o token** e imprime as duas linhas para você
+colar no `config.yaml` do PC. Se precisar gerar à mão:
 
 ```bash
 python -c "import secrets;print(secrets.token_urlsafe(32))"
 ```
 
-Com o token preenchido, **todas** as rotas passam a exigir o cabeçalho
-`X-API-Token` (ou `Authorization: Bearer`), exceto `/health`, que fica aberta
-para monitoramento:
+```yaml
+api:
+  token: "o-valor-gerado"
+```
+
+Consumindo de outro sistema:
 
 ```bash
 curl -H "X-API-Token: SEU_TOKEN" http://IP_DO_PI:8000/attendance
+curl -H "Authorization: Bearer SEU_TOKEN" http://IP_DO_PI:8000/attendance
 ```
 
-> ⚠️ Dois avisos. O `config.yaml` **do PC** precisa do mesmo token, senão o
-> painel passa a receber 401. E token sobre HTTP simples trafega em texto claro
-> na rede — em rede de escola compartilhada, isso protege contra acesso casual,
-> não contra quem esteja capturando tráfego. HTTPS resolveria, e fica na lista
-> de pendências.
+**Um token por consumidor**, se quiser poder revogar um sem derrubar o outro (e
+ter no log quem chamou):
+
+```yaml
+api:
+  tokens:
+    painel: "..."
+    escola: "..."
+```
+
+O painel usa o token chamado `painel`, ou o primeiro da lista.
+
+> ⚠️ **Sobre HTTP, o token trafega em texto claro.** Quem captura tráfego na
+> rede o pega na primeira requisição e passa a ter acesso completo,
+> autenticado. Adivinhar o token é impossível (2²⁵⁶ combinações), mas
+> interceptar é trivial. Ligue HTTPS antes de operar com crianças reais.
+
+> ⚠️ Trate o token como senha: não vai em print, e-mail, chat ou repositório.
+> Se vazar, gere outro e troque nos dois configs.
+
+**Se algum dia entrar um proxy reverso na frente da API**, atenção: todas as
+requisições passarão a chegar de `127.0.0.1` e a regra liberaria tudo. Nesse
+caso é obrigatório usar `--forwarded-allow-ips` no uvicorn para que o IP real
+do cliente seja considerado.
 
 ## 7. Calibrar o limiar de reconhecimento
 
