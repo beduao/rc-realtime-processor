@@ -1975,6 +1975,101 @@ def painel_nao_tem_mais_st_image_com_url():
     return f"nenhum st.image com URL; {fonte.count('imagem(') - 1} usos do wrapper"
 
 
+@teste
+def recall_aborta_com_trilha_pendente_e_avisa_do_cooldown():
+    """Dois jeitos de o relatório mentir por causa da configuração.
+
+    Trilha `pendente` não casa com degrau nenhum do funil, então a passagem
+    cairia em "nunca detectada" — culpando a câmera por lote não executado.
+    E o cooldown do worker suprime evento repetido da mesma pessoa, o que
+    produz o mesmo falso negativo.
+    """
+    import io
+    from contextlib import redirect_stdout
+    from pathlib import Path
+    from scripts.measure_recall import _passagens_proximas, medir_passagens
+
+    # --- a contagem de passagens dentro do cooldown ------------------------ #
+    base = 1_700_000_000.0
+    p = [{"nome": "Alfa", "ts": base}, {"nome": "Beta", "ts": base + 3},
+         {"nome": "Alfa", "ts": base + 8},          # 8s < 15s -> suprimida
+         {"nome": "Alfa", "ts": base + 40}]         # 32s depois -> ok
+    assert _passagens_proximas(p, 15.0) == 1, _passagens_proximas(p, 15.0)
+    assert _passagens_proximas(p, 0.0) == 0
+    assert _passagens_proximas(p, 60.0) == 2, "8s e 40s ambos < 60s"
+
+    # --- aborta quando há trilha pendente ---------------------------------- #
+    db, ids, trilha = _banco_recall("recall_pendente")
+    pasta = os.path.join(TMP, "recall_pendente")
+    crop = [{"path": "c.jpg", "quality": 1.0, "face": "[]"}]
+    db.add_track(base + 1, base + 2, 8, crop)        # fica 'pendente'
+
+    csv_path = os.path.join(pasta, "reg.csv")
+    with open(csv_path, "w", encoding="utf-8") as fh:
+        fh.write("nome;hora;rodada\n")
+        fh.write(f"Alfa;{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(base))};solo\n")
+
+    class CfgFalso(dict):
+        class _R:
+            cosine_threshold = 0.363
+        class _A:
+            host, port = "127.0.0.1", 8000
+        recognition, api = _R(), _A()
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = medir_passagens(db, CfgFalso(), Path(csv_path), 10.0,
+                             time.strftime("%Y-%m-%d", time.localtime(base)))
+    saida = buf.getvalue()
+    assert rc == 1, f"devia abortar, retornou {rc}\n{saida}"
+    assert "NÃO foram" in saida and "recognize_batch" in saida, saida
+    assert "nunca detectada" not in saida.split("Rode primeiro")[0].split("⚠")[0], \
+        "não devia imprimir o funil com dado incompleto"
+    return "pendente aborta apontando o lote; cooldown conta passagens afetadas"
+
+
+@teste
+def camera_backend_por_plataforma():
+    """Webcam por índice: V4L2 no Linux, DirectShow no Windows.
+
+    V4L2 é API do Linux e não existe no Windows — pedi-la lá faz o
+    VideoCapture não abrir, com o sintoma inútil "can't open camera by index".
+    O projeto roda no Pi (Linux) e no PC da equipe (Windows), então a escolha
+    tem que ser por plataforma.
+    """
+    import importlib
+    real = sys.platform
+    try:
+        esperado = {"win32": cv2.CAP_DSHOW,
+                    "linux": cv2.CAP_V4L2,
+                    "darwin": cv2.CAP_ANY}
+        for plat, backend in esperado.items():
+            sys.platform = plat
+            cam = importlib.reload(importlib.import_module("core.camera"))
+            for fonte in (0, "0", "1"):
+                _, b = cam._parse_source(fonte)
+                assert b == backend, f"{plat} com {fonte!r}: {b} != {backend}"
+            # RTSP e arquivo continuam no FFmpeg em toda plataforma
+            for fonte in ("rtsp://host/stream", "video.avi"):
+                _, b = cam._parse_source(fonte)
+                assert b == cv2.CAP_FFMPEG, f"{plat} {fonte}: {b}"
+            # /dev/video0 só faz sentido no Linux, e segue explícito
+            assert cam._parse_source("/dev/video0")[1] == cv2.CAP_V4L2
+    finally:
+        sys.platform = real
+        importlib.reload(importlib.import_module("core.camera"))
+
+    # is_local_device precisa valer para webcam em QUALQUER plataforma: é o que
+    # habilita pedir MJPG. Comparar com CAP_V4L2 deixava o Windows entregando
+    # YUYV, que satura o barramento USB.
+    import core.camera as cam
+    for fonte in (0, "0"):
+        c = cam.Camera(fonte)
+        assert c.is_local_device, f"{fonte!r} devia ser dispositivo local"
+    assert not cam.Camera("rtsp://host/stream").is_local_device
+    return "DSHOW no Windows, V4L2 no Linux; RTSP no FFmpeg; MJPG habilitado"
+
+
 # --------------------------------------------------------------------------- #
 # runner
 # --------------------------------------------------------------------------- #

@@ -11,6 +11,7 @@ sozinho consumia uma fatia relevante da CPU do Pi.
 """
 
 import os
+import sys
 import threading
 import time
 
@@ -29,22 +30,43 @@ os.environ.setdefault(
 import cv2  # noqa: E402  (importado após configurar a env do FFmpeg)
 
 
+def _backend_local():
+    """Backend de captura para webcam por ÍNDICE, conforme o sistema.
+
+    V4L2 é a API de vídeo do Linux e **não existe no Windows** — pedir
+    CAP_V4L2 lá faz o VideoCapture falhar em abrir, e o sintoma é um
+    "can't open camera by index" que não diz a causa. Como o projeto roda
+    tanto no Pi (Linux) quanto no PC da equipe (Windows), a escolha precisa
+    ser por plataforma:
+
+      Linux    -> CAP_V4L2      (webcam USB, câmera CSI do Pi)
+      Windows  -> CAP_DSHOW     (DirectShow; aceita MJPG e definir resolução,
+                                 ao contrário do MSMF em várias webcams)
+      outros   -> CAP_ANY       (deixa o OpenCV decidir)
+    """
+    if sys.platform.startswith("win"):
+        return cv2.CAP_DSHOW
+    if sys.platform.startswith("linux"):
+        return cv2.CAP_V4L2
+    return cv2.CAP_ANY
+
+
 def _parse_source(source):
     """Interpreta a fonte de vídeo e escolhe o backend certo do OpenCV.
 
     Aceita:
       "rtsp://..." / caminho de arquivo  -> FFmpeg (câmera IP, vídeo de teste)
-      0, "0", "1"                        -> índice de webcam USB     -> V4L2
-      "/dev/video0"                      -> dispositivo V4L2 explícito
+      0, "0", "1"                        -> índice de webcam       -> ver acima
+      "/dev/video0"                      -> dispositivo V4L2 explícito (Linux)
 
     Isso permite usar uma webcam USB ou a câmera CSI do Pi quando a câmera IP
     não expõe RTSP (caso das câmeras de nuvem, linha Mibo).
     """
     if isinstance(source, int):
-        return source, cv2.CAP_V4L2
+        return source, _backend_local()
     text = str(source).strip()
     if text.isdigit():
-        return int(text), cv2.CAP_V4L2
+        return int(text), _backend_local()
     if text.startswith("/dev/video"):
         return text, cv2.CAP_V4L2
     return text, cv2.CAP_FFMPEG
@@ -55,7 +77,10 @@ class Camera:
                  width: int = 0, height: int = 0, fps: int = 0, mjpeg: bool = True):
         self.url = rtsp_url
         self.source, self.backend = _parse_source(rtsp_url)
-        self.is_local_device = self.backend == cv2.CAP_V4L2
+        # "dispositivo local" = webcam/CSI, onde faz sentido pedir MJPG,
+        # resolução e fps. Comparar com CAP_V4L2 deixava o Windows de fora e o
+        # DirectShow entregava YUYV, que satura o barramento USB.
+        self.is_local_device = self.backend != cv2.CAP_FFMPEG
         # Só usados quando a fonte é uma webcam USB / câmera CSI:
         self.width, self.height, self.fps, self.mjpeg = width, height, fps, mjpeg
         self.reconnect_delay = reconnect_delay

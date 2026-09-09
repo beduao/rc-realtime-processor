@@ -126,6 +126,22 @@ def ler_passagens(caminho: Path, base_dia: str | None) -> list[dict]:
 # --------------------------------------------------------------------------- #
 # Classificação de uma passagem
 # --------------------------------------------------------------------------- #
+def _passagens_proximas(passagens: list[dict], cooldown: float) -> int:
+    """Quantas passagens caem dentro do cooldown da anterior da MESMA pessoa.
+
+    São exatamente as que o worker suprime no modo realtime, e portanto as que
+    o relatório contaria como "nunca detectada" sem aviso.
+    """
+    ultima: dict[str, float] = {}
+    n = 0
+    for p in sorted(passagens, key=lambda x: x["ts"]):
+        anterior = ultima.get(p["nome"])
+        if anterior is not None and p["ts"] - anterior < cooldown:
+            n += 1
+        ultima[p["nome"]] = p["ts"]
+    return n
+
+
 def atribuir(passagens: list[dict], deteccoes: list[dict], pessoas: dict,
              janela: float) -> int:
     """Casa detecções com passagens e classifica cada passagem no funil.
@@ -270,6 +286,42 @@ def medir_passagens(db: Database, cfg, caminho: Path, janela: float,
     print(f"Passagens registradas: {len(passagens)}")
     print(f"Detecções no período:  {len(deteccoes)}")
     print(f"Janela de casamento:   ±{janela:.0f}s | limiar atual {limiar:.3f}")
+
+    # Trilha pendente = capturada e AINDA NÃO reconhecida. Sem esta checagem,
+    # ela não casa com nenhum degrau do funil e a passagem cai em "nunca
+    # detectada" — reportando como falha de detecção o que é só lote não
+    # executado. Aborta em vez de avisar: um relatório inteiro errado é pior
+    # que nenhum relatório.
+    pendentes = [d for d in deteccoes if d["status"] == "pendente"]
+    if pendentes:
+        print(f"\n⚠ {len(pendentes)} trilha(s) no período ainda NÃO foram "
+              "reconhecidas.")
+        print("  No modo captura o reconhecimento roda depois, em lote. Sem")
+        print("  isso, estas passagens apareceriam como 'nunca detectada' —")
+        print("  culpando a câmera por trabalho que não foi feito.")
+        print("\n  Rode primeiro:")
+        print("    python scripts/recognize_batch.py")
+        print("\n  E depois repita esta medição.")
+        return 1
+
+    # O cooldown existe para não gravar 200 eventos da mesma criança, e é certo
+    # para a chamada. Para medir POR PASSAGEM ele destrói dado: a mesma pessoa
+    # detectada de novo dentro da janela não gera evento, e todos os
+    # desconhecidos dividem a mesma chave — vários não reconhecidos juntos
+    # viram um evento só. O resto aparece como "nunca detectada".
+    cooldown = float((cfg.get("worker") or {}).get("event_cooldown_seconds") or 0)
+    if cooldown > 0 and any(d["fonte"] == "evento" for d in deteccoes):
+        proximas = _passagens_proximas(passagens, cooldown)
+        if proximas:
+            print(f"\n⚠ worker.event_cooldown_seconds = {cooldown:.0f}s, e "
+                  f"{proximas} passagem(ns) ocorreram a menos que isso da")
+            print("  anterior da MESMA pessoa. Esses eventos foram suprimidos")
+            print("  na gravação e vão aparecer como 'nunca detectada'.")
+            print("\n  Para medir por passagem, use uma das opções:")
+            print("    • worker.event_cooldown_seconds: 0  (e reinicie o worker)")
+            print("    • modo captura, que grava uma trilha por travessia")
+            print("      (é também o modo que roda na escola)")
+            print("\n  Continuando, mas os números abaixo subestimam o recall.")
 
     nao_cadastrados = sorted({p["nome"] for p in passagens
                               if p["nome"].strip().lower() not in pessoas})
