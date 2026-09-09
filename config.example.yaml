@@ -38,11 +38,41 @@ recognition:
   min_face_size: 60          # ignora rostos menores que isto (px)
 
 worker:
+  # realtime = reconhece na hora (bom para conferir cadastro e limiar)
+  # captura  = rastreia e guarda recortes; o reconhecimento roda depois em
+  #            lote (scripts/recognize_batch.py), por votação entre os
+  #            recortes. É o modo que aguenta grupo — no corredor de escola,
+  #            com várias crianças ao mesmo tempo, é este que se usa.
+  # Trocar este valor vale sem reiniciar o worker.
+  mode: realtime
   process_every_n_frames: 5  # processa 1 a cada N frames RECEBIDOS da câmera
   min_interval_seconds: 0.0  # teto de taxa: 0.5 = no máximo 2 processamentos/s (0 = sem teto)
-  event_cooldown_seconds: 15 # não registra a mesma identidade de novo nessa janela
+  # Não registra a mesma identidade de novo nessa janela. Evita centenas de
+  # eventos da mesma pessoa — correto para a chamada.
+  # ATENÇÃO ao medir recall POR PASSAGEM (scripts/measure_recall.py): use 0.
+  # Senão a segunda passagem da mesma pessoa dentro da janela não gera evento
+  # e conta como "nunca detectada"; e como todos os desconhecidos dividem a
+  # mesma chave, vários não reconhecidos juntos viram um evento só. No modo
+  # captura o problema não existe — cada travessia é uma trilha.
+  event_cooldown_seconds: 15
   draw_annotations: true
   opencv_threads: 0          # 0 = automático; no Pi 3B use 3 (deixa 1 núcleo p/ o decode)
+
+# Usado só no modo captura. Os valores são os mesmos padrões do código, então
+# a seção pode ser removida — existe para permitir ajuste e documentar.
+tracking:
+  iou_threshold: 0.3         # sobreposição mínima para considerar o mesmo rosto
+  max_missing_frames: 8      # frames sem ver a pessoa antes de encerrar a trilha
+  crops_per_track: 3         # recortes guardados por trilha (mais = mais votos)
+  min_track_frames: 2        # trilha de 1 frame é descartada (falso positivo)
+  crops_dir: "data/tracks"
+
+# Reconhecimento em lote (scripts/recognize_batch.py).
+batch:
+  # Quantos recortes precisam concordar na mesma identidade para virar
+  # presença. 2 equilibra bem com crops_per_track: 3. Suba para 3 se houver
+  # falso positivo; desça para 1 se estiver perdendo gente.
+  min_votos: 2
 
 enroll:
   frames_to_capture: 5       # amostras boas por pessoa no cadastro
