@@ -9,6 +9,12 @@ Fluxo:
   match(vec, gallery)    -> (person_id, score_cosseno) do mais parecido
 """
 
+import ctypes
+import shutil
+import sys
+import tempfile
+from pathlib import Path
+
 import cv2
 import numpy as np
 
@@ -26,6 +32,127 @@ _DETECTOR_FALLBACKS = {
 def _cv_version() -> tuple[int, int]:
     parts = cv2.__version__.split(".")
     return int(parts[0]), int(parts[1])
+
+
+def _e_ascii(texto: str) -> bool:
+    try:
+        texto.encode("ascii")
+        return True
+    except UnicodeEncodeError:
+        return False
+
+
+def _nome_curto_bruto(caminho: Path) -> Path | None:
+    """Chama GetShortPathNameW e devolve o resultado, sem julgar."""
+    if not sys.platform.startswith("win"):
+        return None
+    try:
+        GetShortPathNameW = ctypes.windll.kernel32.GetShortPathNameW
+        GetShortPathNameW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p,
+                                      ctypes.c_uint]
+        GetShortPathNameW.restype = ctypes.c_uint
+        buf = ctypes.create_unicode_buffer(1024)
+        n = GetShortPathNameW(str(caminho), buf, len(buf))
+        if n and n < len(buf) and buf.value:
+            return Path(buf.value)
+    except Exception:                                    # noqa: BLE001
+        pass
+    return None
+
+
+def _caminho_curto_windows(caminho: Path) -> Path | None:
+    """Caminho ASCII equivalente, via nome curto 8.3 do Windows.
+
+    Contexto: o importador ONNX do OpenCV abre o arquivo com `std::ifstream`,
+    que no Windows converte a string pela página de código ANSI local. Caminho
+    com acento não sobrevive: o arquivo não é achado e o erro que sai é
+    "Can't read ONNX file" — parece corrupção, mas é caminho. Um usuário
+    chamado "BeatrizEduão-TI" põe um "ã" em todo caminho absoluto do projeto.
+
+    **Encurta só o DIRETÓRIO, preservando o nome do arquivo.** O nome curto
+    completo tem extensão limitada a 3 caracteres e transforma
+    `face_detection_yunet_2023mar.onnx` em `FACE_D~1.ONN` — e o `readNet` do
+    OpenCV decide o framework pela EXTENSÃO, então passa a achar o arquivo e
+    não saber o que ele é ("Cannot determine an origin framework"). Trocaria um
+    erro por outro. Como o acento está na pasta do usuário e não no nome do
+    modelo, encurtar o diretório resolve e mantém o `.onnx` intacto.
+
+    Devolve None se o Windows não tiver nome curto — a geração 8.3 pode estar
+    desativada no volume.
+    """
+    if not sys.platform.startswith("win"):
+        return None
+
+    # 1) diretório curto + nome de arquivo original (preserva a extensão)
+    curto_dir = _nome_curto_bruto(caminho.parent)
+    if curto_dir is not None:
+        cand = curto_dir / caminho.name
+        if _e_ascii(str(cand)) and cand.exists():
+            return cand
+
+    # 2) nome curto completo, aceito só se a extensão sobreviver
+    curto = _nome_curto_bruto(caminho)
+    if (curto is not None and _e_ascii(str(curto)) and curto.exists()
+            and curto.suffix.lower() == caminho.suffix.lower()):
+        return curto
+    return None
+
+
+def _caminho_legivel_pelo_dnn(caminho: Path) -> str:
+    """Caminho que o módulo DNN do OpenCV consegue abrir de fato.
+
+    Três tentativas, da mais barata para a mais cara:
+
+      1. o caminho como está — se for ASCII, nada a fazer (todo Linux, e
+         Windows com usuário sem acento);
+      2. o nome curto 8.3 do Windows, que é ASCII e não copia nada;
+      3. cópia para uma pasta temporária de caminho ASCII, como último
+         recurso. O %TEMP% do usuário também fica sob o nome com acento, então
+         a cópia vai para o diretório temporário do sistema, e o nome curto
+         dele é usado se necessário.
+
+    A cópia é feita uma vez e reaproveitada: os modelos não mudam, e comparar
+    o tamanho evita recopiar 37 MB do SFace em cada início.
+    """
+    if _e_ascii(str(caminho)):
+        return str(caminho)
+
+    curto = _caminho_curto_windows(caminho)
+    if curto is not None:
+        # Trava: o OpenCV escolhe o leitor pela extensão, então qualquer
+        # alternativa que a altere está errada por construção.
+        assert curto.suffix.lower() == caminho.suffix.lower()
+        return str(curto)
+
+    # Último recurso: copiar para um destino de caminho ASCII.
+    base = Path(tempfile.gettempdir())
+    if not _e_ascii(str(base)):
+        curto_base = _caminho_curto_windows(base)
+        base = curto_base if curto_base is not None else Path("C:/ProgramData")
+    destino_dir = base / "facial-models"
+    try:
+        destino_dir.mkdir(parents=True, exist_ok=True)
+        # `caminho.name` preserva a extensão — obrigatório, porque é dela que o
+        # OpenCV deduz o framework do modelo.
+        destino = destino_dir / caminho.name
+        if (not destino.exists()
+                or destino.stat().st_size != caminho.stat().st_size):
+            shutil.copy2(caminho, destino)
+        if _e_ascii(str(destino)):
+            print(f"[engine] caminho com acento; usando cópia ASCII do modelo "
+                  f"em {destino}", flush=True)
+            return str(destino)
+    except OSError as exc:
+        raise RuntimeError(
+            f"O caminho do modelo contém caractere não-ASCII ({caminho}) e o "
+            "módulo DNN do OpenCV não consegue abri-lo no Windows. Tentei o "
+            "nome curto 8.3 e uma cópia temporária, e ambos falharam "
+            f"({type(exc).__name__}: {exc}).\n"
+            "Solução: mova o projeto para um caminho sem acento, por exemplo "
+            "C:\\rc-realtime-processor."
+        ) from exc
+
+    return str(caminho)
 
 
 def _resolve_model(rel_path: str, kind: str) -> str:
@@ -55,7 +182,7 @@ def _resolve_model(rel_path: str, kind: str) -> str:
                     "face_detection_yunet_2022mar.onnx na pasta models/, que este "
                     "código usa automaticamente quando o OpenCV é antigo."
                 )
-            return str(cand)
+            return _caminho_legivel_pelo_dnn(cand)
 
     tried = ", ".join(c.name for c in candidates)
     raise FileNotFoundError(

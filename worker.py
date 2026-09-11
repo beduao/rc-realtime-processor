@@ -34,6 +34,7 @@ from core.config import (frame_image_path, live_image_path, load_config_or_exit,
 from core.database import Database
 from core.draw import draw_face
 from core.face_engine import FaceEngine
+from core.imagem import escrever as escrever_imagem
 from core.storage import SnapshotStore
 
 GALLERY_RELOAD_SECONDS = 10.0   # recarrega cadastros novos sem reiniciar
@@ -303,8 +304,13 @@ def loop_captura(cfg, engine, db, live_path, cam, modo_fixo=False):
             for i, (qualidade, recorte, face_local) in enumerate(tr.crops):
                 nome = f"{marca}_t{tr.id}_{i}.jpg"
                 caminho = pasta / nome
-                if not cv2.imwrite(str(caminho), recorte,
-                                   [int(cv2.IMWRITE_JPEG_QUALITY), 92]):
+                # escrever_imagem, não cv2.imwrite: com caminho não-ASCII o
+                # imwrite devolve False, e este `continue` descartaria TODOS os
+                # recortes em silêncio — o modo captura rodaria sem gravar nada.
+                if not escrever_imagem(caminho, recorte,
+                                       [int(cv2.IMWRITE_JPEG_QUALITY), 92]):
+                    print(f"[worker] falha ao gravar recorte {caminho}",
+                          flush=True)
                     continue
                 registros.append({
                     "path": f"{dia}/{nome}",

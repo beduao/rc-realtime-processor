@@ -15,6 +15,7 @@ import cv2  # noqa: E402
 
 from core.camera import camera_from_config  # noqa: E402
 from core.config import load_config_or_exit, project_path  # noqa: E402
+from core.imagem import escrever as escrever_imagem  # noqa: E402
 
 
 def main() -> int:
@@ -47,8 +48,14 @@ def main() -> int:
     out_dir = project_path("data")
     out_dir.mkdir(parents=True, exist_ok=True)
     out = out_dir / "test_frame.jpg"
-    cv2.imwrite(str(out), frame)
-    print("Frame salvo em:", out)
+    # Confirma que gravou, em vez de anunciar sucesso: com caminho não-ASCII o
+    # cv2.imwrite devolvia False calado e a mensagem "Frame salvo" mentia.
+    if escrever_imagem(out, frame) and out.exists():
+        print("Frame salvo em:", out)
+    else:
+        print(f"FALHA ao gravar {out} — verifique permissão e espaço em disco.")
+        cam.stop()
+        return 1
 
     cam.stop()
     return 0

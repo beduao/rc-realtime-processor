@@ -62,7 +62,8 @@ def video_sintetico(caminho, frames=60, tam=(640, 480)):
 
 
 def escrever_config(**over):
-    cfg = yaml.safe_load(open(os.path.join(RAIZ, "config.pi.example.yaml")))
+    cfg = yaml.safe_load(open(os.path.join(RAIZ, "config.pi.example.yaml"),
+                                    encoding="utf-8"))
     cfg["storage"]["db_path"] = os.path.join(TMP, "t.db")
     cfg["storage"]["snapshots_dir"] = os.path.join(TMP, "snaps")
     cfg["storage"]["live_path"] = os.path.join(TMP, "live.jpg")
@@ -71,7 +72,8 @@ def escrever_config(**over):
         secao, _, chave = k.partition(".")
         cfg[secao][chave] = v
     caminho = os.path.join(TMP, "config.yaml")
-    yaml.safe_dump(cfg, open(caminho, "w"))
+    yaml.safe_dump(cfg, open(caminho, "w", encoding="utf-8"),
+                   allow_unicode=True)
     os.environ["FACIAL_CONFIG"] = caminho
     import core.config as cc
     cc._cache = None
@@ -129,15 +131,20 @@ def config_live_path_absoluto_e_fallback():
 # --------------------------------------------------------------------------- #
 @teste
 def camera_escolhe_backend_por_tipo_de_fonte():
-    from core.camera import _parse_source, Camera
+    from core.camera import _backend_local, _parse_source, Camera
+    # O backend de webcam por ÍNDICE depende da plataforma (V4L2 no Linux,
+    # DirectShow no Windows), então vem de _backend_local() em vez de estar
+    # fixo aqui. Fixar V4L2 fazia este teste falhar no Windows com um
+    # "(0, 700)" enigmático — 700 é o CAP_DSHOW.
+    local = _backend_local()
     casos = [("rtsp://a@1.2.3.4/x", cv2.CAP_FFMPEG, False),
              ("/tmp/v.avi", cv2.CAP_FFMPEG, False),
-             (0, cv2.CAP_V4L2, True), ("0", cv2.CAP_V4L2, True),
+             (0, local, True), ("0", local, True),
              ("/dev/video0", cv2.CAP_V4L2, True)]
-    for fonte, backend, local in casos:
+    for fonte, backend, e_local in casos:
         _, be = _parse_source(fonte)
-        assert be == backend, (fonte, be)
-        assert Camera(fonte).is_local_device == local, fonte
+        assert be == backend, (fonte, be, backend)
+        assert Camera(fonte).is_local_device == e_local, fonte
     return f"{len(casos)} fontes classificadas corretamente"
 
 
@@ -437,11 +444,21 @@ def worker_sigterm_salva_trilhas_em_andamento():
     import subprocess
     from core.database import Database
 
+    if sys.platform.startswith("win"):
+        # No Windows, send_signal(SIGTERM) vira TerminateProcess: mata o
+        # processo na hora, sem rodar handler nenhum, e o código de saída é 1.
+        # O encerramento gracioso é logicamente impossível ali — e é
+        # dispensável, porque quem para o worker com SIGTERM é o systemd, que
+        # só existe no Pi. Pular é a resposta correta; "corrigir" seria
+        # afrouxar a asserção e o teste deixaria de provar o que importa.
+        return "PULADO no Windows: SIGTERM não é entregável (é TerminateProcess)"
+
     db_path = os.path.join(TMP, "sigterm.db")
     v = os.path.join(TMP, "sig.avi")
     video_sintetico(v, frames=80)
     cfg_path = os.path.join(TMP, "cfg_sigterm.yaml")
-    cfg = yaml.safe_load(open(os.path.join(RAIZ, "config.pi.example.yaml")))
+    cfg = yaml.safe_load(open(os.path.join(RAIZ, "config.pi.example.yaml"),
+                                    encoding="utf-8"))
     cfg["camera"]["rtsp_url"] = v
     cfg["camera"]["reconnect_delay_seconds"] = 0.2
     cfg["storage"]["db_path"] = db_path
@@ -451,12 +468,14 @@ def worker_sigterm_salva_trilhas_em_andamento():
     cfg["tracking"]["min_track_frames"] = 1
     cfg["worker"]["mode"] = "captura"
     cfg["worker"]["draw_annotations"] = False
-    yaml.safe_dump(cfg, open(cfg_path, "w"))
+    yaml.safe_dump(cfg, open(cfg_path, "w", encoding="utf-8"),
+                   allow_unicode=True)
 
     # engine falsa injetada por sitecustomize, já que roda em outro processo
     shim = os.path.join(TMP, "shim")
     os.makedirs(shim, exist_ok=True)
-    with open(os.path.join(shim, "sitecustomize.py"), "w") as fh:
+    with open(os.path.join(shim, "sitecustomize.py"), "w",
+              encoding="utf-8") as fh:
         fh.write(
             "import sys, numpy as np\n"
             f"sys.path.insert(0, {RAIZ!r})\n"
@@ -508,7 +527,8 @@ def _shim_engine(destino, proibir_embed=False):
     """sitecustomize que injeta a EngineFalsa num worker rodando em subprocesso."""
     os.makedirs(destino, exist_ok=True)
     guarda = "        raise AssertionError('captura nao reconhece')\n" if proibir_embed else ""
-    with open(os.path.join(destino, "sitecustomize.py"), "w") as fh:
+    with open(os.path.join(destino, "sitecustomize.py"), "w",
+              encoding="utf-8") as fh:
         fh.write(
             "import sys, numpy as np\n"
             f"sys.path.insert(0, {RAIZ!r})\n"
@@ -535,7 +555,8 @@ def _shim_engine(destino, proibir_embed=False):
 
 
 def _cfg_arquivo(nome, **over):
-    cfg = yaml.safe_load(open(os.path.join(RAIZ, "config.pi.example.yaml")))
+    cfg = yaml.safe_load(open(os.path.join(RAIZ, "config.pi.example.yaml"),
+                                    encoding="utf-8"))
     v = os.path.join(TMP, "modo.avi")
     if not os.path.exists(v):
         video_sintetico(v, frames=80)
@@ -556,7 +577,8 @@ def _cfg_arquivo(nome, **over):
         sec, _, chave = k.partition(".")
         cfg[sec][chave] = val
     caminho = os.path.join(TMP, f"{nome}.yaml")
-    yaml.safe_dump(cfg, open(caminho, "w"))
+    yaml.safe_dump(cfg, open(caminho, "w", encoding="utf-8"),
+                   allow_unicode=True)
     return caminho
 
 
@@ -581,13 +603,13 @@ def modo_cli_fixa_e_ignora_o_config():
     try:
         time.sleep(4)
         assert proc.poll() is None, proc.stdout.read()
-        status = json.load(open(status_file))
+        status = json.load(open(status_file, encoding="utf-8"))
         assert status["mode"] == "realtime", status
         assert status["fixo"] is True, status
 
         # config diz "captura", mas o CLI mandou: não pode trocar
         time.sleep(6)
-        status = json.load(open(status_file))
+        status = json.load(open(status_file, encoding="utf-8"))
         assert status["mode"] == "realtime", "trocou apesar de --mode"
         proc.send_signal(sig.SIGTERM)
         saida = proc.communicate(timeout=25)[0]
@@ -610,7 +632,7 @@ def modo_troca_a_quente_sem_reiniciar():
     try:
         time.sleep(5)
         assert proc.poll() is None, proc.stdout.read()
-        st = json.load(open(status_file))
+        st = json.load(open(status_file, encoding="utf-8"))
         assert st["mode"] == "captura" and st["fixo"] is False, st
 
         db = Database(os.path.join(TMP, "hot", "dados.db"))
@@ -622,22 +644,33 @@ def modo_troca_a_quente_sem_reiniciar():
         db.add_embedding(pid, EngineFalsa().embed(None, None))
 
         # troca pelo mesmo caminho que a pessoa usaria
-        cfg = yaml.safe_load(open(cfg_path))
+        cfg = yaml.safe_load(open(cfg_path, encoding="utf-8"))
         cfg["worker"]["mode"] = "realtime"
         cfg["worker"]["min_interval_seconds"] = 0.05
         cfg["worker"]["process_every_n_frames"] = 1
         cfg["worker"]["event_cooldown_seconds"] = 0.3
-        yaml.safe_dump(cfg, open(cfg_path, "w"))
+        yaml.safe_dump(cfg, open(cfg_path, "w", encoding="utf-8"),
+                   allow_unicode=True)
 
         time.sleep(7)
-        st = json.load(open(status_file))
+        st = json.load(open(status_file, encoding="utf-8"))
         assert st["mode"] == "realtime", f"não trocou: {st}"
         assert db.list_events(limit=5), "realtime não gerou eventos após a troca"
         assert len(db.pending_tracks()) >= trilhas_antes, \
             "trilhas pendentes sumiram na transição"
 
+        # A troca a quente já foi provada acima, pelo estado publicado e pelo
+        # banco. O que vem agora é só a confirmação no log — e ela depende de
+        # encerramento gracioso, que no Windows não existe: send_signal(SIGTERM)
+        # vira TerminateProcess, mata sem rodar handler e a saída pendente se
+        # perde. Asserção sobre log post-mortem, ali, testaria o sistema
+        # operacional, não o worker.
         proc.send_signal(sig.SIGTERM)
         saida = proc.communicate(timeout=25)[0]
+        if sys.platform.startswith("win"):
+            return ("captura -> realtime sem reiniciar; trilhas preservadas "
+                    "(log de encerramento não conferido: SIGTERM no Windows "
+                    "não é gracioso)")
         assert "captura -> realtime" in saida, saida
         assert proc.returncode == 0
         return ("captura -> realtime sem reiniciar; trilhas preservadas e "
@@ -654,12 +687,13 @@ def modo_invalido_no_config_nao_derruba_o_worker():
     os.environ["FACIAL_CONFIG"] = cfg_path
     assert w.modo_do_config("realtime") == "realtime"
 
-    cfg = yaml.safe_load(open(cfg_path))
+    cfg = yaml.safe_load(open(cfg_path, encoding="utf-8"))
     cfg["worker"]["mode"] = "turbo"
-    yaml.safe_dump(cfg, open(cfg_path, "w"))
+    yaml.safe_dump(cfg, open(cfg_path, "w", encoding="utf-8"),
+                   allow_unicode=True)
     assert w.modo_do_config("captura") == "captura", "valor inválido mudou o modo"
 
-    with open(cfg_path, "w") as fh:      # YAML corrompido
+    with open(cfg_path, "w", encoding="utf-8") as fh:   # YAML corrompido
         fh.write("worker: [isto: nao: e: valido\n")
     assert w.modo_do_config("captura") == "captura", "YAML quebrado mudou o modo"
     return "valor inválido e YAML corrompido mantêm o modo atual"
@@ -750,7 +784,8 @@ def _api_cliente(nome="api", host="127.0.0.1", **over):
 
     pasta = os.path.join(TMP, nome)
     os.makedirs(pasta, exist_ok=True)
-    cfg = yaml.safe_load(open(os.path.join(RAIZ, "config.pi.example.yaml")))
+    cfg = yaml.safe_load(open(os.path.join(RAIZ, "config.pi.example.yaml"),
+                                    encoding="utf-8"))
     cfg["storage"]["db_path"] = os.path.join(pasta, "dados.db")
     cfg["storage"]["snapshots_dir"] = os.path.join(pasta, "snaps")
     cfg["storage"]["live_path"] = os.path.join(pasta, "live.jpg")
@@ -758,7 +793,8 @@ def _api_cliente(nome="api", host="127.0.0.1", **over):
         sec, _, chave = k.partition(".")
         cfg.setdefault(sec, {})[chave] = v
     caminho = os.path.join(pasta, "cfg.yaml")
-    yaml.safe_dump(cfg, open(caminho, "w"))
+    yaml.safe_dump(cfg, open(caminho, "w", encoding="utf-8"),
+                   allow_unicode=True)
     os.environ["FACIAL_CONFIG"] = caminho
     cc._cache = None
 
@@ -1220,13 +1256,15 @@ def api_token_opcional_protege_sem_trancar_o_health():
 
     pasta = os.path.join(TMP, "token")
     os.makedirs(pasta, exist_ok=True)
-    cfg = yaml.safe_load(open(os.path.join(RAIZ, "config.pi.example.yaml")))
+    cfg = yaml.safe_load(open(os.path.join(RAIZ, "config.pi.example.yaml"),
+                                    encoding="utf-8"))
     cfg["storage"]["db_path"] = os.path.join(pasta, "dados.db")
     cfg["storage"]["snapshots_dir"] = os.path.join(pasta, "snaps")
     cfg["storage"]["live_path"] = os.path.join(pasta, "live.jpg")
     cfg["api"]["token"] = "segredo-de-teste"
     caminho = os.path.join(pasta, "cfg.yaml")
-    yaml.safe_dump(cfg, open(caminho, "w"))
+    yaml.safe_dump(cfg, open(caminho, "w", encoding="utf-8"),
+                   allow_unicode=True)
     os.environ["FACIAL_CONFIG"] = caminho
     cc._cache = None
 
@@ -1346,13 +1384,15 @@ def retencao_alcanca_a_pasta_de_trilhas():
                        [{"path": "20200101/x.jpg", "quality": 1.0, "face": "[]"}])
     db.resolve_track(tid, None, "Desconhecido", 0.2, "[]")
 
-    cfg = yaml.safe_load(open(os.path.join(RAIZ, "config.pi.example.yaml")))
+    cfg = yaml.safe_load(open(os.path.join(RAIZ, "config.pi.example.yaml"),
+                                    encoding="utf-8"))
     cfg["storage"]["db_path"] = os.path.join(pasta, "dados.db")
     cfg["storage"]["snapshots_dir"] = snaps
     cfg["storage"]["live_path"] = os.path.join(pasta, "live.jpg")
     cfg["tracking"]["crops_dir"] = tracks
     caminho = os.path.join(pasta, "cfg.yaml")
-    yaml.safe_dump(cfg, open(caminho, "w"))
+    yaml.safe_dump(cfg, open(caminho, "w", encoding="utf-8"),
+                   allow_unicode=True)
 
     env = dict(os.environ, FACIAL_CONFIG=caminho, PYTHONPATH=RAIZ)
     r = subprocess.run([sys.executable, "scripts/cleanup_snapshots.py",
@@ -1389,13 +1429,15 @@ def retencao_nao_apaga_recortes_de_trilha_pendente():
                  [{"path": "20200101/x.jpg", "quality": 1.0, "face": "[]"}])
     assert db.pending_tracks_before(time.time() - 7 * 86400) == 1
 
-    cfg = yaml.safe_load(open(os.path.join(RAIZ, "config.pi.example.yaml")))
+    cfg = yaml.safe_load(open(os.path.join(RAIZ, "config.pi.example.yaml"),
+                                    encoding="utf-8"))
     cfg["storage"]["db_path"] = os.path.join(pasta, "dados.db")
     cfg["storage"]["snapshots_dir"] = snaps
     cfg["storage"]["live_path"] = os.path.join(pasta, "live.jpg")
     cfg["tracking"]["crops_dir"] = tracks
     caminho = os.path.join(pasta, "cfg.yaml")
-    yaml.safe_dump(cfg, open(caminho, "w"))
+    yaml.safe_dump(cfg, open(caminho, "w", encoding="utf-8"),
+                   allow_unicode=True)
 
     env = dict(os.environ, FACIAL_CONFIG=caminho, PYTHONPATH=RAIZ)
     r = subprocess.run([sys.executable, "scripts/cleanup_snapshots.py",
@@ -1907,6 +1949,21 @@ def painel_baixa_imagem_com_token():
             self.status_code = r.status_code
             self.content = r.content
             self.ok = 200 <= r.status_code < 300
+            self._r = r
+
+        def json(self):
+            # O painel passou a ler o `detail` da resposta em vez de deduzir a
+            # causa pelo código HTTP, então o dublê precisa de json() e text.
+            # Levanta ValueError quando o corpo não é JSON, igual ao requests —
+            # é desse erro que o painel se defende.
+            try:
+                return self._r.json()
+            except Exception as exc:                     # noqa: BLE001
+                raise ValueError(str(exc)) from exc
+
+        @property
+        def text(self):
+            return self._r.text
 
     # Session que fala com a API por dentro do TestClient, com o token.
     class SessaoFalsa:
@@ -1944,10 +2001,16 @@ def painel_baixa_imagem_com_token():
     assert "bytes" not in capturado, "não devia renderizar imagem"
     assert "token" in capturado["aviso"].lower(), capturado
 
-    # 3) foto apagada pela retenção: mensagem diferente de problema de token
+    # 3) foto que não existe: a mensagem vem da API e é DIFERENTE da de token.
+    # Antes o painel deduzia a causa pelo código HTTP e escrevia "retenção" —
+    # suposição que só às vezes era verdade. Agora repassa o `detail`, então o
+    # que se testa é que a explicação é a da API e não se confunde com token.
     montar("tok3n")("/snapshots/nao-existe.jpg")
     assert "bytes" not in capturado
-    assert "retenção" in capturado["aviso"], capturado
+    aviso_404 = capturado["aviso"]
+    assert "não encontrado" in aviso_404.lower(), aviso_404
+    assert "token" not in aviso_404.lower(), \
+        "404 não pode ser anunciado como problema de token"
 
     # 4) aceita caminho relativo e URL absoluta (snapshot_url vem dos dois jeitos)
     montar("tok3n")("http://api-de-teste/snapshots/foto.jpg")

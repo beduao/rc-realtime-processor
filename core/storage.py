@@ -7,9 +7,8 @@ que é o que vai para o banco e o que a API usa em /snapshots/{path}.
 import time
 from pathlib import Path
 
-import cv2
-
 from .config import project_path
+from .imagem import escrever as escrever_imagem
 
 
 def _safe(name: str) -> str:
@@ -31,7 +30,11 @@ class SnapshotStore:
         stamp = time.strftime("%H%M%S", time.localtime(now))
         millis = int((now % 1) * 1000)
         fname = f"{stamp}_{millis:03d}_{_safe(label)}.jpg"
-        cv2.imwrite(str(folder / fname), frame)
+        # escrever_imagem, não cv2.imwrite: com caminho não-ASCII o imwrite
+        # devolve False sem levantar nada, e o sistema rodaria sem gravar
+        # snapshot nenhum, em silêncio. Agora a falha é audível.
+        if not escrever_imagem(folder / fname, frame):
+            raise OSError(f"não foi possível gravar o snapshot {folder / fname}")
         return str(prefix / fname)
 
     def remove_dir(self, subdir: str) -> None:

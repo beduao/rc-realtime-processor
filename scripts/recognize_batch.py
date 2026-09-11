@@ -34,6 +34,7 @@ import numpy as np  # noqa: E402
 from core.config import load_config_or_exit, project_path  # noqa: E402
 from core.database import Database  # noqa: E402
 from core.face_engine import FaceEngine  # noqa: E402
+from core.imagem import ler as ler_imagem  # noqa: E402
 
 
 def _crops_dir(cfg):
@@ -46,7 +47,9 @@ def processar_trilha(engine, gallery, base, trilha, crops, limiar, min_votos):
     votos = []          # (person_id ou None, score)
     for c in crops:
         caminho = base / c["path"]
-        img = cv2.imread(str(caminho))
+        # ler_imagem, não cv2.imread: caminho não-ASCII faz o imread devolver
+        # None em silêncio, e a trilha inteira viraria "sem recorte legível".
+        img = ler_imagem(caminho)
         if img is None:
             continue
         try:

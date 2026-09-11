@@ -52,6 +52,25 @@ def checar_python():
     diz(OK, f"Sistema: {platform.system()} {platform.release()} "
             f"({platform.machine()})")
 
+    # Caminho com acento quebra o importador ONNX do OpenCV no Windows: ele
+    # abre o arquivo com std::ifstream, que converte pela página de código
+    # ANSI local. O erro que sai é "Can't read ONNX file", que parece
+    # corrupção do modelo e manda procurar no lugar errado.
+    try:
+        str(RAIZ).encode("ascii")
+        ascii_ok = True
+    except UnicodeEncodeError:
+        ascii_ok = False
+    if not ascii_ok:
+        fora = "".join(sorted({c for c in str(RAIZ) if ord(c) > 127}))
+        diz(AVISO, f"o caminho do projeto tem caractere não-ASCII: {fora}",
+            f"{RAIZ}\n"
+            "O módulo DNN do OpenCV não abre caminho com acento no Windows.\n"
+            "O core/face_engine.py contorna isso (nome curto 8.3 e, se\n"
+            "preciso, cópia ASCII do modelo). Se ainda assim falhar com\n"
+            "\"Can't read ONNX file\", mova o projeto para um caminho sem\n"
+            "acento, por exemplo C:\\rc-realtime-processor.")
+
     faltando = []
     try:
         import cv2
@@ -317,9 +336,17 @@ def checar_camera(indice):
 
     saida = RAIZ / "data" / "test_frame_local.jpg"
     saida.parent.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(str(saida), frame)
-    diz(OK, f"frame salvo em {saida.relative_to(RAIZ)} — abra para conferir "
-            "enquadramento")
+    # Confere se gravou de verdade. A versão anterior usava cv2.imwrite e
+    # anunciava "frame salvo" sem verificar — com caminho não-ASCII o imwrite
+    # devolve False em silêncio, e o arquivo nunca existiu. Foi essa mensagem
+    # falsa que atrasou o diagnóstico de um problema de codificação de caminho.
+    from core.imagem import escrever as escrever_imagem
+    if escrever_imagem(saida, frame) and saida.exists():
+        diz(OK, f"frame salvo em {saida.relative_to(RAIZ)} — abra para "
+                "conferir enquadramento")
+    else:
+        diz(ERRO, f"não conseguiu gravar {saida.relative_to(RAIZ)}",
+            "Verifique permissão de escrita e espaço em disco.")
 
 
 def checar_portas():

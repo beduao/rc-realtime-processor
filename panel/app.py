@@ -69,13 +69,22 @@ def imagem(caminho: str, **kwargs):
         st.caption(f"⚠ imagem indisponível ({type(exc).__name__})")
         return
     if not r.ok:
-        # Distingue os casos, porque cada um tem causa diferente: 401/503 é
-        # token, 404 é arquivo que a retenção já apagou.
-        motivo = {401: "token inválido ou ausente neste computador",
-                  503: "API sem token configurado",
-                  404: "foto não está mais no disco (retenção)"}.get(
-                      r.status_code, f"HTTP {r.status_code}")
-        st.caption(f"⚠ {motivo}")
+        # Mostra o `detail` que a API mandou, em vez de deduzir a causa pelo
+        # código HTTP. A primeira versão fazia essa dedução e errava feio: o
+        # mesmo 503 é usado pelo middleware ("sem token configurado") e pelo
+        # /enroll/preview ("ainda sem imagem, o worker está rodando?"). O
+        # painel anunciava problema de token quando o problema era câmera,
+        # mandando procurar no lugar errado.
+        detalhe = ""
+        try:
+            detalhe = str(r.json().get("detail") or "")
+        except ValueError:
+            detalhe = (r.text or "").strip()[:300]
+        if not detalhe:
+            detalhe = {401: "token inválido ou ausente neste computador",
+                       404: "foto não está mais no disco (retenção)"}.get(
+                           r.status_code, f"HTTP {r.status_code}")
+        st.caption(f"⚠ {detalhe}")
         return
     st.image(r.content, **kwargs)
 
@@ -344,7 +353,22 @@ elif page == "Cadastrar":
                         ss.samples = data["samples"]
                         st.rerun()
                     else:
-                        st.warning(data.get("message", "Não foi possível capturar."))
+                        # `message` é a recusa explicada da API (sem rosto, sem
+                        # imagem). `detail` é o corpo de uma HTTPException, e
+                        # HTTP 500 sem corpo útil significa exceção no servidor.
+                        # A versão anterior caía num "Não foi possível capturar"
+                        # genérico nos dois últimos casos, escondendo a única
+                        # informação que permitiria diagnosticar.
+                        motivo = (data.get("message") or data.get("detail")
+                                  or "").strip()
+                        if motivo:
+                            st.warning(motivo)
+                        else:
+                            st.error(
+                                f"A API respondeu {r.status_code} sem explicar. "
+                                "Provável exceção no servidor — o traceback "
+                                "está no terminal do uvicorn.")
+                            st.caption(f"corpo: {r.text[:400]}")
 
         with col_samples:
             st.caption("Amostras")

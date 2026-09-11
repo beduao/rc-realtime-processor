@@ -41,6 +41,7 @@ from core.database import (Database, InepDuplicado, inep_suspeito,
                           normalizar_inep)
 from core.draw import crop_face, draw_face
 from core.face_engine import FaceEngine
+from core.imagem import ler as ler_imagem
 from core.storage import SnapshotStore
 
 cfg = load_config()
@@ -222,7 +223,10 @@ def _frame_do_worker():
             return None
     except OSError:
         return None
-    return cv2.imread(str(FRAME_PATH))
+    # imagem.ler, não cv2.imread: com caminho não-ASCII o imread devolve None
+    # em silêncio, e o sintoma era a API dizer "ainda sem imagem" enquanto o
+    # worker publicava o frame normalmente.
+    return ler_imagem(FRAME_PATH)
 
 
 def _get_camera() -> Camera:
@@ -247,8 +251,51 @@ def frame_para_cadastro():
     img = _frame_do_worker()
     if img is not None:
         return img, "worker"
+
+    # Plano B é abrir a câmera aqui. Legítimo com RTSP, que aceita várias
+    # conexões — e CONDENADO com webcam USB ou CSI, que são exclusivas: com o
+    # worker rodando, a API disputa o dispositivo e perde quase sempre.
+    #
+    # Foi exatamente esse o bug do cadastro que exigia ~15 cliques para
+    # capturar uma amostra. Silenciosamente competir produzia sucesso
+    # esporádico, o que é muito pior que falhar: parecia instabilidade da
+    # câmera, e escondeu por semanas que o frame do worker não estava sendo
+    # alcançado (no Pi porque não era publicado; no Windows porque o imread
+    # não lia caminho com acento).
+    if _fonte_e_dispositivo_local() and _worker_vivo():
+        return None, "conflito"
+
     cam = _get_camera()
     return cam.read(), "camera"
+
+
+def _porque_sem_imagem(origem: str) -> str:
+    """Explica a ausência de imagem conforme a causa, em vez de um texto só."""
+    if origem == "conflito":
+        return ("A câmera é local (webcam/CSI) e o worker está com o "
+                "dispositivo, que aceita só um processo. A API deveria estar "
+                "lendo o frame publicado por ele, e não está — verifique se o "
+                f"arquivo {FRAME_PATH.name} está sendo atualizado na pasta "
+                f"{FRAME_PATH.parent}. Alternativa: pare o worker durante o "
+                "cadastro.")
+    return ("Ainda sem imagem da câmera. Se o worker acabou de subir, aguarde "
+            "alguns segundos; se está parado, verifique se ele está rodando.")
+
+
+def _fonte_e_dispositivo_local() -> bool:
+    """True quando a câmera é webcam/CSI, que só aceita UM processo."""
+    from core.camera import _parse_source
+    return _parse_source(cfg.camera.rtsp_url)[1] != cv2.CAP_FFMPEG
+
+
+def _worker_vivo() -> bool:
+    """O worker publicou status recentemente?"""
+    try:
+        with open(STATUS_PATH, encoding="utf-8") as fh:
+            st = json.load(fh)
+    except (OSError, ValueError):
+        return False
+    return time.time() - float(st.get("updated_at", 0)) < 60
 
 
 def _maybe_close_camera():
@@ -394,10 +441,7 @@ def enroll_preview():
         raise HTTPException(404, "Nenhuma sessão de cadastro ativa.")
     frame, origem = frame_para_cadastro()
     if frame is None:
-        raise HTTPException(
-            503, "Ainda sem imagem. Se a câmera é USB e o worker está parado, "
-                 "aguarde alguns segundos; se ele está rodando, verifique "
-                 "'sudo systemctl status facial-worker'.")
+        raise HTTPException(503, _porque_sem_imagem(origem))
     preview = frame.copy()
     for face in engine.detect(frame):
         draw_face(preview, face, "rosto", score=float(face[14]), known=True)
@@ -415,7 +459,7 @@ def enroll_capture(req: SessionReq):
         raise HTTPException(404, "Sessão inválida ou expirada.")
     frame, origem = frame_para_cadastro()
     if frame is None:
-        return {"ok": False, "message": "Ainda sem imagem da câmera."}
+        return {"ok": False, "message": _porque_sem_imagem(origem)}
 
     face = engine.best_face(engine.detect(frame))
     if face is None:
@@ -625,7 +669,7 @@ def add_sample(person_id: int):
 
     frame, origem = frame_para_cadastro()
     if frame is None:
-        return {"ok": False, "message": "Ainda sem imagem da câmera."}
+        return {"ok": False, "message": _porque_sem_imagem(origem)}
     face = engine.best_face(engine.detect(frame))
     if face is None:
         return {"ok": False, "message": "Nenhum rosto detectado. Ajuste a posição."}
