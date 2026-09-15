@@ -32,6 +32,7 @@ um JPEG truncado — era o bug do preview servido pela API.
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 
 import cv2
@@ -55,6 +56,39 @@ def ler(caminho, flags: int = cv2.IMREAD_COLOR):
     return cv2.imdecode(buf, flags)
 
 
+def _substituir_com_retry(tmp: Path, destino: Path, tentativas: int = 12,
+                          espera: float = 0.02) -> bool:
+    """`os.replace` resistente ao bloqueio de arquivo aberto do Windows.
+
+    No POSIX, renomear por cima de um arquivo que outro processo tem aberto é
+    permitido — o leitor continua com o inode antigo. No Windows isso é negado:
+
+        PermissionError: [WinError 5] Acesso negado
+
+    E acontece de verdade neste projeto: o worker reescreve `facial-frame.jpg`
+    várias vezes por segundo enquanto a API o lê a cada 0,8s para o preview do
+    cadastro. Quando as duas operações se cruzam, a troca falha — e como a
+    publicação do frame ficava fora do `try` do laço, o worker MORRIA no meio
+    do reconhecimento.
+
+    O leitor segura o arquivo por microssegundos, então repetir resolve. Doze
+    tentativas com 20 ms cobrem ~240 ms, muito acima da janela real. Falhando
+    todas, devolve False: perder um frame de preview é irrelevante, derrubar o
+    worker não.
+    """
+    for i in range(tentativas):
+        try:
+            os.replace(tmp, destino)
+            return True
+        except PermissionError:
+            if i == tentativas - 1:
+                return False
+            time.sleep(espera)
+        except OSError:
+            return False
+    return False
+
+
 def escrever(caminho, imagem, params=None) -> bool:
     """Como `cv2.imwrite`, mas segura com caminho não-ASCII e ATÔMICA.
 
@@ -63,7 +97,12 @@ def escrever(caminho, imagem, params=None) -> bool:
     """
     caminho = Path(caminho)
     ext = caminho.suffix or ".jpg"
-    ok, buf = cv2.imencode(ext, imagem, params or [])
+    try:
+        ok, buf = cv2.imencode(ext, imagem, params or [])
+    except cv2.error:
+        # Imagem vazia ou com formato inesperado. Quem chama trata pelo False;
+        # deixar escapar daqui já derrubou o worker uma vez.
+        return False
     if not ok:
         return False
 
@@ -73,7 +112,9 @@ def escrever(caminho, imagem, params=None) -> bool:
     try:
         caminho.parent.mkdir(parents=True, exist_ok=True)
         tmp.write_bytes(buf.tobytes())
-        os.replace(tmp, caminho)
+        if not _substituir_com_retry(tmp, caminho):
+            tmp.unlink(missing_ok=True)
+            return False
         return True
     except OSError:
         try:

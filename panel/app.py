@@ -417,7 +417,37 @@ elif page == "Reconhecimentos":
         events = []
 
     if not events:
-        st.info("Nenhum evento ainda. Deixe o worker rodando e passe na frente da câmera.")
+        # Esta página lê a tabela `events`, que SÓ o modo realtime alimenta.
+        # No modo captura o worker guarda trilhas e o reconhecimento roda
+        # depois, em lote — então ficar vazia aqui é o comportamento correto,
+        # e dizer só "nenhum evento" mandava procurar defeito onde não há.
+        modo = pendentes = None
+        try:
+            h = S.get(f"{API}/health", timeout=5).json()
+            modo = h.get("worker_mode")
+            pendentes = h.get("tracks_pending")
+        except (requests.RequestException, ValueError):
+            pass
+
+        if modo == "captura":
+            st.info(
+                f"**O worker está em modo `captura`** — ele não reconhece na "
+                f"hora, guarda as passagens e o reconhecimento roda depois, "
+                f"em lote. Por isso esta página está vazia; não é falha.\n\n"
+                + (f"Há **{pendentes} trilha(s)** aguardando. " if pendentes
+                   else "")
+                + "Para processar:\n\n"
+                "```\npython scripts/recognize_batch.py\n```\n"
+                "O resultado aparece na aba **Chamada**, não aqui.\n\n"
+                "Para ver reconhecimento imediato, troque para "
+                "`worker.mode: realtime` no config.yaml — vale em até 10s, "
+                "sem reiniciar.")
+        elif modo is None:
+            st.warning("Nenhum evento, e não consegui falar com a API para "
+                       "saber o modo do worker. Ele está rodando?")
+        else:
+            st.info("Nenhum evento ainda. Deixe o worker rodando e passe na "
+                    "frente da câmera.")
     else:
         cols = st.columns(4)
         for i, ev in enumerate(events):

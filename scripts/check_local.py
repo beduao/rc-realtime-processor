@@ -243,7 +243,25 @@ def varrer_cameras(pular=None, ate=4):
     return funcionando, sem_frame
 
 
-def checar_camera(indice):
+def _worker_com_a_camera(cfg):
+    """(worker_vivo, idade_do_frame) — o worker está publicando frame agora?
+
+    Webcam e câmera CSI aceitam UM processo por vez. Com o worker rodando, o
+    teste de abrir a câmera aqui está condenado a falhar, e reportar isso como
+    "nenhuma câmera encontrada" manda procurar defeito onde não há.
+    """
+    if cfg is None:
+        return False, None
+    try:
+        from core.config import frame_image_path
+        caminho = frame_image_path(cfg)
+        idade = time.time() - caminho.stat().st_mtime
+        return idade < 15, round(idade, 1)
+    except Exception:                                    # noqa: BLE001
+        return False, None
+
+
+def checar_camera(indice, cfg=None):
     secao(f"Câmera (índice {indice})")
     try:
         import cv2
@@ -252,13 +270,38 @@ def checar_camera(indice):
         diz(AVISO, "OpenCV ausente — pulei o teste de câmera")
         return
 
+    vivo, idade = _worker_com_a_camera(cfg)
+    if vivo:
+        diz(OK, f"o worker está rodando e publicando frame (há {idade}s)",
+            "A câmera é dele: webcam e CSI aceitam só um processo. NÃO vou\n"
+            "tentar abrir o dispositivo — a tentativa falharia e pareceria\n"
+            "defeito. É assim que o cadastro funciona com o worker no ar: a\n"
+            "API consome o frame publicado em vez de disputar a câmera.\n"
+            "Para testar a câmera diretamente, pare o worker antes.")
+        return
+
     nomes = {cv2.CAP_DSHOW: "CAP_DSHOW (DirectShow)",
              cv2.CAP_V4L2: "CAP_V4L2", cv2.CAP_ANY: "CAP_ANY"}
     backend = _backend_local()
     diz(OK, f"backend para esta plataforma: {nomes.get(backend, backend)}")
 
+    # Silencia o log do OpenCV já na PRIMEIRA tentativa: a falha aqui é
+    # esperada em vários cenários e o aviso dele, no meio do relatório,
+    # confunde mais do que informa. O que importa este script diz por conta.
+    nivel = None
+    try:
+        nivel = cv2.utils.logging.getLogLevel()
+        cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_SILENT)
+    except Exception:                                    # noqa: BLE001
+        pass
+
     fonte, backend = _parse_source(indice)
     cap = cv2.VideoCapture(fonte, backend)
+    if nivel is not None:
+        try:
+            cv2.utils.logging.setLogLevel(nivel)
+        except Exception:                                # noqa: BLE001
+            pass
     if not cap.isOpened():
         cap.release()
         diz(AVISO, f"não abriu no índice {indice} — varrendo índices e "
@@ -386,7 +429,7 @@ def main(argv=None) -> int:
         indice = int(fonte) if fonte.isdigit() else None
     if indice is None:
         indice = 0
-    checar_camera(indice)
+    checar_camera(indice, cfg)
     checar_portas()
 
     print("\n" + "=" * 68)

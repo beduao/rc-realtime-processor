@@ -37,6 +37,9 @@ from core.face_engine import FaceEngine
 from core.imagem import escrever as escrever_imagem
 from core.storage import SnapshotStore
 
+# Falhas seguidas ao publicar o preview não podem virar enxurrada no log.
+_falhas_publicacao = 0
+
 GALLERY_RELOAD_SECONDS = 10.0   # recarrega cadastros novos sem reiniciar
 LIVE_WRITE_SECONDS = 0.5        # frequência de atualização do preview ao vivo
 LIVE_JPEG_QUALITY = 70          # menor = menos CPU e menos escrita em disco
@@ -102,23 +105,23 @@ def publicar_status(live_path, modo: str, extra: dict = None):
         pass    # status é informativo; falhar aqui não pode parar o worker
 
 
-def _escrever_jpeg(path, image, qualidade):
-    """Escreve um JPEG de forma atômica (arquivo temporário + rename).
+def _escrever_jpeg(path, image, qualidade) -> bool:
+    """Publica um JPEG de forma atômica. Nunca levanta exceção.
 
-    Sem isso a API pode servir uma imagem cortada, porque ela lê o arquivo no
-    mesmo instante em que o worker está escrevendo.
+    Delegado a `core.imagem.escrever`, que resolve de uma vez três coisas que
+    esta função já teve que aprender na marra:
 
-    Codificamos em memória com `imencode` em vez de usar `imwrite` num arquivo
-    ".tmp": o OpenCV escolhe o formato pela EXTENSÃO, então um nome temporário
-    terminado em .tmp faz o imwrite falhar.
+      - **atomicidade**: temporário + rename, senão a API serve JPEG cortado;
+      - **extensão importa**: o OpenCV escolhe o formato por ela, e um
+        temporário ".tmp" fazia o imwrite falhar;
+      - **`os.replace` no Windows falha se o arquivo estiver aberto** — e a API
+        abre esse arquivo a cada 0,8s para o preview. Lá há retry.
+
+    Devolve True/False em vez de propagar: publicar o preview é conveniência,
+    e conveniência não pode derrubar o reconhecimento.
     """
-    ok, buf = cv2.imencode(".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), qualidade])
-    if not ok:
-        return
-    tmp = str(path) + ".part"
-    with open(tmp, "wb") as fh:
-        fh.write(buf.tobytes())
-    os.replace(tmp, str(path))
+    return escrever_imagem(path, image, [int(cv2.IMWRITE_JPEG_QUALITY),
+                                         qualidade])
 
 
 def _write_live(path, image):
@@ -132,8 +135,20 @@ def _write_frame(path, image):
     Publicado sempre, nos dois modos e independente de `draw_annotations`:
     é o que permite cadastrar pessoas com o worker rodando, já que webcam USB
     não aceita dois processos abrindo o dispositivo.
+
+    Perder uma publicação é inofensivo (a próxima vem em milissegundos), mas
+    ficar SEM publicar por muito tempo quebra o cadastro — daí o aviso a cada
+    100 falhas, em vez de silêncio total ou de uma linha por frame.
     """
-    _escrever_jpeg(path, image, FRAME_JPEG_QUALITY)
+    global _falhas_publicacao
+    if _escrever_jpeg(path, image, FRAME_JPEG_QUALITY):
+        _falhas_publicacao = 0
+        return
+    _falhas_publicacao += 1
+    if _falhas_publicacao % 100 == 1:
+        print(f"[worker] não consegui publicar {path} "
+              f"({_falhas_publicacao} falha(s) seguidas). O cadastro pela API "
+              "depende desse arquivo.", flush=True)
 
 
 def intervalo_checagem(cfg) -> float:
