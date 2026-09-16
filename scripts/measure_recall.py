@@ -208,7 +208,7 @@ def atribuir(passagens: list[dict], deteccoes: list[dict], pessoas: dict,
                 and abs(d["ts"] - q["ts"]) <= dist
                 for q in passagens)
             p.update(resultado="acerto", score=d["score"],
-                     crop=d.get("crop"), det_ts=d["ts"])
+                     crop=d.get("crop"), fonte=d.get("fonte"), det_ts=d["ts"])
             d["_usada"] = True
 
     # Fase 2: identidade trocada. Só conta se a pessoa nomeada não estava
@@ -413,7 +413,11 @@ def _relatorio_ambiguos(passagens: list[dict], ip: str, porta: int) -> None:
                         if q is not p and abs(q["ts"] - p["ts"]) <= 2
                         and q["nome"] != p["nome"]})
         crop = p.get("crop")
-        url = (f"http://{ip}:{porta}/snapshots/{crop}" if crop else "(sem recorte)")
+        # As duas origens ficam em bases diferentes e a API tem uma rota para
+        # cada. Montar /snapshots/ para tudo dava 404 em todo recorte vindo do
+        # modo captura — ou seja, em tudo que interessa na escola.
+        base = "/snapshots/" if p.get("fonte") == "evento" else "/tracks/"
+        url = (f"http://{ip}:{porta}{base}{crop}" if crop else "(sem recorte)")
         print(f"  {hora}  disse {p['nome']} ({p['score']:.3f})")
         if junto:
             print(f"            passaram junto: {', '.join(junto)}")

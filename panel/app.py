@@ -40,10 +40,41 @@ st.set_page_config(page_title="Reconhecimento Facial", page_icon="📷", layout=
 
 
 def api_up() -> bool:
+    """Saúde da API, com cache curto.
+
+    Streamlit reexecuta o script inteiro a cada interação, então sem cache
+    esta chamada virava uma ida à rede ANTES de qualquer coisa renderizar —
+    em todo clique, em toda tecla Enter. 10 segundos é curto o bastante para
+    perceber a API caindo e longo o bastante para não pesar na navegação.
+    """
+    agora = time.time()
+    st.session_state.setdefault("_saude", (0.0, False))
+    quando, valor = st.session_state["_saude"]
+    if agora - quando < 10:
+        return valor
     try:
-        return S.get(f"{API}/health", timeout=3).ok
+        valor = S.get(f"{API}/health", timeout=3).ok
     except requests.RequestException:
-        return False
+        valor = False
+    st.session_state["_saude"] = (agora, valor)
+    return valor
+
+
+# Cache de imagens do próprio processo. Fotos de snapshot são IMUTÁVEIS: um
+# caminho sempre devolve os mesmos bytes, então rebaixá-las é desperdício puro.
+#
+# Isso virou necessário quando as imagens passaram a ser buscadas pelo painel
+# (para enviar o token) em vez de pelo navegador. O navegador cacheava; o
+# `requests` não. Em Reconhecimentos, com 60 fotos, cada clique custava 60
+# downloads — e era a maior parte da lentidão percebida.
+#
+# O preview ao vivo NÃO entra aqui: ele muda a cada instante e a URL carrega um
+# cache-buster, então cachear só encheria a memória.
+_CACHE_MAX = 400
+
+
+def _cache_imagem():
+    return st.session_state.setdefault("_img_cache", {})
 
 
 def imagem(caminho: str, **kwargs):
@@ -63,6 +94,15 @@ def imagem(caminho: str, **kwargs):
          funcionar em qualquer topologia de rede (VPN, sub-rede diferente).
     """
     url = caminho if caminho.startswith("http") else f"{API}{caminho}"
+
+    # Preview ao vivo muda a cada instante e traz cache-buster na URL: cachear
+    # só encheria a memória. Snapshot é imutável e vale guardar.
+    cacheavel = "/enroll/preview" not in url
+    cache = _cache_imagem()
+    if cacheavel and url in cache:
+        st.image(cache[url], **kwargs)
+        return
+
     try:
         r = S.get(url, timeout=10)
     except requests.RequestException as exc:
@@ -86,6 +126,13 @@ def imagem(caminho: str, **kwargs):
                            r.status_code, f"HTTP {r.status_code}")
         st.caption(f"⚠ {detalhe}")
         return
+
+    # Só sucesso entra no cache: guardar um 404 ou 503 faria o painel repetir
+    # o erro depois de resolvido.
+    if cacheavel:
+        if len(cache) >= _CACHE_MAX:
+            cache.clear()          # simples de propósito; são bytes, não estado
+        cache[url] = r.content
     st.image(r.content, **kwargs)
 
 
@@ -177,26 +224,49 @@ if page == "Chamada":
     def _linha(pessoa, marcado_default):
         """Uma pessoa na conferência. Devolve o valor do checkbox.
 
-        O nome é o RÓTULO da caixa, não uma coluna ao lado. Com colunas, a
+        A FOTO da melhor detecção fica ao lado, porque sem ela a conferência é
+        feita no escuro: marcar "presente" vira confirmação de um nome, não de
+        um rosto. E é dessa confirmação que saem os rótulos da calibração e o
+        denominador da medição de recall — conferir sem olhar contamina as duas.
+
+        O nome é o RÓTULO da caixa, não um texto ao lado. Com colunas, a
         largura sobrando na coluna da caixa virava um vão vazio — e a área de
         clique ficava restrita ao quadradinho. Assim o nome inteiro é clicável.
         """
-        valor = st.checkbox(f"**{pessoa['nome']}**", value=marcado_default,
-                            key=f"pres-{dia_iso}-{pessoa['person_id']}",
-                            disabled=d["conferida"])
-        detalhe = [ICONES[pessoa["origem"]]]
-        if not pessoa.get("inep_id"):
-            detalhe.append("⚠ sem ID INEP")
-        if pessoa.get("primeira_vez"):
-            detalhe.append(pessoa["primeira_vez"][11:16])
-        if pessoa.get("melhor_score") is not None:
-            detalhe.append(f"score {pessoa['melhor_score']:.2f}")
-        if pessoa.get("correcao") and pessoa["correcao"]["motivo"]:
-            detalhe.append(f"motivo: {pessoa['correcao']['motivo']}")
-        # recuo alinha o detalhe com o texto do rótulo, não com a caixa
-        st.markdown(
-            f"<div style='color:gray;font-size:0.85em;margin:-0.7rem 0 0.6rem 2rem'>"
-            f"{' · '.join(detalhe)}</div>", unsafe_allow_html=True)
+        col_foto, col_dados = st.columns([1, 9], vertical_alignment="center")
+
+        with col_foto:
+            if pessoa.get("foto_url"):
+                imagem(pessoa["foto_url"], width=64)
+            else:
+                # Ausência de foto é informação: significa que o sistema não
+                # viu essa pessoa hoje. Marcar presente aqui é justamente o
+                # falso negativo que a medição de recall procura.
+                st.markdown(
+                    "<div style='width:64px;height:64px;border:1px dashed #555;"
+                    "border-radius:4px;display:flex;align-items:center;"
+                    "justify-content:center;color:#777;font-size:0.7em;"
+                    "text-align:center'>sem<br>registro</div>",
+                    unsafe_allow_html=True)
+
+        with col_dados:
+            valor = st.checkbox(f"**{pessoa['nome']}**", value=marcado_default,
+                                key=f"pres-{dia_iso}-{pessoa['person_id']}",
+                                disabled=d["conferida"])
+            detalhe = [ICONES[pessoa["origem"]]]
+            if not pessoa.get("inep_id"):
+                detalhe.append("⚠ sem ID INEP")
+            if pessoa.get("primeira_vez"):
+                detalhe.append(pessoa["primeira_vez"][11:16])
+            if pessoa.get("melhor_score") is not None:
+                detalhe.append(f"score {pessoa['melhor_score']:.2f}")
+            if pessoa.get("correcao") and pessoa["correcao"]["motivo"]:
+                detalhe.append(f"motivo: {pessoa['correcao']['motivo']}")
+            # recuo alinha o detalhe com o texto do rótulo, não com a caixa
+            st.markdown(
+                f"<div style='color:gray;font-size:0.85em;"
+                f"margin:-0.7rem 0 0.6rem 2rem'>"
+                f"{' · '.join(detalhe)}</div>", unsafe_allow_html=True)
         return valor
 
     with st.form(f"conferencia-{dia_iso}"):
@@ -404,59 +474,118 @@ elif page == "Cadastrar":
 
 # --------------------------------------------------------------------------- #
 elif page == "Reconhecimentos":
+    import datetime
+
     st.header("Histórico de reconhecimentos")
-    col_a, col_b = st.columns([1, 3])
-    limit = col_a.number_input("Quantidade", 10, 500, 60, step=10)
-    if col_b.button("Atualizar"):
-        st.rerun()
 
     try:
-        events = S.get(f"{API}/events", params={"limit": int(limit)}, timeout=10).json()
-    except requests.RequestException as exc:
-        st.error(f"Falha ao buscar eventos: {exc}")
-        events = []
+        pessoas_r = S.get(f"{API}/people", timeout=10)
+        pessoas_lista = pessoas_r.json() if pessoas_r.ok else []
+    except requests.RequestException:
+        pessoas_lista = []
 
-    if not events:
-        # Esta página lê a tabela `events`, que SÓ o modo realtime alimenta.
-        # No modo captura o worker guarda trilhas e o reconhecimento roda
-        # depois, em lote — então ficar vazia aqui é o comportamento correto,
-        # e dizer só "nenhum evento" mandava procurar defeito onde não há.
+    c1, c2, c3, c4 = st.columns([2, 1, 1, 1], vertical_alignment="bottom")
+
+    opcoes = {"Todas as pessoas": 0}
+    opcoes.update({p["name"]: p["id"] for p in pessoas_lista})
+    escolha = c1.selectbox("Pessoa", list(opcoes), index=0)
+    pid_filtro = opcoes[escolha]
+
+    usar_dia = c2.checkbox("Filtrar dia", value=False)
+    dia_r = c3.date_input("Dia", value=datetime.date.today(),
+                          format="DD/MM/YYYY", disabled=not usar_dia,
+                          label_visibility="collapsed" if not usar_dia else "visible")
+    # 24 de padrão: a primeira renderização baixa uma imagem por detecção, e
+    # 60 custavam segundos antes de qualquer coisa aparecer. Depois do cache
+    # ficam instantâneas, mas a primeira impressão é a que conta.
+    limit = c4.number_input("Quantidade", 10, 500, 24, step=10)
+
+    params = {"limit": int(limit), "person_id": pid_filtro}
+    if usar_dia:
+        params["dia"] = dia_r.strftime("%Y-%m-%d")
+
+    try:
+        r = S.get(f"{API}/detections", params=params, timeout=15)
+    except requests.RequestException as exc:
+        st.error(f"Falha ao buscar detecções: {exc}")
+        st.stop()
+    if r.status_code == 404:
+        st.error("A API não tem o endpoint /detections — versão antiga.\n\n"
+                 "No Pi: `git pull && sudo systemctl restart facial-api`")
+        st.stop()
+    if not r.ok:
+        st.error(f"A API respondeu {r.status_code}: {r.text[:300]}")
+        st.stop()
+
+    deteccoes = r.json()["deteccoes"]
+
+    if not deteccoes:
         modo = pendentes = None
         try:
             h = S.get(f"{API}/health", timeout=5).json()
-            modo = h.get("worker_mode")
-            pendentes = h.get("tracks_pending")
+            modo, pendentes = h.get("worker_mode"), h.get("tracks_pending")
         except (requests.RequestException, ValueError):
             pass
-
-        if modo == "captura":
-            st.info(
-                f"**O worker está em modo `captura`** — ele não reconhece na "
-                f"hora, guarda as passagens e o reconhecimento roda depois, "
-                f"em lote. Por isso esta página está vazia; não é falha.\n\n"
-                + (f"Há **{pendentes} trilha(s)** aguardando. " if pendentes
-                   else "")
-                + "Para processar:\n\n"
-                "```\npython scripts/recognize_batch.py\n```\n"
-                "O resultado aparece na aba **Chamada**, não aqui.\n\n"
-                "Para ver reconhecimento imediato, troque para "
-                "`worker.mode: realtime` no config.yaml — vale em até 10s, "
-                "sem reiniciar.")
+        if pendentes:
+            st.info(f"Nada aqui, mas há **{pendentes} trilha(s)** aguardando "
+                    "reconhecimento. Rode o lote:\n\n"
+                    "```\npython scripts/recognize_batch.py\n```")
+        elif pid_filtro:
+            st.info(f"Nenhuma detecção de **{escolha}** no período.")
         elif modo is None:
-            st.warning("Nenhum evento, e não consegui falar com a API para "
+            st.warning("Nada encontrado, e não consegui falar com a API para "
                        "saber o modo do worker. Ele está rodando?")
         else:
-            st.info("Nenhum evento ainda. Deixe o worker rodando e passe na "
-                    "frente da câmera.")
+            st.info("Nenhuma detecção ainda. Deixe o worker rodando e passe "
+                    "na frente da câmera.")
     else:
+        errados = sum(1 for d in deteccoes if d["rotulo"] == "errado")
+        resumo = f"{len(deteccoes)} detecção(ões)"
+        if errados:
+            resumo += f" · **{errados}** marcada(s) como erro"
+        st.caption(resumo + " · marcar aqui **não** altera a chamada")
+
         cols = st.columns(4)
-        for i, ev in enumerate(events):
+        for i, d in enumerate(deteccoes):
             with cols[i % 4]:
-                if ev.get("snapshot_path"):
-                    imagem(f"/snapshots/{ev['snapshot_path']}", width="stretch")
-                quando = time.strftime("%d/%m %H:%M:%S", time.localtime(ev["ts"]))
-                tag = "✅" if ev["is_known"] else "❓"
-                st.caption(f"{tag} **{ev['name']}** · {ev['score']:.2f}\n\n{quando}")
+                if d["foto_url"]:
+                    imagem(d["foto_url"], width="stretch")
+                else:
+                    st.caption("_sem foto_")
+
+                quando = d["quando"][11:19]
+                tag = "✅" if d["is_known"] else "❓"
+                origem = "lote" if d["fonte"] == "trilha" else "ao vivo"
+                st.caption(f"{tag} **{d['nome']}** · {d['score']:.2f}\n\n"
+                           f"{quando} · {origem}")
+
+                if d["rotulo"] == "errado":
+                    st.error("marcada como erro", icon="🚫")
+                    if st.button("desfazer", key=f"undo-{d['chave']}",
+                                 width="stretch"):
+                        S.delete(f"{API}/detections/label",
+                                 params={"fonte": d["fonte"],
+                                         "detection_id": d["id"]}, timeout=10)
+                        st.rerun()
+                elif d["is_known"]:
+                    if st.button("🚫 não é essa pessoa", key=f"bad-{d['chave']}",
+                                 width="stretch"):
+                        resp = S.post(f"{API}/detections/label",
+                                      json={"fonte": d["fonte"],
+                                            "detection_id": d["id"],
+                                            "rotulo": "errado",
+                                            "autor": st.session_state.get("autor", "")},
+                                      timeout=10)
+                        if not resp.ok:
+                            st.error(resp.text[:200])
+                        st.rerun()
+
+        st.divider()
+        st.caption(
+            "Marcar erros aqui alimenta o `calibrate_threshold.py`, que usa "
+            "esses rótulos para calcular o limiar. Quanto mais erros reais "
+            "marcados, melhor a sugestão — e um erro marcado vale mais que "
+            "dez acertos, porque define o teto do limiar.")
 
 
 # --------------------------------------------------------------------------- #

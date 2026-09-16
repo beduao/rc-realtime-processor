@@ -165,6 +165,30 @@ class Database:
                     presentes   INTEGER,
                     correcoes   INTEGER
                 );
+
+                -- Rótulo de uma detecção ESPECÍFICA: "esta aqui não é ela".
+                --
+                -- Mais fino que attendance_overrides, que fala de pessoa/dia.
+                -- Uma pessoa pode ter cinco detecções no dia, quatro certas e
+                -- uma errada — e é essa granularidade que a calibração precisa
+                -- para achar o limiar.
+                --
+                -- A chave é o PAR (fonte, detection_id): `events` e `tracks`
+                -- têm autoincremento próprio, então o id sozinho colide entre
+                -- as duas.
+                --
+                -- Deliberadamente NÃO altera a presença. Rotular é medir o
+                -- acerto do reconhecimento; decidir quem esteve na escola é a
+                -- aba Chamada. Misturar faria uma revisão de fotos mexer na
+                -- frequência do aluno sem que ninguém pedisse.
+                CREATE TABLE IF NOT EXISTS detection_labels (
+                    fonte        TEXT    NOT NULL,   -- 'evento' | 'trilha'
+                    detection_id INTEGER NOT NULL,
+                    rotulo       TEXT    NOT NULL,   -- 'certo' | 'errado'
+                    autor        TEXT,
+                    created_at   REAL    NOT NULL,
+                    PRIMARY KEY (fonte, detection_id)
+                );
                 """
             )
         self._migrar()
@@ -512,6 +536,165 @@ class Database:
                 (day_start, day_end, day_start, day_end),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    def deteccoes_de(self, person_id=None, inicio: float = None,
+                     fim: float = None, limit: int = 200) -> list[dict]:
+        """Detecções das duas origens, com filtro opcional de pessoa e período.
+
+        A aba de reconhecimentos lia só `events`, e por isso ficava vazia no
+        modo captura — o modo que roda na escola. Aqui as duas origens vêm
+        juntas, com `fonte` distinguindo, e cada uma já traz a foto e a base
+        correta (elas ficam em diretórios diferentes).
+
+        `person_id=None` traz todo mundo, inclusive os desconhecidos, que são
+        justamente os que interessam quando se suspeita de falso negativo.
+        """
+        cond_t = ["t.status = 'processado'"]
+        cond_e = ["1=1"]
+        args_t, args_e = [], []
+        if person_id is not None:
+            cond_t.append("t.person_id = ?")
+            cond_e.append("person_id = ?")
+            args_t.append(int(person_id))
+            args_e.append(int(person_id))
+        if inicio is not None:
+            cond_t.append("t.started_at >= ?")
+            cond_e.append("ts >= ?")
+            args_t.append(inicio)
+            args_e.append(inicio)
+        if fim is not None:
+            cond_t.append("t.started_at < ?")
+            cond_e.append("ts < ?")
+            args_t.append(fim)
+            args_e.append(fim)
+
+        sql = f"""
+            SELECT 'trilha' AS fonte, t.id, t.person_id, t.name, t.score,
+                   t.started_at AS ts,
+                   (SELECT path FROM track_crops c WHERE c.track_id = t.id
+                     ORDER BY quality DESC LIMIT 1) AS foto,
+                   CASE WHEN t.person_id IS NOT NULL THEN 1 ELSE 0 END AS is_known
+            FROM tracks t WHERE {' AND '.join(cond_t)}
+            UNION ALL
+            SELECT 'evento' AS fonte, id, person_id, name, score, ts,
+                   snapshot_path AS foto, is_known
+            FROM events WHERE {' AND '.join(cond_e)}
+            ORDER BY ts DESC LIMIT ?
+        """
+        with self._connect() as con:
+            rows = con.execute(sql, (*args_t, *args_e, int(limit))).fetchall()
+        return [dict(r) for r in rows]
+
+    # ---- rótulos por detecção -------------------------------------------------
+    def set_detection_label(self, fonte: str, detection_id: int, rotulo: str,
+                            autor: str = "") -> None:
+        """Marca uma detecção como 'certo' ou 'errado'."""
+        if rotulo not in ("certo", "errado"):
+            raise ValueError("rotulo deve ser 'certo' ou 'errado'")
+        if fonte not in ("evento", "trilha"):
+            raise ValueError("fonte deve ser 'evento' ou 'trilha'")
+        with self._connect() as con:
+            con.execute(
+                """
+                INSERT INTO detection_labels
+                       (fonte, detection_id, rotulo, autor, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(fonte, detection_id) DO UPDATE SET
+                    rotulo=excluded.rotulo, autor=excluded.autor,
+                    created_at=excluded.created_at
+                """,
+                (fonte, int(detection_id), rotulo, autor, time.time()),
+            )
+
+    def remove_detection_label(self, fonte: str, detection_id: int) -> int:
+        with self._connect() as con:
+            return con.execute(
+                "DELETE FROM detection_labels WHERE fonte=? AND detection_id=?",
+                (fonte, int(detection_id))).rowcount or 0
+
+    def detection_labels(self) -> dict:
+        """{"fonte:id": rotulo} — o formato que a calibração já usa como chave."""
+        with self._connect() as con:
+            return {f"{r['fonte']}:{r['detection_id']}": r["rotulo"]
+                    for r in con.execute(
+                        "SELECT fonte, detection_id, rotulo FROM detection_labels")}
+
+    def importar_rotulos(self, rotulos: dict) -> int:
+        """Importa rótulos no formato {"fonte:id": "certo"}, sem sobrescrever.
+
+        Serve para migrar o arquivo JSON que o calibrate_threshold usava antes
+        de os rótulos irem para o banco. `INSERT OR IGNORE` porque o que já
+        está no banco é mais recente que o arquivo — se alguém já rotulou pelo
+        painel, a migração não pode desfazer.
+        """
+        linhas = []
+        for chave, rotulo in (rotulos or {}).items():
+            fonte, _, ident = str(chave).partition(":")
+            if not ident.isdigit() or rotulo not in ("certo", "errado"):
+                continue
+            if fonte not in ("evento", "trilha"):
+                continue
+            linhas.append((fonte, int(ident), rotulo, "migrado", time.time()))
+        if not linhas:
+            return 0
+        with self._connect() as con:
+            cur = con.executemany(
+                """
+                INSERT OR IGNORE INTO detection_labels
+                       (fonte, detection_id, rotulo, autor, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """, linhas)
+            return cur.rowcount or 0
+
+    def melhores_fotos(self, day_start: float, day_end: float) -> dict:
+        """person_id -> a foto da detecção de MAIOR score no período.
+
+        Existe para a conferência humana da chamada: sem ver o rosto, marcar
+        "presente" é confirmar no escuro — e são essas confirmações que
+        alimentam a calibração e a medição de recall. Conferência às cegas
+        contamina as duas.
+
+        Consulta separada de `attendance()` de propósito. Aquela usa `MIN(ts)`
+        e `MAX(score)` juntos, e o SQLite só garante que as colunas avulsas
+        venham da linha certa quando há UM agregado desses. Com dois, qual
+        linha alimenta a foto seria indefinido — e o erro apareceria como uma
+        foto de outra passagem, difícil de perceber e pior que não ter foto.
+
+        Devolve `fonte` porque as duas origens guardam imagem em bases
+        diferentes: `realtime` em snapshots/, `captura` em tracks/.
+        """
+        with self._connect() as con:
+            rows = con.execute(
+                """
+                SELECT person_id, foto, fonte, score FROM (
+                    SELECT person_id, score, 'captura' AS fonte,
+                           (SELECT path FROM track_crops c
+                             WHERE c.track_id = t.id
+                             ORDER BY quality DESC LIMIT 1) AS foto
+                    FROM tracks t
+                    WHERE status = 'processado' AND person_id IS NOT NULL
+                      AND started_at >= ? AND started_at < ?
+                    UNION ALL
+                    SELECT person_id, score, 'realtime' AS fonte,
+                           snapshot_path AS foto
+                    FROM events
+                    WHERE is_known = 1 AND person_id IS NOT NULL
+                      AND ts >= ? AND ts < ?
+                )
+                WHERE foto IS NOT NULL
+                ORDER BY person_id, score DESC
+                """,
+                (day_start, day_end, day_start, day_end),
+            ).fetchall()
+
+        # Primeira linha de cada pessoa é a de maior score (ORDER BY acima).
+        melhores: dict[int, dict] = {}
+        for r in rows:
+            pid = int(r["person_id"])
+            if pid not in melhores:
+                melhores[pid] = {"foto": r["foto"], "fonte": r["fonte"],
+                                 "score": float(r["score"])}
+        return melhores
 
     # ---- retenção das trilhas -------------------------------------------------
     def pending_tracks_before(self, ts: float) -> int:

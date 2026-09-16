@@ -765,6 +765,9 @@ def _montar_chamada(dia: str = "", inicio: str = "", fim: str = "") -> dict:
     dia_iso = time.strftime("%Y-%m-%d", time.localtime(t0))
 
     automatico = {l["person_id"]: l for l in db.attendance(t0, t1)}
+    # Foto da melhor detecção de cada pessoa, para a conferência humana poder
+    # olhar o rosto antes de confirmar.
+    fotos = db.melhores_fotos(t0, t1)
     correcoes = db.attendance_overrides(dia_iso)
     fechamento = db.attendance_closure(dia_iso)
     todos = db.list_people()
@@ -810,6 +813,14 @@ def _montar_chamada(dia: str = "", inicio: str = "", fim: str = "") -> dict:
                 "melhor_score": round(auto["melhor_score"], 3),
                 "fontes": (auto["fontes"] or "").split(","),
             })
+            # As duas origens guardam imagem em bases diferentes, então a URL
+            # precisa sair daqui pronta — quem consome não deveria ter que
+            # saber dessa separação interna.
+            foto = fotos.get(pid)
+            if foto and foto["foto"]:
+                base = "/snapshots/" if foto["fonte"] == "realtime" else "/tracks/"
+                linha["foto_url"] = f"{base}{foto['foto']}"
+                linha["foto_score"] = round(foto["score"], 3)
         (presentes if presente else ausentes).append(linha)
 
     presentes.sort(key=lambda x: (x.get("primeira_vez") or "~", x["nome"]))
@@ -881,6 +892,76 @@ def attendance(dia: str = Query("", description="AAAA-MM-DD; vazio = hoje"),
       convém guardar a matrícula do aluno aqui e casar por ela.
     """
     return _montar_chamada(dia, inicio, fim)
+
+
+@app.get("/detections")
+def detections(person_id: int = Query(0, description="0 = todas as pessoas"),
+               dia: str = Query("", description="AAAA-MM-DD; vazio = todos"),
+               limit: int = Query(120, ge=1, le=1000)):
+    """Detecções das DUAS origens, filtráveis por pessoa e dia.
+
+    Difere de `/events`, que lê só a tabela `events` e portanto devolve vazio
+    no modo captura — o modo usado na escola. Cada linha já vem com a URL da
+    foto na rota certa (snapshots e recortes de trilha ficam em bases
+    diferentes) e com o rótulo manual, se houver.
+    """
+    t0 = t1 = None
+    if dia:
+        t0, t1 = _janela(dia, "", "")
+    linhas = db.deteccoes_de(person_id or None, t0, t1, limit)
+    rotulos = db.detection_labels()
+
+    saida = []
+    for l in linhas:
+        base = "/snapshots/" if l["fonte"] == "evento" else "/tracks/"
+        saida.append({
+            "fonte": l["fonte"],
+            "id": int(l["id"]),
+            # `id` colide entre as origens; a chave é o par.
+            "chave": f"{l['fonte']}:{int(l['id'])}",
+            "person_id": l["person_id"],
+            "nome": l["name"],
+            "score": round(float(l["score"] or 0.0), 3),
+            "ts": l["ts"],
+            "quando": time.strftime("%Y-%m-%dT%H:%M:%S%z",
+                                    time.localtime(l["ts"])),
+            "is_known": bool(l["is_known"]),
+            "foto_url": f"{base}{l['foto']}" if l["foto"] else None,
+            "rotulo": rotulos.get(f"{l['fonte']}:{int(l['id'])}"),
+        })
+    return {"total": len(saida), "deteccoes": saida}
+
+
+class RotuloReq(BaseModel):
+    fonte: str
+    detection_id: int
+    rotulo: str = "errado"
+    autor: str = ""
+
+
+@app.post("/detections/label")
+def rotular_deteccao(req: RotuloReq):
+    """Marca uma detecção como 'certo' ou 'errado'.
+
+    NÃO altera a presença — decisão deliberada. Rotular mede o acerto do
+    reconhecimento; quem esteve na escola é decidido na chamada. Se uma
+    revisão de fotos mexesse na frequência do aluno, ninguém confiaria em
+    nenhuma das duas.
+    """
+    try:
+        db.set_detection_label(req.fonte, req.detection_id, req.rotulo,
+                               req.autor)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"ok": True, "chave": f"{req.fonte}:{req.detection_id}",
+            "rotulo": req.rotulo,
+            "observacao": "A presença na chamada não foi alterada."}
+
+
+@app.delete("/detections/label")
+def remover_rotulo(fonte: str = Query(...), detection_id: int = Query(...)):
+    removidos = db.remove_detection_label(fonte, detection_id)
+    return {"ok": True, "removidos": removidos}
 
 
 class OverrideReq(BaseModel):
@@ -960,13 +1041,29 @@ def reopen_attendance(dia: str = Query(...)):
 
 @app.get("/snapshots/{path:path}")
 def snapshot(path: str):
-    full = (SNAP_BASE / path).resolve()
-    # is_relative_to compara COMPONENTES de caminho. O `startswith` anterior
-    # comparava prefixo de string, e um diretório irmão de nome parecido
-    # ("snapshots-privado" ao lado de "snapshots") passaria na verificação.
-    # O `.resolve()` acima já barra o ataque óbvio de "../../etc/passwd".
-    if not full.is_relative_to(SNAP_BASE) or not full.is_file():
-        raise HTTPException(404, "Snapshot não encontrado.")
+    return _servir_imagem(SNAP_BASE, path, "Snapshot não encontrado.")
+
+
+@app.get("/tracks/{path:path}")
+def track_crop(path: str):
+    """Recorte guardado pelo modo captura.
+
+    Os recortes ficam em `tracking.crops_dir`, base DIFERENTE da de snapshots.
+    Sem esta rota eles não tinham como ser exibidos, e tanto a chamada quanto
+    os relatórios de calibração e de recall montavam URLs sob /snapshots/ que
+    devolviam 404 para tudo que viesse do modo captura — justamente o modo
+    usado em produção.
+    """
+    return _servir_imagem(TRACKS_BASE, path, "Recorte não encontrado.")
+
+
+def _servir_imagem(base, path: str, erro: str):
+    full = (base / path).resolve()
+    # is_relative_to compara COMPONENTES de caminho. Um `startswith` de string
+    # deixaria passar diretório irmão de nome parecido ("snapshots-privado" ao
+    # lado de "snapshots"). O `.resolve()` barra o "../../etc/passwd".
+    if not full.is_relative_to(base) or not full.is_file():
+        raise HTTPException(404, erro)
     return FileResponse(str(full), media_type="image/jpeg")
 
 

@@ -1901,21 +1901,47 @@ def auth_snapshot_nao_escapa_da_pasta():
     return "arquivo válido serve; traversal e diretório irmão barrados"
 
 
-def _funcao_do_painel(nome, globais):
-    """Extrai uma função do panel/app.py e a compila com globais controlados.
+def _funcao_do_painel(nomes, globais):
+    """Extrai funções e constantes do panel/app.py com globais controlados.
 
     O painel é um script Streamlit: importá-lo executaria a página inteira.
-    Pegando só o trecho da função dá para testar o CÓDIGO REAL — não uma
+    Pegando só os trechos necessários dá para testar o CÓDIGO REAL — não uma
     réplica que poderia divergir do arquivo sem ninguém notar.
+
+    Aceita lista porque uma função do painel pode chamar outra (a `imagem`
+    chama `_cache_imagem`). Extrair só a primeira dava NameError — falha do
+    andaime de teste, não do código sob teste.
     """
     import ast
+    if isinstance(nomes, str):
+        nomes = [nomes]
     fonte = open(os.path.join(RAIZ, "panel", "app.py"), encoding="utf-8").read()
     arvore = ast.parse(fonte)
-    alvo = next(n for n in arvore.body
-                if isinstance(n, ast.FunctionDef) and n.name == nome)
-    mod = ast.Module(body=[alvo], type_ignores=[])
+
+    corpo = []
+    for no in arvore.body:
+        if isinstance(no, ast.FunctionDef) and no.name in nomes:
+            corpo.append(no)
+        # Constantes LITERAIS de módulo que as funções usam (ex.: _CACHE_MAX).
+        # A restrição a `ast.Constant` é essencial: sem ela entrariam também
+        # `API = cfg.api.base_url...` e `S = requests.Session()`, que são
+        # maiúsculos, dependem de estado do módulo (estouraria no exec) e
+        # sobrescreveriam justamente os dublês que o teste injeta.
+        elif (isinstance(no, ast.Assign)
+                and isinstance(no.value, ast.Constant)
+                and len(no.targets) == 1
+                and isinstance(no.targets[0], ast.Name)
+                and no.targets[0].id.isupper()):
+            corpo.append(no)
+
+    faltando = [n for n in nomes
+                if not any(isinstance(c, ast.FunctionDef) and c.name == n
+                           for c in corpo)]
+    assert not faltando, f"não achei no panel/app.py: {faltando}"
+
+    mod = ast.Module(body=corpo, type_ignores=[])
     exec(compile(mod, "panel/app.py", "exec"), globais)      # noqa: S102
-    return globais[nome]
+    return globais[nomes[-1]]
 
 
 @teste
@@ -1966,17 +1992,26 @@ def painel_baixa_imagem_com_token():
             return self._r.text
 
     # Session que fala com a API por dentro do TestClient, com o token.
+    # Conta as idas à rede, para o teste poder provar que o cache evita
+    # rebaixar a mesma foto — que é o ponto da otimização.
     class SessaoFalsa:
         def __init__(self, token):
             self.headers = {"X-API-Token": token} if token else {}
+            self.chamadas = 0
 
         def get(self, url, timeout=None):
+            self.chamadas += 1
             caminho = url.replace("http://api-de-teste", "")
             return Resp(c.get(caminho, headers=self.headers))
 
     capturado = {}
 
     class StFalso:
+        # O `_cache_imagem` real guarda o cache aqui, então o dublê precisa
+        # ter session_state — é assim que se testa o código de verdade em vez
+        # de uma réplica.
+        session_state = {}
+
         @staticmethod
         def image(dados, **kw):
             capturado["bytes"] = dados
@@ -1985,11 +2020,25 @@ def painel_baixa_imagem_com_token():
         def caption(texto, **kw):
             capturado["aviso"] = texto
 
-    def montar(token):
+    # Cache do painel: dicionário simples, injetado nos globais da função.
+    cache = {}
+    sessoes = []
+
+    def montar(token, limpar_cache=True):
+        """Simula uma sessão nova do painel.
+
+        Limpa o cache por padrão: sem isso, o caso 1 deixaria a foto guardada
+        e o caso 2 (sem token) acertaria pelo cache em vez de exercitar o 401.
+        O caso que PROVA o cache passa limpar_cache=False de propósito.
+        """
         capturado.clear()
-        g = {"S": SessaoFalsa(token), "API": "http://api-de-teste",
-             "st": StFalso, "requests": requests}
-        return _funcao_do_painel("imagem", g)
+        if limpar_cache:
+            StFalso.session_state.clear()
+        sessao = SessaoFalsa(token)
+        sessoes.append(sessao)
+        g = {"S": sessao, "API": "http://api-de-teste", "st": StFalso,
+             "requests": requests}
+        return _funcao_do_painel(["_cache_imagem", "imagem"], g)
 
     # 1) com o token certo: os bytes chegam
     montar("tok3n")("/snapshots/foto.jpg")
@@ -2015,7 +2064,28 @@ def painel_baixa_imagem_com_token():
     # 4) aceita caminho relativo e URL absoluta (snapshot_url vem dos dois jeitos)
     montar("tok3n")("http://api-de-teste/snapshots/foto.jpg")
     assert capturado.get("bytes", b"").endswith(b"CONTEUDO"), capturado
-    return "bytes com token; 401 e 404 com mensagens distintas; caminho e URL"
+
+    # 5) o cache evita rebaixar a MESMA foto. É o ponto da otimização: o
+    # Streamlit reexecuta o script a cada clique, e sem isto a aba de
+    # reconhecimentos redescarregava dezenas de imagens por interação.
+    f = montar("tok3n")
+    sessao = sessoes[-1]
+    f("/snapshots/foto.jpg")
+    f("/snapshots/foto.jpg")
+    f("/snapshots/foto.jpg")
+    assert sessao.chamadas == 1, \
+        f"cache não pegou: {sessao.chamadas} idas à rede para a mesma foto"
+    assert capturado.get("bytes", b"").endswith(b"CONTEUDO"), capturado
+
+    # 6) o preview ao vivo NÃO pode ser cacheado: muda a cada instante.
+    f = montar("tok3n")
+    sessao = sessoes[-1]
+    f("/enroll/preview?t=1")
+    f("/enroll/preview?t=1")
+    assert sessao.chamadas == 2, "preview ao vivo não pode vir do cache"
+
+    return ("bytes com token; 401 e 404 distintos; caminho e URL; "
+            "cache poupa rede na foto e é ignorado no preview ao vivo")
 
 
 @teste
@@ -2030,12 +2100,225 @@ def painel_nao_tem_mais_st_image_com_url():
     fonte = open(os.path.join(RAIZ, "panel", "app.py"), encoding="utf-8").read()
     ruins = re.findall(r'st\.image\(\s*f?"?\{?API\}?[^\)]*', fonte)
     assert not ruins, f"st.image com URL da API: {ruins}"
-    # a única chamada legítima recebe bytes
-    chamadas = re.findall(r"st\.image\(([^,\)]+)", fonte)
-    assert chamadas == ["r.content"], chamadas
+
+    # Todo st.image tem que receber BYTES, nunca uma string. Fixar a lista
+    # exata (["r.content"]) quebrou quando o cache adicionou uma segunda
+    # chamada legítima — o teste passou a proibir manutenção em vez de
+    # proibir a regressão. Agora a regra é a propriedade que importa.
+    chamadas = [c.strip() for c in re.findall(r"st\.image\(([^,\)]+)", fonte)]
+    assert chamadas, "nenhum st.image encontrado — o wrapper sumiu?"
+    for arg in chamadas:
+        assert not arg.startswith(('"', "'", 'f"', "f'")), \
+            f"st.image recebendo string (vira URL para o navegador): {arg}"
+        assert "API" not in arg, f"st.image com URL montada: {arg}"
+
     # e todos os pontos de exibição usam o wrapper
     assert fonte.count("imagem(") >= 6, "esperava a definição + 5 usos"
-    return f"nenhum st.image com URL; {fonte.count('imagem(') - 1} usos do wrapper"
+    return (f"{len(chamadas)} st.image, todos com bytes; "
+            f"{fonte.count('imagem(') - 1} usos do wrapper")
+
+
+@teste
+def rotulos_ficam_no_banco_e_nao_mexem_na_presenca():
+    """Uma fonte só para 'certo/errado', e rotular não altera a chamada."""
+    try:
+        import fastapi.testclient  # noqa: F401
+    except ImportError:
+        return "PULADO: fastapi.testclient indisponível"
+
+    import importlib
+    c, pasta = _api_cliente("rotulos", host="127.0.0.1")
+    api = importlib.import_module("api")
+    db = api.db
+
+    hoje = time.strftime("%Y-%m-%d")
+    alfa = db.add_person("Alfa")
+    e1 = db.add_event(alfa, "Alfa", 0.91, "20260101/a.jpg", 1)
+    e2 = db.add_event(alfa, "Alfa", 0.42, "20260101/b.jpg", 1)
+
+    # --- filtro por pessoa e união das duas origens ------------------------- #
+    beta = db.add_person("Beta")
+    t = db.add_track(time.time(), time.time() + 1, 8,
+                     [{"path": "20260101/c.jpg", "quality": 9.0, "face": "[]"}])
+    db.resolve_track(t, beta, "Beta", 0.80, "[]")
+
+    todas = c.get("/detections").json()["deteccoes"]
+    assert {d["fonte"] for d in todas} == {"evento", "trilha"}, \
+        "a lista tem que unir os dois modos, senão fica vazia em captura"
+
+    so_alfa = c.get("/detections", params={"person_id": alfa}).json()["deteccoes"]
+    assert {d["nome"] for d in so_alfa} == {"Alfa"}, so_alfa
+    assert len(so_alfa) == 2, so_alfa
+
+    # URLs na base certa de cada origem
+    ev = next(d for d in todas if d["fonte"] == "evento")
+    tr = next(d for d in todas if d["fonte"] == "trilha")
+    assert ev["foto_url"].startswith("/snapshots/"), ev
+    assert tr["foto_url"].startswith("/tracks/"), tr
+
+    # --- rotular NÃO pode mexer na presença --------------------------------- #
+    antes = c.get("/attendance", params={"dia": hoje}).json()
+    presentes_antes = {p["nome"] for p in antes["presentes"]}
+    assert "Alfa" in presentes_antes
+
+    r = c.post("/detections/label",
+               json={"fonte": "evento", "detection_id": e2,
+                     "rotulo": "errado", "autor": "Operador"})
+    assert r.status_code == 200, r.text
+
+    depois = c.get("/attendance", params={"dia": hoje}).json()
+    assert {p["nome"] for p in depois["presentes"]} == presentes_antes, \
+        "rotular detecção não pode alterar a chamada"
+    assert depois["correcoes"]["total"] == antes["correcoes"]["total"], \
+        "rótulo não é correção de chamada"
+
+    # o rótulo aparece na listagem
+    lista = c.get("/detections", params={"person_id": alfa}).json()["deteccoes"]
+    marcado = {d["id"]: d["rotulo"] for d in lista if d["fonte"] == "evento"}
+    assert marcado[e2] == "errado" and marcado[e1] is None, marcado
+
+    # desfazer
+    c.request("DELETE", "/detections/label",
+              params={"fonte": "evento", "detection_id": e2})
+    lista = c.get("/detections", params={"person_id": alfa}).json()["deteccoes"]
+    assert all(d["rotulo"] is None for d in lista), lista
+
+    # valor inválido é recusado, não gravado torto
+    assert c.post("/detections/label",
+                  json={"fonte": "evento", "detection_id": e1,
+                        "rotulo": "talvez"}).status_code == 400
+
+    # --- a calibração lê do banco, e o manual vence o derivado -------------- #
+    from scripts.calibrate_threshold import juntar_rotulos
+    db.set_detection_label("evento", e1, "errado", "painel")
+    db.set_attendance_override(hoje, alfa, True, "", "Operador")
+    db.close_attendance(hoje, "Operador", 2, 1)
+
+    deteccoes = db.list_detections(limit=100)
+    combinado, origem = juntar_rotulos(db, deteccoes)
+    assert combinado[f"evento:{e1}"] == "errado", \
+        "o rótulo do painel tem que prevalecer sobre o derivado da chamada"
+    assert origem["manual"] >= 1, origem
+    return ("duas origens numa lista só; filtro por pessoa; rótulo no banco "
+            "sem tocar na presença; manual vence o derivado")
+
+
+@teste
+def rotulos_migram_do_json_antigo():
+    """O JSON que o calibrate usava vira linha no banco, uma vez só."""
+    import json as _json
+    from core.database import Database
+    from core.config import project_path
+    import scripts.calibrate_threshold as cal
+
+    pasta = os.path.join(TMP, "migra")
+    os.makedirs(pasta, exist_ok=True)
+    db = Database(os.path.join(pasta, "m.db"))
+
+    antigo = project_path(cal.LABELS_FILE)
+    antigo.parent.mkdir(parents=True, exist_ok=True)
+    salvo = antigo.read_text(encoding="utf-8") if antigo.exists() else None
+    migrado = antigo.with_suffix(antigo.suffix + ".migrado")
+    salvo_mig = migrado.read_text(encoding="utf-8") if migrado.exists() else None
+    try:
+        # chave antiga (só número) significava evento; a nova traz a fonte
+        antigo.write_text(_json.dumps({"7": "errado", "trilha:3": "certo"}),
+                          encoding="utf-8")
+
+        db.set_detection_label("evento", 7, "certo", "painel")   # já existe
+        n = cal._migrar_json(db)
+
+        rotulos = db.detection_labels()
+        assert rotulos["trilha:3"] == "certo", rotulos
+        # O que já estava no banco NÃO pode ser sobrescrito pelo arquivo:
+        # quem rotulou pelo painel decidiu depois.
+        assert rotulos["evento:7"] == "certo", \
+            "migração não pode desfazer rótulo mais recente do painel"
+        assert n == 1, f"devia importar só o que faltava, importou {n}"
+
+        assert not antigo.exists(), "o JSON devia ter sido renomeado"
+        assert migrado.exists(), "o original precisa ser preservado"
+
+        # rodar de novo não duplica nem quebra
+        assert cal._migrar_json(db) == 0
+    finally:
+        for p, conteudo in ((antigo, salvo), (migrado, salvo_mig)):
+            if conteudo is None:
+                p.unlink(missing_ok=True)
+            else:
+                p.write_text(conteudo, encoding="utf-8")
+    return "chave antiga normalizada; banco vence o arquivo; JSON preservado"
+
+
+@teste
+def chamada_traz_a_foto_da_melhor_deteccao():
+    """Sem foto, conferir a chamada é confirmar um nome, não um rosto.
+
+    E são essas confirmações que viram rótulo da calibração e denominador da
+    medição de recall — conferência às cegas contamina as duas.
+    """
+    try:
+        import fastapi.testclient  # noqa: F401
+    except ImportError:
+        return "PULADO: fastapi.testclient indisponível"
+
+    import importlib
+    c, pasta = _api_cliente("chamada_foto", host="127.0.0.1")
+    api = importlib.import_module("api")
+    db = api.db
+
+    hoje = time.strftime("%Y-%m-%d")
+    base = time.mktime(time.strptime(f"{hoje} 07:30:00", "%Y-%m-%d %H:%M:%S"))
+
+    alfa = db.add_person("Alfa")
+    beta = db.add_person("Beta")
+
+    # Alfa vem do modo REALTIME: duas passagens, e a melhor NÃO é a primeira.
+    db.add_event(alfa, "Alfa", 0.55, "20260101/fraca.jpg", 1)
+    db.add_event(alfa, "Alfa", 0.91, "20260101/forte.jpg", 1)
+
+    # Beta vem do modo CAPTURA: a foto sai de track_crops, em OUTRA base.
+    t = db.add_track(base + 60, base + 61, 9,
+                     [{"path": "20260101/ruim.jpg", "quality": 10.0, "face": "[]"},
+                      {"path": "20260101/bom.jpg", "quality": 99.0, "face": "[]"}])
+    db.resolve_track(t, beta, "Beta", 0.77, "[]")
+
+    d = c.get("/attendance", params={"dia": hoje}).json()
+    por_nome = {p["nome"]: p for p in d["presentes"]}
+    assert set(por_nome) == {"Alfa", "Beta"}, d
+
+    # A foto tem que ser a do MAIOR score, não a primeira nem a última.
+    assert por_nome["Alfa"]["foto_url"] == "/snapshots/20260101/forte.jpg", \
+        por_nome["Alfa"]
+    assert por_nome["Alfa"]["foto_score"] == 0.91
+
+    # Recorte de trilha usa a rota /tracks/, que fica em base diferente.
+    # Montar /snapshots/ para ele dava 404 em tudo vindo do modo captura.
+    assert por_nome["Beta"]["foto_url"].startswith("/tracks/"), por_nome["Beta"]
+    assert "bom.jpg" in por_nome["Beta"]["foto_url"], "devia pegar o recorte de maior qualidade"
+
+    # As duas rotas servem de verdade, cada uma da sua base.
+    api.SNAP_BASE.joinpath("20260101").mkdir(parents=True, exist_ok=True)
+    api.SNAP_BASE.joinpath("20260101/forte.jpg").write_bytes(b"\xff\xd8SNAP")
+    api.TRACKS_BASE.joinpath("20260101").mkdir(parents=True, exist_ok=True)
+    api.TRACKS_BASE.joinpath("20260101/bom.jpg").write_bytes(b"\xff\xd8CROP")
+
+    r = c.get(por_nome["Alfa"]["foto_url"])
+    assert r.status_code == 200 and r.content.endswith(b"SNAP"), r.status_code
+    r = c.get(por_nome["Beta"]["foto_url"])
+    assert r.status_code == 200 and r.content.endswith(b"CROP"), r.status_code
+
+    # A rota nova tem a mesma proteção de caminho da antiga.
+    assert c.get("/tracks/../../etc/passwd").status_code == 404
+
+    # Quem não foi detectado não tem foto — e isso é informação, não erro:
+    # marcar presente aí é o falso negativo que a medição procura.
+    gama = db.add_person("Gama")
+    d2 = c.get("/attendance", params={"dia": hoje}).json()
+    ausente = next(p for p in d2["ausentes"] if p["nome"] == "Gama")
+    assert "foto_url" not in ausente, ausente
+    return ("foto é a de maior score; realtime em /snapshots e captura em "
+            "/tracks; ambas servidas; ausente sem foto")
 
 
 @teste

@@ -64,19 +64,46 @@ def _local_ip() -> str:
         return "IP_DO_PI"
 
 
-def _load_labels() -> dict:
-    """Rótulos manuais. Aceita chave antiga (só o número) como evento."""
+def _migrar_json(db: Database) -> int:
+    """Move os rótulos do arquivo JSON antigo para o banco, uma vez.
+
+    Os rótulos manuais moraram num JSON enquanto só este script os escrevia.
+    Quando o painel ganhou o botão "não é essa pessoa", manter os dois lugares
+    criaria uma TERCEIRA fonte de verdade sobre acerto e erro (chamada, JSON,
+    painel) — e divergência entre fontes já causou dois bugs neste projeto.
+
+    O arquivo é renomeado para `.migrado` em vez de apagado: se algo der
+    errado, o dado original continua lá.
+    """
     path = project_path(LABELS_FILE)
     if not path.exists():
-        return {}
-    cru = json.loads(path.read_text(encoding="utf-8"))
-    return {(k if ":" in k else f"evento:{k}"): v for k, v in cru.items()}
+        return 0
+    try:
+        cru = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return 0
+    # Chave antiga era só o número, e significava evento.
+    normalizado = {(k if ":" in str(k) else f"evento:{k}"): v
+                   for k, v in (cru or {}).items()}
+    n = db.importar_rotulos(normalizado)
+    try:
+        path.rename(path.with_suffix(path.suffix + ".migrado"))
+    except OSError:
+        pass
+    if n:
+        print(f"  {n} rótulo(s) migrados do {LABELS_FILE} para o banco.")
+    return n
 
 
-def _save_labels(labels: dict) -> None:
-    path = project_path(LABELS_FILE)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(labels, indent=2), encoding="utf-8")
+def _load_labels(db: Database) -> dict:
+    """Rótulos manuais, agora do banco. Migra o JSON antigo na primeira vez."""
+    _migrar_json(db)
+    return db.detection_labels()
+
+
+def _save_label(db: Database, chave: str, rotulo: str) -> None:
+    fonte, _, ident = chave.partition(":")
+    db.set_detection_label(fonte, int(ident), rotulo, autor="review")
 
 
 def rotulos_da_chamada(db: Database, deteccoes: list[dict]) -> dict:
@@ -107,7 +134,7 @@ def rotulos_da_chamada(db: Database, deteccoes: list[dict]) -> dict:
 def juntar_rotulos(db: Database, deteccoes: list[dict]) -> tuple[dict, dict]:
     """Combina as duas fontes. Manual vence, por ser mais específica."""
     derivados = rotulos_da_chamada(db, deteccoes)
-    manuais = _load_labels()
+    manuais = _load_labels(db)
     combinado = dict(derivados)
     combinado.update(manuais)
     origem = {"chamada": len(derivados), "manual": len(manuais),
@@ -174,7 +201,6 @@ def review(db: Database, cfg, deteccoes: list[dict], ip: str, porta: int) -> Non
         return
 
     combinado, _ = juntar_rotulos(db, deteccoes)
-    manuais = _load_labels()
     # Do menor para o maior score: os erros se concentram no início, então você
     # encontra os problemas nas primeiras respostas.
     conhecidos.sort(key=lambda d: d["score"])
@@ -191,11 +217,9 @@ def review(db: Database, cfg, deteccoes: list[dict], ip: str, porta: int) -> Non
         print(f"  score {d['score']:.3f}  ->  identificou como '{d['name']}' "
               f"({d['fonte']})")
         if d["snapshot_path"]:
-            if d["fonte"] == "evento":
-                print(f"  foto: http://{ip}:{porta}/snapshots/{d['snapshot_path']}")
-            else:
-                # recortes de trilha não são servidos pela API; caminho local
-                print(f"  recorte: data/tracks/{d['snapshot_path']}")
+            # Cada origem tem sua rota, porque ficam em bases diferentes.
+            base = "/snapshots/" if d["fonte"] == "evento" else "/tracks/"
+            print(f"  foto: http://{ip}:{porta}{base}{d['snapshot_path']}")
         try:
             resp = input("  acertou? [s/n/p/q] ").strip().lower()
         except (EOFError, KeyboardInterrupt):
@@ -204,8 +228,7 @@ def review(db: Database, cfg, deteccoes: list[dict], ip: str, porta: int) -> Non
         if resp == "q":
             break
         if resp in ("s", "n"):
-            manuais[chave(d)] = "certo" if resp == "s" else "errado"
-            _save_labels(manuais)
+            _save_label(db, chave(d), "certo" if resp == "s" else "errado")
         print()
 
     combinado, origem = juntar_rotulos(db, deteccoes)
