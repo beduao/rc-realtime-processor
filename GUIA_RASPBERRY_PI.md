@@ -637,29 +637,42 @@ captura, criança que passou fora do enquadramento, ou score abaixo do limiar.
 Transformar isso em falta é decisão do outro sistema, e deveria passar por
 conferência humana.
 
-**`inep_id`** — identificação única do aluno no Censo Escolar, e o campo pelo
-qual o sistema de gestão da escola casa os registros. É o identificador certo
-para integração: nacional e estável entre escolas e anos, ao contrário de
-matrícula, que é local. O `person_id` continua na resposta, mas é interno deste
-sistema e não serve para o outro lado.
+**`matricula`** — o identificador pelo qual o sistema de gestão da escola casa
+os registros. O `person_id` continua na resposta, mas é interno deste sistema e
+não serve para o outro lado.
+
+> Este campo já se chamou `inep_id`, por informação que se mostrou incorreta:
+> o sistema da escola identifica o aluno pela **matrícula**, não pelo ID do
+> Censo Escolar. A coluna antiga continua no banco com o que foi digitado, mas
+> não é mais usada.
 
 Casar por **nome** não é opção: homônimos, acentuação e digitação divergente
 quebram a associação silenciosamente.
 
 O campo é **opcional no cadastro**, para não travar o piloto — mas a resposta
-traz `sem_inep` com a contagem de quem está sem, e o painel avisa. Aluno sem ID
-INEP não pode ser casado pelo outro sistema, então esse número precisa chegar a
-zero antes da integração valer.
+traz `sem_matricula` com a contagem de quem está sem, e o painel avisa. Aluno
+sem matrícula não pode ser casado pelo outro sistema, então esse número precisa
+chegar a zero antes da integração valer.
 
-Preencher: no painel, em **Pessoas**, selecione o aluno e edite o campo. Pontos e
-traços são removidos automaticamente, e zeros à esquerda são preservados — o
-valor é guardado como texto, não número. Dois alunos não podem ter o mesmo ID; a
-tentativa é recusada com o nome de quem já usa.
+Preencher: no painel, em **Pessoas**, selecione o aluno e edite o campo.
 
-Para o outro sistema consultar um aluno pelo ID:
+**Nenhuma validação de formato**, de propósito: aceita letra, barra, prefixo de
+turma, o que a escola usar. Só espaços das pontas são removidos, e zeros à
+esquerda são preservados — o valor é guardado como texto, não número. Dois
+alunos não podem ter a mesma matrícula; a tentativa é recusada com o nome de
+quem já usa.
+
+> A versão anterior deste campo validava "12 dígitos", número que eu supus do
+> formato do Censo Escolar sem confirmar. Validar formato desconhecido
+> transforma dado válido em dado recusado, e o erro só aparece no pior momento:
+> cadastrando um aluno de verdade. Se o formato for confirmado depois, aí vale
+> acrescentar a checagem.
+
+Para o outro sistema consultar um aluno pela matrícula:
 
 ```
-GET /people/by-inep/000123456789
+GET /people/by-matricula/000123456789
+GET /people/by-matricula/2026/0142      # barra funciona
 ```
 
 A resposta une as duas origens possíveis — trilhas do modo captura e eventos do

@@ -198,10 +198,10 @@ if page == "Chamada":
         st.error(f"**{d['trilhas_pendentes']} trilha(s) aguardando reconhecimento.** "
                  "A chamada está incompleta — rode o lote antes de conferir:\n\n"
                  "`python scripts/recognize_batch.py`")
-    if d.get("sem_inep"):
-        st.warning(f"**{d['sem_inep']} aluno(s) sem ID INEP.** O sistema de gestão "
-                   "da escola não consegue casar esses registros. Preencha em "
-                   "**Pessoas**.")
+    if d.get("sem_matricula"):
+        st.warning(f"**{d['sem_matricula']} aluno(s) sem matrícula.** O sistema "
+                   "de gestão da escola não consegue casar esses registros. "
+                   "Preencha em **Pessoas**.")
     if d["conferida"]:
         f = d["fechamento"]
         # ISO -> "26/08 às 11:29"
@@ -254,8 +254,8 @@ if page == "Chamada":
                                 key=f"pres-{dia_iso}-{pessoa['person_id']}",
                                 disabled=d["conferida"])
             detalhe = [ICONES[pessoa["origem"]]]
-            if not pessoa.get("inep_id"):
-                detalhe.append("⚠ sem ID INEP")
+            if not pessoa.get("matricula"):
+                detalhe.append("⚠ sem matrícula")
             if pessoa.get("primeira_vez"):
                 detalhe.append(pessoa["primeira_vez"][11:16])
             if pessoa.get("melhor_score") is not None:
@@ -373,15 +373,16 @@ elif page == "Cadastrar":
         st.write("Informe o nome e inicie o cadastro para abrir o preview da câmera.")
         cn, ci = st.columns([2, 1])
         name = cn.text_input("Nome")
-        inep = ci.text_input(
-            "ID INEP", placeholder="12 dígitos",
-            help="Identificação única do aluno no Censo Escolar. É por ela que o "
-                 "sistema de gestão da escola casa os registros — casar por nome "
-                 "é frágil. Pode ficar em branco e ser preenchida depois.")
+        matricula = ci.text_input(
+            "Matrícula",
+            help="Identificador do aluno no sistema de gestão da escola. É por "
+                 "ele que os registros são casados — casar por nome é frágil. "
+                 "Pode ficar em branco e ser preenchido depois.")
         if st.button("Iniciar cadastro", type="primary", disabled=not name.strip()):
             try:
                 r = S.post(f"{API}/enroll/start", timeout=30,
-                           json={"name": name.strip(), "inep_id": inep.strip()})
+                           json={"name": name.strip(),
+                                 "matricula": matricula.strip()})
             except requests.RequestException as exc:
                 st.error(f"Falha ao falar com a API: {exc}")
             else:
@@ -619,8 +620,8 @@ elif page == "Pessoas":
     st.caption(f"{len(people)} pessoa(s) cadastrada(s). "
                "Selecione uma para ver e gerenciar as amostras.")
     def _rotulo(p):
-        inep = p.get("inep_id") or "sem ID INEP"
-        return f"{p['name']}  —  {inep}  ({p['embeddings']} amostra(s))"
+        mat = p.get("matricula") or "sem matrícula"
+        return f"{p['name']}  —  {mat}  ({p['embeddings']} amostra(s))"
     rotulos = {_rotulo(p): p for p in people}
     escolhido = st.selectbox("Pessoa", list(rotulos))
     p = rotulos[escolhido]
@@ -751,15 +752,17 @@ elif page == "Pessoas":
     cr, cd = st.columns([3, 1])
     with cr:
         novo = st.text_input("Nome", value=p["name"], key=f"nome-{p['id']}")
-        novo_inep = st.text_input(
-            "ID INEP", value=p.get("inep_id") or "", key=f"inep-{p['id']}",
-            help="Deixe em branco para limpar. Dois alunos não podem ter o mesmo.")
+        nova_mat = st.text_input(
+            "Matrícula", value=p.get("matricula") or "",
+            key=f"matricula-{p['id']}",
+            help="Deixe em branco para limpar. Dois alunos não podem ter a mesma.")
         mudou = (novo.strip() != p["name"] or
-                 novo_inep.strip() != (p.get("inep_id") or ""))
+                 nova_mat.strip() != (p.get("matricula") or ""))
         if st.button("Salvar", key=f"ren-{p['id']}",
                      disabled=not novo.strip() or not mudou):
             r = S.patch(f"{API}/people/{p['id']}", timeout=10,
-                        json={"name": novo.strip(), "inep_id": novo_inep.strip()})
+                        json={"name": novo.strip(),
+                              "matricula": nova_mat.strip()})
             if r.ok:
                 d = r.json()
                 if d.get("aviso"):

@@ -654,11 +654,11 @@ Registradas para quem for dar manutenção:
    oclusão. A votação mitiga, mas não elimina.
 3. **`match()` é max-pooling sobre amostras**, então cadastro inflado aumenta
    falso positivo (seção 4.3).
-4. ~~Sem identificador externo.~~ **Resolvido:** o `people.inep_id` guarda a
-   identificação única do Censo Escolar, que é como o sistema de gestão da
-   escola identifica o aluno. Guardado como TEXT (zero à esquerda importa),
-   normalizado na entrada e com índice único parcial. O que resta é operacional:
-   preencher para todos os alunos já cadastrados.
+4. ~~Sem identificador externo.~~ **Resolvido:** o `people.matricula` guarda o
+   identificador que o sistema de gestão da escola usa. TEXT (zero à esquerda
+   importa), sem validação de formato — ele não foi confirmado, e a tentativa
+   anterior de validar partia de uma suposição errada. Índice único parcial.
+   O que resta é operacional: preencher para todos os alunos já cadastrados.
 5. **A câmera V4L2 é exclusiva.** Worker e API não podem abrir o mesmo
    `/dev/video0`; contornado com o worker publicando o frame em tmpfs.
 6. **Sem HTTPS.** O token protege contra acesso casual, não contra captura de
