@@ -1,0 +1,250 @@
+/* Painel — estilo enxuto, sem framework.
+ *
+ * Tema escuro para não cansar quem passa o dia olhando fotos, e cartões
+ * arredondados porque o conteúdo é majoritariamente imagem.
+ *
+ * A regra que mais importa aqui: TUDO usa o mesmo container centrado. A
+ * primeira versão tinha `max-width` sem `margin: 0 auto`, e o resultado era
+ * conteúdo preso à esquerda com centenas de pixels vazios à direita em todas
+ * as abas. Largura sem centralização não é layout, é acidente.
+ */
+
+:root {
+  --fundo: #0e1117;
+  --cartao: #1a1f2b;
+  --painel: #151a24;
+  --borda: #2c3444;
+  --texto: #e6e9ef;
+  --apagado: #8b93a7;
+  --acento: #4c8dff;
+  --ok: #2e7d4f;
+  --erro: #b3413a;
+  --aviso: #8a6d1f;
+  --largura: 1680px;
+  --raio: 10px;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--fundo);
+  color: var(--texto);
+  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+/* -------------------------------------------------------------- topo ---- */
+
+header {
+  border-bottom: 1px solid var(--borda);
+  position: sticky; top: 0; z-index: 10;
+  background: var(--fundo);
+  padding: 0 1.5rem;
+}
+.topo {
+  max-width: var(--largura); margin: 0 auto;
+  display: flex; align-items: center; gap: 1.5rem;
+  min-height: 3.4rem;
+}
+header h1 { font-size: 1.02rem; margin: 0; font-weight: 600; white-space: nowrap; }
+
+nav { display: flex; gap: .25rem; }
+nav button {
+  background: none; border: 1px solid transparent; color: var(--apagado);
+  padding: .42rem .9rem; border-radius: 7px; cursor: pointer; font-size: .94rem;
+}
+nav button:hover { color: var(--texto); background: #ffffff0a; }
+nav button.ativa {
+  color: var(--texto); background: var(--cartao); border-color: var(--borda);
+}
+
+.estado { margin-left: auto; font-size: .84rem; color: var(--apagado);
+          white-space: nowrap; }
+.estado.ruim { color: #ff8f87; }
+
+/* ------------------------------------------------------------ corpo ----- */
+
+main, #login { max-width: var(--largura); margin: 0 auto; padding: 1.6rem 1.5rem 3rem; }
+#login { max-width: 34rem; margin: 3rem auto; }
+
+h3 { font-size: 1rem; margin: 0 0 .8rem; font-weight: 600; }
+h4 { font-size: .88rem; margin: 0 0 .6rem; font-weight: 600; }
+.contagem { color: var(--apagado); font-weight: 400; }
+.nota { color: var(--apagado); font-size: .84rem; }
+.erro { color: #ff8f87; }
+
+/* -------------------------------------------------------- controles ----- */
+
+.barra {
+  display: flex; gap: 1rem; align-items: flex-end; flex-wrap: wrap;
+  margin-bottom: 1.2rem; padding-bottom: 1.1rem;
+  border-bottom: 1px solid var(--borda);
+}
+.barra label { display: flex; flex-direction: column; gap: .28rem;
+               font-size: .8rem; color: var(--apagado); }
+
+input, select, button {
+  font: inherit; color: var(--texto); background: var(--cartao);
+  border: 1px solid var(--borda); border-radius: 7px; padding: .46rem .65rem;
+}
+input[type=checkbox] { width: 1.05rem; height: 1.05rem; accent-color: var(--acento); }
+button { cursor: pointer; }
+button:hover:not(:disabled) { border-color: var(--acento); }
+button:disabled { opacity: .45; cursor: not-allowed; }
+button.primario { background: var(--acento); border-color: var(--acento);
+                  color: #fff; font-weight: 600; }
+button.perigo { background: var(--erro); border-color: var(--erro); color: #fff; }
+button.largo { width: 100%; }
+
+label.campo { display: flex; flex-direction: column; gap: .28rem;
+              font-size: .8rem; color: var(--apagado); margin-bottom: .8rem; }
+label.campo-inline { display: flex; align-items: flex-start; gap: .55rem;
+                     font-size: .85rem; margin: .7rem 0; line-height: 1.35; }
+
+/* ------------------------------------------------------- indicadores ---- */
+
+.metricas { display: grid; gap: 1rem; margin-bottom: 1.2rem;
+            grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); }
+.metrica { background: var(--cartao); border: 1px solid var(--borda);
+           border-radius: var(--raio); padding: .8rem 1.1rem; }
+.metrica .rotulo { font-size: .72rem; color: var(--apagado);
+                   text-transform: uppercase; letter-spacing: .05em; }
+.metrica .valor { font-size: 1.4rem; font-weight: 600; margin-top: .15rem; }
+
+.faixa { padding: .75rem 1rem; border-radius: var(--raio); margin-bottom: .6rem;
+         border: 1px solid transparent; font-size: .92rem; }
+.faixa.erro  { background: #3a1c1a; border-color: var(--erro); color: var(--texto); }
+.faixa.aviso { background: #332a10; border-color: var(--aviso); }
+.faixa.ok    { background: #16301f; border-color: var(--ok); }
+.faixa code { background: #00000055; padding: .1rem .35rem; border-radius: 4px; }
+
+/* --------------------------------------------------------- chamada ------ */
+
+#listas { display: grid; grid-template-columns: 1fr 1fr; gap: 1.8rem;
+          margin-top: 1.4rem; }
+@media (max-width: 1000px) { #listas { grid-template-columns: 1fr; } }
+
+.pessoas { display: flex; flex-direction: column; gap: .5rem; }
+
+/* A linha inteira é clicável: com área restrita ao quadradinho, conferir 50
+   alunos vira tortura. Por isso é <label> envolvendo o checkbox. */
+.pessoa {
+  display: flex; gap: .9rem; align-items: center;
+  background: var(--cartao); border: 1px solid var(--borda);
+  border-radius: var(--raio); padding: .6rem .8rem; cursor: pointer;
+  transition: border-color .12s, background .12s;
+}
+.pessoa:hover { border-color: var(--acento); background: #1e2531; }
+.pessoa.corrigida { border-left: 3px solid var(--aviso); }
+.pessoa img, .pessoa .sem-foto {
+  width: 60px; height: 60px; border-radius: 8px; object-fit: cover;
+  flex: 0 0 60px; background: #000;
+}
+.pessoa .sem-foto {
+  border: 1px dashed var(--borda); display: flex; align-items: center;
+  justify-content: center; font-size: .62rem; color: var(--apagado);
+  text-align: center; line-height: 1.15;
+}
+/* O texto cresce e empurra nada: é o que faz a linha ocupar a largura toda
+   em vez de deixar um vão à direita. */
+.pessoa .texto { flex: 1; min-width: 0; }
+.pessoa .nome { font-weight: 600; }
+.pessoa .detalhe { font-size: .79rem; color: var(--apagado); }
+
+.rodape-acoes { margin-top: 1.6rem; display: flex; gap: .8rem; }
+.salvo { color: #6ee7a0; font-size: .85rem; align-self: center; }
+
+/* --------------------------------------------------- grades de foto ----- */
+
+.grade { display: grid; gap: .9rem;
+         grid-template-columns: repeat(auto-fill, minmax(155px, 1fr)); }
+.cartao { background: var(--cartao); border: 1px solid var(--borda);
+          border-radius: var(--raio); overflow: hidden;
+          display: flex; flex-direction: column; }
+.cartao.errada { border-color: var(--erro); }
+.cartao img { width: 100%; aspect-ratio: 1; object-fit: cover; display: block;
+              background: #000; }
+.cartao .info { padding: .5rem .6rem; font-size: .78rem; flex: 1; }
+.cartao .info .nome { font-weight: 600; font-size: .88rem; }
+.cartao .info .meta { color: var(--apagado); }
+.cartao .redundante { color: #ffd479; }
+.cartao button { width: 100%; border-radius: 0; border: none;
+                 border-top: 1px solid var(--borda); font-size: .77rem;
+                 padding: .4rem; }
+
+/* ---------------------------------------- conteúdo + coluna lateral ----- */
+
+/* Usado em Cadastrar e Pessoas: o conteúdo principal cresce e as ações ficam
+   numa coluna fixa. Antes as duas partes eram empilhadas em faixas, e cada
+   uma deixava metade da tela vazia. */
+.com-lateral { display: grid; grid-template-columns: minmax(0, 1fr) 340px;
+               gap: 1.8rem; align-items: start; }
+@media (max-width: 1000px) { .com-lateral { grid-template-columns: 1fr; } }
+
+.painel { background: var(--painel); border: 1px solid var(--borda);
+          border-radius: var(--raio); padding: 1rem; margin-bottom: 1rem; }
+.painel > *:last-child { margin-bottom: 0; }
+
+.preview { width: 100%; border-radius: 8px; border: 1px solid var(--borda);
+           background: #000; display: block; aspect-ratio: 4/3;
+           object-fit: contain; margin-bottom: .7rem; }
+.preview.grande { aspect-ratio: auto; max-height: 76vh; }
+
+.tiras { display: grid; gap: .7rem;
+         grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); }
+.tira { background: var(--cartao); border: 1px solid var(--borda);
+        border-radius: var(--raio); padding: .45rem; text-align: center; }
+.tira img { width: 100%; border-radius: 6px; display: block; background: #000;
+            aspect-ratio: 1; object-fit: cover; }
+.tira button { width: 100%; margin-top: .4rem; font-size: .75rem;
+               padding: .28rem; }
+
+/* ------------------------------------------------------------ lupa ------ */
+
+/* Foto em tamanho grande. Existe porque miniatura de 60px não permite dizer
+   se o rosto é de quem o sistema afirma — e é exatamente essa decisão que a
+   conferência da chamada e a marcação de erro exigem. */
+#lupa {
+  position: fixed; inset: 0; z-index: 100;
+  background: #000000ee;
+  display: grid; align-items: center; justify-items: center;
+  grid-template-columns: 4rem 1fr 4rem;
+  grid-template-rows: auto 1fr auto;
+  padding: 1rem;
+}
+#lupa[hidden] { display: none; }
+
+.lupa-topo {
+  grid-column: 1 / -1; grid-row: 1;
+  width: 100%; max-width: var(--largura);
+  display: flex; align-items: center; gap: 1.2rem;
+  padding: .6rem .4rem 1rem;
+}
+.lupa-titulo { font-size: 1.15rem; font-weight: 600; }
+.lupa-acoes { margin-left: auto; display: flex; gap: .6rem; }
+#lupa-fechar { font-size: 1.1rem; line-height: 1; padding: .45rem .7rem; }
+
+#lupa img {
+  grid-column: 2; grid-row: 2;
+  max-width: 100%; max-height: 78vh;
+  border-radius: var(--raio); background: #000;
+  object-fit: contain;
+}
+
+.lupa-nav {
+  grid-row: 2; background: #ffffff12; border: 1px solid var(--borda);
+  font-size: 1.8rem; line-height: 1; padding: 1.2rem .6rem; color: var(--texto);
+}
+.lupa-nav:disabled { opacity: .2; }
+#lupa-anterior { grid-column: 1; }
+#lupa-proxima  { grid-column: 3; }
+
+.lupa-rodape { grid-column: 1 / -1; grid-row: 3; padding-top: .8rem; }
+
+/* Deixa claro que a miniatura abre */
+.pessoa img, .cartao img, .tira img { cursor: zoom-in; }
+
+/* ----------------------------------------------------------- login ------ */
+
+#form-login { display: flex; gap: .6rem; margin: 1rem 0; }
+#form-login input { flex: 1; }

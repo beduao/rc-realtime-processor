@@ -2136,6 +2136,143 @@ def painel_nao_tem_mais_st_image_com_url():
 
 
 @teste
+def interface_web_so_chama_rotas_que_existem():
+    """Todo caminho e método que o JS usa tem que existir na API.
+
+    Guarda contra a falha mais chata desse tipo de interface: um caminho
+    digitado errado, ou um POST numa rota que só aceita GET. Nada disso quebra
+    o import nem aparece em teste de Python — quebra no navegador, na hora do
+    clique, e o sintoma é um botão que não faz nada.
+    """
+    import ast
+    import re
+    from collections import defaultdict
+
+    js = os.path.join(RAIZ, "web", "app.js")
+    if not os.path.exists(js):
+        return "PULADO: interface web ainda não existe"
+
+    # Lê os decoradores do FONTE, sem importar o módulo. Importar `api` abre o
+    # banco e carrega os modelos, então o teste passava a depender do config
+    # do ambiente — e falhou com "disk I/O error" ao topar com o banco da
+    # instalação em uso. Análise estática não precisa de nada disso.
+    arvore = ast.parse(open(os.path.join(RAIZ, "api.py"), encoding="utf-8").read())
+    rotas = defaultdict(set)
+    for no in ast.walk(arvore):
+        if not isinstance(no, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for dec in no.decorator_list:
+            # @app.get("/x") / @app.post("/x") ...
+            if (isinstance(dec, ast.Call)
+                    and isinstance(dec.func, ast.Attribute)
+                    and isinstance(dec.func.value, ast.Name)
+                    and dec.func.value.id == "app"
+                    and dec.func.attr in ("get", "post", "put", "patch", "delete")
+                    and dec.args
+                    and isinstance(dec.args[0], ast.Constant)):
+                rotas[dec.args[0].value].add(dec.func.attr.upper())
+    assert rotas, "não extraí rota nenhuma do api.py — o padrão mudou?"
+
+    fonte = open(js, encoding="utf-8").read()
+
+    def limpar(s):
+        # `${dia}` e afins viram um segmento qualquer; a query não entra
+        return re.sub(r"\$\{[^}]+\}", "X", s).split("?")[0]
+
+    def casa(caminho):
+        if caminho in rotas:
+            return caminho
+        for r in rotas:
+            p = re.sub(r"\{[^}]+:path\}", ".*", r)
+            p = re.sub(r"\{[^}]+\}", "[^/]+", p)
+            if re.fullmatch(p, caminho):
+                return r
+        return None
+
+    usos = set()
+    for m in re.finditer(r'api\(\s*([`"])((?:(?!\1).)*)\1\s*(?:,\s*\{([^}]*))?',
+                         fonte):
+        met = (re.search(r'metodo:\s*"(\w+)"', m.group(3) or "")
+               or [None, "GET"])[1]
+        usos.add((limpar(m.group(2)), met))
+    for m in re.finditer(r'fetch\(\s*"([^"?]+)', fonte):
+        usos.add((m.group(1), "GET"))
+
+    assert usos, "não extraí nenhuma chamada do app.js — regex desatualizada?"
+
+    problemas = []
+    for caminho, metodo in sorted(usos):
+        r = casa(caminho)
+        if r is None:
+            problemas.append(f"{metodo} {caminho}: rota inexistente")
+        elif metodo not in rotas[r]:
+            problemas.append(f"{metodo} {caminho}: {r} aceita "
+                             f"{sorted(rotas[r])}")
+    assert not problemas, "\n".join(problemas)
+    return f"{len(usos)} par(es) caminho/método do JS conferem com a API"
+
+
+@teste
+def sessao_por_cookie_autentica_a_interface_web():
+    """A interface web autentica por cookie HttpOnly, não guardando o token.
+
+    Em localStorage qualquer script da página leria o valor. HttpOnly o torna
+    invisível para JavaScript, então o token existe só no tráfego.
+    """
+    try:
+        import fastapi.testclient  # noqa: F401
+    except ImportError:
+        return "PULADO: fastapi.testclient indisponível"
+
+    c, _ = _api_cliente("sessao", host="10.0.0.9", **{"api.token": "s3gr3d0"})
+
+    # /session tem que responder SEM autenticação — é a rota que autentica, e
+    # exigir sessão nela impediria qualquer login.
+    s = c.get("/session")
+    assert s.status_code == 200, s.text
+    assert s.json() == {"autenticado": False, "consumidor": None,
+                        "token_exigido": True, "motivo": None}, s.json()
+
+    # Os estáticos ficam abertos, senão a própria tela de login não carrega.
+    # Não contêm dado de ninguém — só o código da tela.
+    assert c.get("/painel/").status_code in (200, 404), "estáticos não podem dar 401"
+
+    # Sem sessão, rota de dados continua barrada.
+    assert c.get("/attendance").status_code == 401
+
+    # Token errado não abre sessão.
+    assert c.post("/session", json={"token": "errado"}).status_code == 401
+    assert c.get("/attendance").status_code == 401
+
+    # Token certo abre, e o cookie é HttpOnly.
+    r = c.post("/session", json={"token": "s3gr3d0"})
+    assert r.status_code == 200 and r.json()["consumidor"] == "padrao", r.text
+    set_cookie = r.headers.get("set-cookie", "")
+    assert "httponly" in set_cookie.lower(), f"cookie sem HttpOnly: {set_cookie}"
+    assert "samesite=strict" in set_cookie.lower().replace(" ", ""), set_cookie
+
+    # Agora o cookie (que o cliente guardou) autentica sozinho.
+    assert c.get("/attendance").status_code == 200
+    assert c.get("/session").json()["autenticado"] is True
+
+    # O cabeçalho continua valendo: é como o sistema da escola vai chamar.
+    c2, _ = _api_cliente("sessao2", host="10.0.0.9", **{"api.token": "s3gr3d0"})
+    assert c2.get("/attendance",
+                  headers={"x-api-token": "s3gr3d0"}).status_code == 200
+
+    # Sair encerra a sessão.
+    c.request("DELETE", "/session")
+    assert c.get("/attendance").status_code == 401
+
+    # Cliente LOCAL não precisa de nada disso.
+    c3, _ = _api_cliente("sessao3", host="127.0.0.1", **{"api.token": "s3gr3d0"})
+    assert c3.get("/session").json()["autenticado"] is True
+    assert c3.get("/attendance").status_code == 200
+    return ("cookie HttpOnly e SameSite=Strict; /session aberta; estáticos "
+            "abertos; header preservado para a escola; local dispensa")
+
+
+@teste
 def rotulos_ficam_no_banco_e_nao_mexem_na_presenca():
     """Uma fonte só para 'certo/errado', e rotular não altera a chamada."""
     try:
@@ -2224,19 +2361,23 @@ def rotulos_ficam_no_banco_e_nao_mexem_na_presenca():
 def rotulos_migram_do_json_antigo():
     """O JSON que o calibrate usava vira linha no banco, uma vez só."""
     import json as _json
+    from pathlib import Path
     from core.database import Database
-    from core.config import project_path
     import scripts.calibrate_threshold as cal
 
     pasta = os.path.join(TMP, "migra")
     os.makedirs(pasta, exist_ok=True)
     db = Database(os.path.join(pasta, "m.db"))
 
-    antigo = project_path(cal.LABELS_FILE)
-    antigo.parent.mkdir(parents=True, exist_ok=True)
-    salvo = antigo.read_text(encoding="utf-8") if antigo.exists() else None
+    # Aponta LABELS_FILE para o temporário. A primeira versão deste teste
+    # salvava e restaurava o arquivo REAL em data/ — mexer no dado do projeto
+    # para testar é pedir para perder dado, e ainda quebrou por permissão de
+    # rename no diretório montado. `project_path` respeita caminho absoluto.
+    original_labels = cal.LABELS_FILE
+    antigo = Path(pasta) / "calibracao.json"
+    cal.LABELS_FILE = str(antigo)
     migrado = antigo.with_suffix(antigo.suffix + ".migrado")
-    salvo_mig = migrado.read_text(encoding="utf-8") if migrado.exists() else None
+    salvo = salvo_mig = None
     try:
         # chave antiga (só número) significava evento; a nova traz a fonte
         antigo.write_text(_json.dumps({"7": "errado", "trilha:3": "certo"}),
@@ -2259,11 +2400,7 @@ def rotulos_migram_do_json_antigo():
         # rodar de novo não duplica nem quebra
         assert cal._migrar_json(db) == 0
     finally:
-        for p, conteudo in ((antigo, salvo), (migrado, salvo_mig)):
-            if conteudo is None:
-                p.unlink(missing_ok=True)
-            else:
-                p.write_text(conteudo, encoding="utf-8")
+        cal.LABELS_FILE = original_labels
     return "chave antiga normalizada; banco vence o arquivo; JSON preservado"
 
 

@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<!--
+  Interface do painel — HTML e JavaScript puros, servidos pela própria API.
+
+  Por que não Streamlit aqui: o Streamlit reexecuta o script inteiro a cada
+  interação, e com 50 alunos na chamada isso significa refazer todas as
+  chamadas de rede e rebaixar todas as fotos a cada clique. Numa tela de uso
+  diário, a espera some o trabalho.
+
+  Por que sem React, npm ou bundler: passo de build é passivo num projeto
+  mantido por uma pessoa e rodando num Raspberry Pi. Quebra em atualização,
+  exige Node no ambiente e some junto com quem sabia operá-lo. Aqui é só
+  abrir o arquivo.
+
+  Autenticação: o token nunca entra no JavaScript. A tela de entrada o manda
+  uma vez para POST /session, que devolve um cookie HttpOnly — invisível para
+  qualquer script da página. Em localStorage, qualquer script leria o valor.
+-->
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Reconhecimento Facial</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header>
+ <div class="topo">
+  <h1>Reconhecimento facial</h1>
+  <nav>
+    <button data-aba="chamada" class="ativa">Chamada</button>
+    <button data-aba="reconhecimentos">Reconhecimentos</button>
+    <button data-aba="cadastrar">Cadastrar</button>
+    <button data-aba="pessoas">Pessoas</button>
+    <button data-aba="aovivo">Ao vivo</button>
+  </nav>
+  <div id="estado-api" class="estado"></div>
+ </div>
+</header>
+
+<!-- Pedido de token: só aparece quando a API exige e não há sessão -->
+<section id="login" hidden>
+  <h2>Acesso</h2>
+  <p id="login-motivo"></p>
+  <form id="form-login">
+    <input type="password" id="token" placeholder="token de acesso"
+           autocomplete="current-password" required>
+    <button type="submit">Entrar</button>
+  </form>
+  <p class="erro" id="login-erro" hidden></p>
+  <p class="nota">
+    O token está no <code>config.yaml</code> do Pi, em <code>api.token</code>.
+    Ele fica num cookie HttpOnly — o JavaScript desta página não o lê.
+  </p>
+</section>
+
+<!-- ------------------------------------------------------------------ -->
+<main id="app" hidden>
+
+  <section id="aba-chamada">
+    <div class="barra">
+      <label>Dia <input type="date" id="dia"></label>
+      <label>Quem confere
+        <input type="text" id="autor" placeholder="seu nome"
+               autocomplete="off">
+      </label>
+      <button id="recarregar">Atualizar</button>
+      <span id="salvo" class="salvo" hidden>salvo</span>
+    </div>
+
+    <div id="metricas" class="metricas"></div>
+    <div id="avisos"></div>
+
+    <div id="listas">
+      <section>
+        <h3>Presentes <span id="n-presentes" class="contagem"></span></h3>
+        <div id="presentes" class="pessoas"></div>
+      </section>
+      <section>
+        <h3>Ausentes <span id="n-ausentes" class="contagem"></span></h3>
+        <div id="ausentes" class="pessoas"></div>
+      </section>
+    </div>
+
+    <div class="rodape-acoes">
+      <button id="fechar" class="primario">Fechar chamada</button>
+      <button id="reabrir" hidden>Reabrir</button>
+    </div>
+  </section>
+
+  <!-- ---------------------------------------------------------------- -->
+  <section id="aba-reconhecimentos" hidden>
+    <div class="barra">
+      <label>Pessoa
+        <select id="filtro-pessoa"><option value="0">Todas</option></select>
+      </label>
+      <label>
+        <input type="checkbox" id="usar-dia-rec"> Filtrar dia
+      </label>
+      <input type="date" id="dia-rec" disabled>
+      <label>Quantidade
+        <input type="number" id="limite" value="24" min="10" max="500" step="10">
+      </label>
+      <button id="recarregar-rec">Atualizar</button>
+    </div>
+    <p id="resumo-rec" class="nota"></p>
+    <div id="grade" class="grade"></div>
+  </section>
+
+  <!-- ---------------------------------------------------------------- -->
+  <section id="aba-cadastrar" hidden>
+    <!-- Sem sessão: pede nome e matrícula -->
+    <div id="cad-inicio">
+      <h3>Cadastrar pessoa</h3>
+      <p class="nota">O preview da câmera abre depois de iniciar.</p>
+      <div class="barra">
+        <label>Nome <input type="text" id="cad-nome" autocomplete="off"></label>
+        <label>Matrícula
+          <input type="text" id="cad-matricula" autocomplete="off">
+        </label>
+        <button id="cad-iniciar" class="primario" disabled>Iniciar cadastro</button>
+      </div>
+      <p class="nota">
+        A matrícula é o que o sistema da escola usa para casar os registros.
+        Pode ficar em branco e ser preenchida depois, em <b>Pessoas</b>.
+      </p>
+    </div>
+
+    <!-- Com sessão: preview + capturas -->
+    <div id="cad-sessao" hidden>
+      <h3>Cadastrando <span id="cad-quem"></span></h3>
+      <div class="faixa ok" id="cad-progresso"></div>
+      <div class="com-lateral">
+        <div>
+          <h4>Amostras capturadas</h4>
+          <p class="nota">
+            Varie ângulo, distância e iluminação. Amostra repetida não melhora
+            o reconhecimento e aumenta falso positivo.
+          </p>
+          <div id="cad-amostras" class="tiras"></div>
+        </div>
+        <aside>
+          <div class="painel">
+            <img id="cad-preview" alt="preview da câmera" class="preview">
+            <p class="nota">Caixa verde = rosto detectado.</p>
+            <button id="cad-capturar" class="primario largo">Capturar amostra</button>
+            <p class="erro" id="cad-erro" hidden></p>
+          </div>
+        </aside>
+      </div>
+      <div class="rodape-acoes">
+        <button id="cad-concluir" class="primario" disabled>Concluir cadastro</button>
+        <button id="cad-cancelar">Cancelar</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ---------------------------------------------------------------- -->
+  <section id="aba-pessoas" hidden>
+    <div class="barra">
+      <label>Pessoa <select id="sel-pessoa"></select></label>
+      <button id="recarregar-pessoas">Atualizar</button>
+    </div>
+    <p id="resumo-pessoas" class="nota"></p>
+    <div id="avisos-pessoa"></div>
+
+    <!-- Amostras ocupam a largura; ações ficam numa coluna lateral fixa.
+         Antes as amostras iam numa faixa e as ações embaixo, o que deixava
+         metade da tela vazia nas duas. -->
+    <div class="com-lateral">
+      <div>
+        <h4>Amostras</h4>
+        <div id="amostras-pessoa" class="grade"></div>
+      </div>
+
+      <aside>
+        <div class="painel">
+          <h4>Adicionar amostra</h4>
+          <img id="add-preview" alt="preview da câmera" class="preview">
+          <button id="add-amostra" class="primario largo">Capturar e adicionar</button>
+          <p class="erro" id="add-erro" hidden></p>
+        </div>
+
+        <div class="painel">
+          <h4>Editar</h4>
+          <label class="campo">Nome <input type="text" id="ed-nome"></label>
+          <label class="campo">Matrícula <input type="text" id="ed-matricula"></label>
+          <button id="ed-salvar" class="largo" disabled>Salvar</button>
+        </div>
+
+        <div class="painel">
+          <h4>Excluir pessoa</h4>
+          <p class="nota">
+            Remove nome, amostras, fotos e histórico. Não tem como desfazer.
+          </p>
+          <label class="campo-inline">
+            <input type="checkbox" id="ex-anonimizar">
+            Preservar as passagens sem identificar quem passou
+          </label>
+          <button id="ex-pessoa" class="perigo largo">Excluir</button>
+        </div>
+      </aside>
+    </div>
+  </section>
+
+  <!-- ---------------------------------------------------------------- -->
+  <section id="aba-aovivo" hidden>
+    <div class="barra">
+      <label class="campo-inline">
+        <input type="checkbox" id="vivo-ligado" checked> Atualizando
+      </label>
+      <span id="vivo-estado" class="nota"></span>
+    </div>
+    <img id="vivo" alt="preview ao vivo" class="preview grande">
+    <p class="nota">
+      Imagem anotada publicada pelo worker. Se ficar parada, ele provavelmente
+      não está rodando.
+    </p>
+  </section>
+
+</main>
+
+<!-- Lupa: foto em tamanho grande para conferir de quem é o rosto.
+     Fica fora do <main> porque cobre a tela inteira. -->
+<div id="lupa" hidden>
+  <div class="lupa-topo">
+    <div>
+      <div id="lupa-titulo" class="lupa-titulo"></div>
+      <div id="lupa-meta" class="nota"></div>
+    </div>
+    <div class="lupa-acoes" id="lupa-acoes"></div>
+    <button id="lupa-fechar" title="Fechar (Esc)">✕</button>
+  </div>
+  <button class="lupa-nav" id="lupa-anterior" title="Anterior (←)">‹</button>
+  <img id="lupa-img" alt="">
+  <button class="lupa-nav" id="lupa-proxima" title="Próxima (→)">›</button>
+  <div class="lupa-rodape nota" id="lupa-pos"></div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

@@ -31,7 +31,8 @@ import uuid
 import cv2
 import numpy as np
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import (FileResponse, JSONResponse, RedirectResponse,
+                               Response)
 from pydantic import BaseModel
 
 from core.camera import Camera, camera_from_config
@@ -118,7 +119,20 @@ API_TOKENS = _carregar_tokens(cfg.get("api"))
 # token, e o monitoramento precisa dela. Devolve contagem de pessoas, nunca
 # nomes. /docs, /openapi.json e /redoc SAÍRAM daqui: não vazam dado, mas
 # entregam o mapa completo da API para quem estiver na rede.
-ROTAS_ABERTAS = {"/health"}
+# `/session` fica aberta por necessidade lógica: é a rota que autentica, então
+# exigir autenticação nela impediria qualquer login. Ela valida o token por
+# conta própria, com compare_digest, e o GET não revela nada — só se a sessão
+# atual vale e se token é exigido nesta origem.
+ROTAS_ABERTAS = {"/health", "/session"}
+
+# Nome do cookie de sessão da interface web.
+COOKIE_SESSAO = "facial_sessao"
+
+# Prefixo dos arquivos da interface. Fica aberto porque HTML, CSS e JS não
+# contêm dado de ninguém — é só o código da tela. Todo dado continua atrás
+# das rotas protegidas, e sem cookie válido a tela carrega vazia pedindo o
+# token. Proteger os estáticos impediria a própria tela de login de carregar.
+PREFIXO_PAINEL = "/painel"
 
 DICA_TOKEN = (
     "Gere um com:  python -c \"import secrets;print(secrets.token_urlsafe(32))\"  "
@@ -166,6 +180,8 @@ def autorizar(request: Request):
         return "local", None
     if request.url.path in ROTAS_ABERTAS:
         return None, None
+    if request.url.path.startswith(PREFIXO_PAINEL):
+        return None, None
     if not API_TOKENS:
         return None, (503, "Esta API está acessível pela rede e nenhum token "
                            "foi configurado, então o acesso remoto está "
@@ -176,6 +192,11 @@ def autorizar(request: Request):
         auth = request.headers.get("authorization", "")
         if auth.lower().startswith("bearer "):
             fornecido = auth[7:]
+    if not fornecido:
+        # Cookie, para a interface web. O navegador o envia sozinho, então o
+        # JavaScript nunca precisa conhecer o token — diferente de guardá-lo em
+        # localStorage, onde qualquer script da página o leria. É HttpOnly.
+        fornecido = request.cookies.get(COOKIE_SESSAO, "")
 
     # compare_digest em TODOS os candidatos, sem interromper no primeiro acerto:
     # sair mais cedo faria o tempo de resposta revelar quantos tokens existem.
@@ -708,7 +729,10 @@ def delete_sample(embedding_id: int):
     db.delete_embedding(embedding_id)
     if amostra["snapshot_path"]:
         arq = (SNAP_BASE / amostra["snapshot_path"]).resolve()
-        if str(arq).startswith(str(SNAP_BASE)) and arq.is_file():
+        # is_relative_to, não startswith: comparação de prefixo de string
+        # deixaria passar diretório irmão de nome parecido. Mesmo defeito que
+        # já foi corrigido na rota de snapshots — este escapou na ocasião.
+        if arq.is_relative_to(SNAP_BASE) and arq.is_file():
             arq.unlink(missing_ok=True)
     return {"deleted": embedding_id,
             "restantes": db.count_embeddings(amostra["person_id"])}
@@ -899,6 +923,78 @@ def attendance(dia: str = Query("", description="AAAA-MM-DD; vazio = hoje"),
     return _montar_chamada(dia, inicio, fim)
 
 
+class LoginReq(BaseModel):
+    token: str
+
+
+@app.post("/session")
+def abrir_sessao(req: LoginReq, request: Request, response: Response):
+    """Troca o token por um cookie HttpOnly, para a interface web.
+
+    Por que cookie e não guardar o token no navegador: em `localStorage`
+    qualquer script da página lê o valor, e ele fica gravado no disco do
+    usuário. Cookie HttpOnly não é acessível por JavaScript, então o token
+    existe só no tráfego e na memória do navegador.
+
+    `SameSite=Strict` porque nenhuma outra origem tem motivo para chamar esta
+    API com a sessão do usuário. Sem `Secure` por enquanto: o projeto ainda
+    roda em HTTP e um cookie Secure simplesmente não seria enviado. Quando o
+    HTTPS entrar, esta flag tem que entrar junto — está anotado como pendência.
+    """
+    if not API_TOKENS:
+        # Sem token configurado, quem chega pela rede já foi recusado antes.
+        # Aqui só chega cliente local, que não precisa de sessão.
+        return {"ok": True, "consumidor": "local",
+                "observacao": "Acesso local dispensa token."}
+
+    quem = None
+    for nome, valor in API_TOKENS.items():
+        if secrets.compare_digest(req.token or "", valor):
+            quem = nome
+    if quem is None:
+        raise HTTPException(401, "Token inválido.")
+
+    response.set_cookie(
+        COOKIE_SESSAO, req.token, httponly=True, samesite="strict",
+        max_age=12 * 3600, path="/")
+    return {"ok": True, "consumidor": quem}
+
+
+@app.delete("/session")
+def fechar_sessao(response: Response):
+    response.delete_cookie(COOKIE_SESSAO, path="/")
+    return {"ok": True}
+
+
+@app.get("/session")
+def estado_sessao(request: Request):
+    """Diz se a interface já está autenticada, sem revelar o token.
+
+    A tela chama isto ao carregar para decidir se mostra o conteúdo ou o pedido
+    de token. Precisa funcionar SEM sessão, daí estar em ROTAS_ABERTAS — e por
+    isso não pode devolver nada sensível.
+    """
+    local = cliente_local(request)
+    # `autorizar` devolveria "aberta, sem erro" para /session (ela está na
+    # lista), então a checagem do cookie é feita aqui de propósito.
+    cookie = request.cookies.get(COOKIE_SESSAO, "")
+    quem = None
+    for nome, valor in API_TOKENS.items():
+        if secrets.compare_digest(cookie, valor):
+            quem = nome
+
+    if local:
+        return {"autenticado": True, "consumidor": "local",
+                "token_exigido": False, "motivo": None}
+    if not API_TOKENS:
+        return {"autenticado": False, "consumidor": None,
+                "token_exigido": False,
+                "motivo": ("Esta API está acessível pela rede e nenhum token "
+                           f"foi configurado. {DICA_TOKEN}")}
+    return {"autenticado": quem is not None, "consumidor": quem,
+            "token_exigido": True, "motivo": None}
+
+
 @app.get("/detections")
 def detections(person_id: int = Query(0, description="0 = todas as pessoas"),
                dia: str = Query("", description="AAAA-MM-DD; vazio = todos"),
@@ -1062,6 +1158,31 @@ def track_crop(path: str):
     return _servir_imagem(TRACKS_BASE, path, "Recorte não encontrado.")
 
 
+@app.get("/")
+def raiz():
+    """Manda quem abre a API no navegador para a interface."""
+    return RedirectResponse(f"{PREFIXO_PAINEL}/")
+
+
+def _montar_painel():
+    """Serve a interface web pela própria API, se os arquivos existirem.
+
+    Com isso o painel deixa de precisar de um processo próprio: eram três
+    (API, worker, Streamlit) e passam a ser dois. Um processo a menos é uma
+    coisa a menos para quebrar e para alguém ter que saber reiniciar — o que
+    importa quando quem opera não é quem desenvolveu.
+
+    Silenciosamente ignorado se a pasta não existir, para a API continuar
+    subindo em instalação que só usa o Streamlit.
+    """
+    pasta = project_path("web")
+    if not pasta.is_dir():
+        return
+    from fastapi.staticfiles import StaticFiles
+    app.mount(PREFIXO_PAINEL, StaticFiles(directory=str(pasta), html=True),
+              name="painel")
+
+
 def _servir_imagem(base, path: str, erro: str):
     full = (base / path).resolve()
     # is_relative_to compara COMPONENTES de caminho. Um `startswith` de string
@@ -1077,3 +1198,8 @@ def live():
     if not LIVE_PATH.exists():
         raise HTTPException(404, "Ainda não há preview ao vivo (o worker está rodando?).")
     return FileResponse(str(LIVE_PATH), media_type="image/jpeg")
+
+
+# No fim do módulo, depois de todas as rotas: `mount` captura tudo sob o
+# prefixo, então registrá-lo antes poderia sombrear rota declarada depois.
+_montar_painel()
