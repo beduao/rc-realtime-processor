@@ -464,12 +464,35 @@ def enroll_preview():
     if frame is None:
         raise HTTPException(503, _porque_sem_imagem(origem))
     preview = frame.copy()
-    for face in engine.detect(frame):
-        draw_face(preview, face, "rosto", score=float(face[14]), known=True)
+    rostos = engine.detect(frame)
+    escolhido = engine.best_face(rostos)
+
+    # Distingue o rosto que SERÁ capturado dos demais.
+    #
+    # Antes todos saíam com a mesma caixa verde e o rótulo "rosto", enquanto a
+    # captura usa `best_face` — o MAIOR do quadro. Com duas pessoas em cena,
+    # não havia como saber qual seria gravada, e quem cadastra costuma estar
+    # mais perto da câmera que a pessoa sendo cadastrada. O resultado foi uma
+    # galeria inteira com o rosto errado, descoberta só semanas depois, pela
+    # calibração, como 75 confusões do mesmo par.
+    for face in rostos:
+        eh_alvo = escolhido is not None and face is escolhido
+        draw_face(preview, face,
+                  "SERA CAPTURADO" if eh_alvo else "ignorado",
+                  score=float(face[14]), known=eh_alvo)
+
+    if len(rostos) > 1:
+        cv2.putText(preview, f"{len(rostos)} rostos em cena",
+                    (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2,
+                    cv2.LINE_AA)
+
     ok, buf = cv2.imencode(".jpg", preview)
     if not ok:
         raise HTTPException(500, "Falha ao codificar o preview.")
-    return Response(content=buf.tobytes(), media_type="image/jpeg")
+    resp = Response(content=buf.tobytes(), media_type="image/jpeg")
+    # A interface lê isto para avisar antes de a pessoa clicar em capturar.
+    resp.headers["X-Rostos"] = str(len(rostos))
+    return resp
 
 
 @app.post("/enroll/capture")
@@ -482,7 +505,8 @@ def enroll_capture(req: SessionReq):
     if frame is None:
         return {"ok": False, "message": _porque_sem_imagem(origem)}
 
-    face = engine.best_face(engine.detect(frame))
+    rostos = engine.detect(frame)
+    face = engine.best_face(rostos)
     if face is None:
         return {"ok": False, "message": "Nenhum rosto detectado. Ajuste a posição."}
 
@@ -493,7 +517,21 @@ def enroll_capture(req: SessionReq):
     sess["samples"].append({"index": index, "embedding": vec, "snapshot": snapshot,
                             "quality": _nitidez(crop)})
     return {"ok": True, "count": len(sess["samples"]), "target": ENROLL_TARGET,
-            "samples": _public_samples(sess)}
+            "samples": _public_samples(sess),
+            # Segunda barreira contra cadastrar a pessoa errada. A primeira é
+            # visual, no preview; esta avisa depois do clique, porque quem
+            # cadastra costuma estar olhando para o botão, não para a imagem.
+            "aviso": _aviso_multiplos_rostos(len(rostos))}
+
+
+def _aviso_multiplos_rostos(n: int):
+    if n <= 1:
+        return None
+    return (f"Havia {n} rostos em cena e foi capturado o MAIOR — normalmente "
+            "quem está mais perto da câmera. Confira a miniatura: se for a "
+            "pessoa errada, remova a amostra e peça para os outros saírem de "
+            "quadro. Galeria com o rosto de outra pessoa produz confusão "
+            "sistemática, difícil de diagnosticar depois.")
 
 
 @app.post("/enroll/sample/delete")
@@ -696,7 +734,8 @@ def add_sample(person_id: int):
     frame, origem = frame_para_cadastro()
     if frame is None:
         return {"ok": False, "message": _porque_sem_imagem(origem)}
-    face = engine.best_face(engine.detect(frame))
+    rostos = engine.detect(frame)
+    face = engine.best_face(rostos)
     if face is None:
         return {"ok": False, "message": "Nenhum rosto detectado. Ajuste a posição."}
 
@@ -708,7 +747,8 @@ def add_sample(person_id: int):
     _maybe_close_camera()
     return {"ok": True, "id": eid, "origem": origem,
             "snapshot_url": f"/snapshots/{caminho}",
-            "total": db.count_embeddings(person_id)}
+            "total": db.count_embeddings(person_id),
+            "aviso": _aviso_multiplos_rostos(len(rostos))}
 
 
 @app.delete("/embeddings/{embedding_id}")
@@ -996,25 +1036,32 @@ def estado_sessao(request: Request):
 
 
 @app.get("/detections")
-def detections(person_id: int = Query(0, description="0 = todas as pessoas"),
+def detections(person_id: int = Query(
+                   0, description="0 = todas; -1 = sem identidade "
+                                  "(desconhecidos e marcados como não "
+                                  "cadastrados)"),
                dia: str = Query("", description="AAAA-MM-DD; vazio = todos"),
                limit: int = Query(120, ge=1, le=1000)):
-    """Detecções das DUAS origens, filtráveis por pessoa e dia.
+    """Detecções das DUAS origens, filtráveis pela identidade CORRIGIDA.
 
     Difere de `/events`, que lê só a tabela `events` e portanto devolve vazio
-    no modo captura — o modo usado na escola. Cada linha já vem com a URL da
-    foto na rota certa (snapshots e recortes de trilha ficam em bases
-    diferentes) e com o rótulo manual, se houver.
+    no modo captura — o modo usado na escola.
+
+    O filtro por pessoa usa a identidade efetiva: uma detecção marcada como
+    "não é a fulana, é a beltrana" sai da lista da fulana e entra na da
+    beltrana. É o que faz a revisão convergir — marcando erro, a lista de cada
+    pessoa vai ficando só com o que é dela de fato.
     """
     t0 = t1 = None
     if dia:
         t0, t1 = _janela(dia, "", "")
     linhas = db.deteccoes_de(person_id or None, t0, t1, limit)
-    rotulos = db.detection_labels()
+    nomes = {p["id"]: p["name"] for p in db.list_people()}
 
     saida = []
     for l in linhas:
         base = "/snapshots/" if l["fonte"] == "evento" else "/tracks/"
+        efetivo = l["efetivo"]
         saida.append({
             "fonte": l["fonte"],
             "id": int(l["id"]),
@@ -1028,7 +1075,11 @@ def detections(person_id: int = Query(0, description="0 = todas as pessoas"),
                                     time.localtime(l["ts"])),
             "is_known": bool(l["is_known"]),
             "foto_url": f"{base}{l['foto']}" if l["foto"] else None,
-            "rotulo": rotulos.get(f"{l['fonte']}:{int(l['id'])}"),
+            "rotulo": l["rotulo"],
+            # Quem a pessoa realmente é, depois da correção humana.
+            "pessoa_correta": l["pessoa_correta"],
+            "efetivo_id": efetivo,
+            "efetivo_nome": nomes.get(efetivo) if efetivo else None,
         })
     return {"total": len(saida), "deteccoes": saida}
 
@@ -1038,11 +1089,18 @@ class RotuloReq(BaseModel):
     detection_id: int
     rotulo: str = "errado"
     autor: str = ""
+    # Quem é de verdade. Ausente (ou null) com rotulo='errado' significa
+    # "não é ninguém cadastrado".
+    pessoa_correta: int | None = None
 
 
 @app.post("/detections/label")
 def rotular_deteccao(req: RotuloReq):
-    """Marca uma detecção como 'certo' ou 'errado'.
+    """Marca uma detecção como 'certo' ou 'errado', e de quem ela é.
+
+    Informar `pessoa_correta` é o que transforma o rótulo de "isto está
+    errado" em par (detecção → identidade real). Só o segundo serve para
+    medir: sem alvo, "errado" diz o que NÃO é e nada mais.
 
     NÃO altera a presença — decisão deliberada. Rotular mede o acerto do
     reconhecimento; quem esteve na escola é decidido na chamada. Se uma
@@ -1051,11 +1109,11 @@ def rotular_deteccao(req: RotuloReq):
     """
     try:
         db.set_detection_label(req.fonte, req.detection_id, req.rotulo,
-                               req.autor)
+                               req.autor, req.pessoa_correta)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     return {"ok": True, "chave": f"{req.fonte}:{req.detection_id}",
-            "rotulo": req.rotulo,
+            "rotulo": req.rotulo, "pessoa_correta": req.pessoa_correta,
             "observacao": "A presença na chamada não foi alterada."}
 
 

@@ -39,6 +39,7 @@ import os
 import socket
 import sys
 import time
+from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -131,14 +132,46 @@ def rotulos_da_chamada(db: Database, deteccoes: list[dict]) -> dict:
     return labels
 
 
+def incluir_rotuladas(db: Database, deteccoes: list[dict]) -> list[dict]:
+    """Acrescenta as detecções rotuladas que ficaram fora da janela recente.
+
+    O relatório analisa as N mais recentes, o que é certo para o histograma —
+    ele descreve a atividade atual. Mas o cálculo do limiar depende dos
+    RÓTULOS, e rótulo não envelhece: cada um é alguém que olhou uma foto e
+    decidiu.
+
+    Sem isto, marcar 211 detecções e depois deixar o worker rodando fazia as
+    marcações saírem da janela e serem ignoradas em silêncio — o relatório
+    dizia "211 manuais" e usava zero. Pior que não ter a informação é exibi-la
+    e não usá-la.
+    """
+    presentes = {chave(d) for d in deteccoes}
+    faltando = [k for k in _load_labels(db) if k not in presentes]
+    if not faltando:
+        return deteccoes
+    extras = db.detections_by_keys(faltando)
+    if extras:
+        print(f"  (+{len(extras)} detecção(ões) rotuladas fora da janela, "
+              "incluídas no cálculo)")
+    return deteccoes + extras
+
+
 def juntar_rotulos(db: Database, deteccoes: list[dict]) -> tuple[dict, dict]:
-    """Combina as duas fontes. Manual vence, por ser mais específica."""
+    """Combina as duas fontes. Manual vence, por ser mais específica.
+
+    `origem` conta só o que é UTILIZÁVEL — rótulo cuja detecção existe na
+    análise. Contar rótulo que não entra na conta foi exatamente o que criou
+    a contradição "211 manuais / 0 erros" na saída.
+    """
+    presentes = {chave(d) for d in deteccoes}
     derivados = rotulos_da_chamada(db, deteccoes)
-    manuais = _load_labels(db)
+    manuais = {k: v for k, v in _load_labels(db).items() if k in presentes}
+    orfaos = len(_load_labels(db)) - len(manuais)
+
     combinado = dict(derivados)
     combinado.update(manuais)
     origem = {"chamada": len(derivados), "manual": len(manuais),
-              "total": len(combinado)}
+              "total": len(combinado), "orfaos": orfaos}
     return combinado, origem
 
 
@@ -235,6 +268,90 @@ def review(db: Database, cfg, deteccoes: list[dict], ip: str, porta: int) -> Non
     sugerir(deteccoes, combinado, origem, float(cfg.recognition.cosine_threshold))
 
 
+def cobertura(db: Database, deteccoes: list[dict], labels: dict,
+              origem: dict) -> None:
+    """Quanto do material já foi conferido, e o que as correções revelaram.
+
+    Existe para responder "minhas marcações adiantaram alguma coisa?". O
+    relatório de limiar mostra o RESULTADO; este mostra a base sobre a qual
+    ele foi calculado — que é o que diz se dá para confiar nele e o que falta
+    para melhorar.
+    """
+    por_chave = {chave(d): d for d in deteccoes}
+    rotuladas = [k for k in labels if k in por_chave]
+    certos = [k for k in rotuladas if labels[k] == "certo"]
+    errados = [k for k in rotuladas if labels[k] == "errado"]
+
+    total = len(deteccoes)
+    pct = (len(rotuladas) / total * 100) if total else 0.0
+
+    print("\n--- Cobertura da conferência ---")
+    print(f"  {len(rotuladas)} de {total} detecções conferidas ({pct:.0f}%)")
+    print(f"    de chamadas fechadas: {origem['chamada']}")
+    print(f"    marcadas à mão:       {origem['manual']}")
+    if origem.get("orfaos"):
+        print(f"  ⚠ {origem['orfaos']} rótulo(s) apontam para detecção que não")
+        print("    existe mais — provavelmente apagada pela retenção. O "
+              "trabalho")
+        print("    de marcá-las se perdeu junto com as fotos.")
+    print(f"  veredito: {len(certos)} acerto(s), {len(errados)} erro(s)")
+
+    # O que as correções de identidade revelam: quais cadastros o sistema
+    # confunde entre si. Isso é mais acionável que o limiar, porque aponta
+    # exatamente quem recadastrar.
+    detalhes = db.detection_labels_detalhados()
+    confusoes = Counter()
+    sem_alvo = 0
+    for k in errados:
+        info = detalhes.get(k) or {}
+        disse = por_chave[k].get("name") or "?"
+        if info.get("pessoa_correta"):
+            confusoes[(disse, info["nome_correto"])] += 1
+        else:
+            sem_alvo += 1
+
+    if confusoes:
+        # Score POR PAR: é o que distingue "o sistema é ruim em geral" de
+        # "um cadastro específico está contaminando tudo". Sem essa quebra, a
+        # sobreposição parece um problema difuso e a recomendação vira
+        # genérica — quando muitas vezes um par responde por quase tudo.
+        scores_par = {}
+        for k in errados:
+            info = detalhes.get(k) or {}
+            if not info.get("pessoa_correta"):
+                continue
+            par = (por_chave[k].get("name") or "?", info["nome_correto"])
+            scores_par.setdefault(par, []).append(por_chave[k]["score"])
+
+        print("\n  Confusões identificadas (o sistema disse -> era):")
+        for (disse, era), n in confusoes.most_common(8):
+            ss = scores_par.get((disse, era), [])
+            faixa = (f"  scores {min(ss):.3f}–{max(ss):.3f}" if ss else "")
+            print(f"    {disse} -> {era}: {n}x{faixa}")
+        print("  Par que se repete é problema de cadastro das DUAS pessoas —")
+        print("  mais amostras de ambas, com ângulos variados, separa melhor")
+        print("  que mexer no limiar.")
+
+        # Um par dominante muda completamente o diagnóstico.
+        if len(confusoes) >= 1:
+            (disse, era), n = confusoes.most_common(1)[0]
+            fatia = n / max(1, sum(confusoes.values()))
+            if fatia >= 0.7 and n >= 5:
+                print(f"\n  ⚠ {fatia*100:.0f}% das confusões são o MESMO par: "
+                      f"{disse} -> {era}.")
+                print("    Isso não é 'o reconhecimento está ruim', é um")
+                print(f"    cadastro específico. Antes de qualquer ajuste, abra")
+                print(f"    as amostras de '{disse}' no painel e confira de quem")
+                print("    é o rosto nelas. Cadastro feito na frente da câmera")
+                print("    com outra pessoa em quadro pode ter capturado a")
+                print("    pessoa errada — e aí a galeria de um contém o rosto")
+                print("    do outro, o que produz exatamente este padrão.")
+    if sem_alvo:
+        print(f"\n  {sem_alvo} erro(s) sem dizer de quem era. Informar a pessoa")
+        print("  certa ao marcar transforma o rótulo em par (detecção -> quem")
+        print("  é), que é o que permite medir; só 'errado' diz o que NÃO é.")
+
+
 def sugerir(deteccoes: list[dict], labels: dict, origem: dict,
             limiar_atual: float) -> None:
     por_chave = {chave(d): d for d in deteccoes}
@@ -272,11 +389,27 @@ def sugerir(deteccoes: list[dict], labels: dict, origem: dict,
     pior_erro, pior_acerto = max(errados), min(certos)
     if pior_erro < pior_acerto:
         sugerido = round((pior_erro + pior_acerto) / 2, 3)
+        margem = pior_acerto - pior_erro
         print(f"\n  As duas distribuições estão SEPARADAS "
               f"({pior_erro:.3f} < {pior_acerto:.3f}).")
         print(f"  Limiar sugerido: {sugerido}   (atual: {limiar_atual})")
+        print(f"  Margem: {margem:.3f} entre o pior erro e o pior acerto.")
         print("  Ponto médio: fica o mais longe possível do pior caso de cada")
         print("  lado, o que dá a maior tolerância a variação futura.")
+
+        # A margem é a medida de QUALIDADE da calibração, e ela costuma
+        # ENCOLHER conforme se rotula mais. Isso não é piora: é o estimador
+        # encontrando casos difíceis que já existiam e ainda não tinham
+        # aparecido. Margem larga com poucos rótulos é falsa sensação de
+        # folga — daí o aviso.
+        if margem < 0.05:
+            print("\n  ⚠ Margem estreita: qualquer variação de luz ou ângulo")
+            print("    atravessa esse vão. Trate o limiar como provisório e")
+            print("    priorize melhorar cadastro e enquadramento.")
+        if len(errados) < 5 or len(certos) < 10:
+            print("\n  Base ainda pequena. Conforme você conferir mais, essa")
+            print("    margem tende a ENCOLHER — é o esperado, e significa que")
+            print("    o número está ficando mais realista, não pior.")
         print("\n  No config.yaml:")
         print("    recognition:")
         print(f"      cosine_threshold: {sugerido}")
@@ -339,11 +472,13 @@ def main() -> int:
     if args.simular is not None:
         simular(db, cfg, args.limite, args.simular)
     elif args.review:
-        deteccoes = relatorio(db, cfg, args.limite)
+        deteccoes = incluir_rotuladas(db, relatorio(db, cfg, args.limite))
         review(db, cfg, deteccoes, _local_ip(), porta)
     else:
         deteccoes = relatorio(db, cfg, args.limite)
+        deteccoes = incluir_rotuladas(db, deteccoes)
         labels, origem = juntar_rotulos(db, deteccoes)
+        cobertura(db, deteccoes, labels, origem)
         sugerir(deteccoes, labels, origem, float(cfg.recognition.cosine_threshold))
     return 0
 

@@ -2326,15 +2326,24 @@ def rotulos_ficam_no_banco_e_nao_mexem_na_presenca():
     assert depois["correcoes"]["total"] == antes["correcoes"]["total"], \
         "rótulo não é correção de chamada"
 
-    # o rótulo aparece na listagem
+    # Marcada como errada SEM dizer de quem é, a detecção sai da lista da
+    # pessoa e vai para o balde dos sem identidade. (Antes ela permanecia na
+    # lista, só com uma marca — e a revisão nunca convergia.)
     lista = c.get("/detections", params={"person_id": alfa}).json()["deteccoes"]
-    marcado = {d["id"]: d["rotulo"] for d in lista if d["fonte"] == "evento"}
-    assert marcado[e2] == "errado" and marcado[e1] is None, marcado
+    ids_alfa = {d["id"] for d in lista if d["fonte"] == "evento"}
+    assert ids_alfa == {e1}, f"a marcada devia ter saído: {ids_alfa}"
+    assert all(d["rotulo"] is None for d in lista), lista
 
-    # desfazer
+    sem_id = c.get("/detections", params={"person_id": -1}).json()["deteccoes"]
+    marcada = next(d for d in sem_id
+                   if d["fonte"] == "evento" and d["id"] == e2)
+    assert marcada["rotulo"] == "errado", marcada
+
+    # desfazer devolve para quem o sistema tinha dito
     c.request("DELETE", "/detections/label",
               params={"fonte": "evento", "detection_id": e2})
     lista = c.get("/detections", params={"person_id": alfa}).json()["deteccoes"]
+    assert {d["id"] for d in lista if d["fonte"] == "evento"} == {e1, e2}
     assert all(d["rotulo"] is None for d in lista), lista
 
     # valor inválido é recusado, não gravado torto
@@ -2355,6 +2364,302 @@ def rotulos_ficam_no_banco_e_nao_mexem_na_presenca():
     assert origem["manual"] >= 1, origem
     return ("duas origens numa lista só; filtro por pessoa; rótulo no banco "
             "sem tocar na presença; manual vence o derivado")
+
+
+@teste
+def cadastro_avisa_quando_ha_mais_de_um_rosto():
+    """Com duas pessoas em cena, a captura pega a ERRADA sem avisar.
+
+    O preview desenhava todos os rostos iguais, e a captura usa `best_face` —
+    o maior do quadro, normalmente quem está mais perto da câmera, que é quem
+    está operando o computador, não quem está sendo cadastrado. O resultado
+    real: uma galeria inteira com o rosto de outra pessoa, descoberta semanas
+    depois como 75 confusões do mesmo par.
+    """
+    try:
+        import fastapi.testclient  # noqa: F401
+    except ImportError:
+        return "PULADO: fastapi.testclient indisponível"
+
+    import importlib
+    c, pasta = _api_cliente("dois_rostos", host="127.0.0.1")
+    api = importlib.import_module("api")
+
+    # Engine com DOIS rostos: um grande (perto) e um pequeno (a pessoa certa)
+    grande = face_em(300, 200, 160)
+    pequeno = face_em(60, 80, 70)
+
+    class DoisRostos:
+        cosine_threshold = 0.5
+
+        def __init__(self, cfg=None):
+            pass
+
+        def detect(self, img):
+            return [pequeno, grande]
+
+        @staticmethod
+        def best_face(fs):
+            return max(fs, key=lambda f: float(f[2]) * float(f[3])) if fs else None
+
+        def embed(self, img, f):
+            v = np.zeros(128, np.float32)
+            v[0] = 1.0
+            return v
+
+        def match(self, v, m, ids):
+            return None, 0.0
+
+    api.engine = DoisRostos()
+
+    sid = c.post("/enroll/start", json={"name": "Lais"}).json()["session_id"]
+    r = c.post("/enroll/capture", json={"session_id": sid}).json()
+    assert r["ok"], r
+    assert r.get("aviso"), "captura com 2 rostos tem que avisar"
+    assert "MAIOR" in r["aviso"], r["aviso"]
+
+    # O preview marca qual será capturado, em vez de desenhar todos iguais
+    resp = c.get("/enroll/preview")
+    assert resp.status_code == 200, resp.text
+    assert resp.headers.get("X-Rostos") == "2", resp.headers
+
+    # Com um rosto só, nada de aviso — senão vira ruído que ninguém lê
+    class UmRosto(DoisRostos):
+        def detect(self, img):
+            return [grande]
+
+    api.engine = UmRosto()
+    r2 = c.post("/enroll/capture", json={"session_id": sid}).json()
+    assert r2["ok"] and not r2.get("aviso"), r2
+    assert c.get("/enroll/preview").headers.get("X-Rostos") == "1"
+    return ("captura com 2 rostos avisa que pegou o maior; preview conta os "
+            "rostos; com 1 rosto não há ruído")
+
+
+@teste
+def calibracao_nao_perde_rotulo_fora_da_janela():
+    """Rótulo antigo não pode sumir porque o worker gerou eventos depois.
+
+    O relatório analisa as N detecções mais recentes — certo para o
+    histograma. Mas o limiar depende dos RÓTULOS, e cada rótulo é alguém que
+    olhou uma foto e decidiu. Marcar 30 erros e depois deixar o worker rodando
+    fazia as marcações saírem da janela e serem ignoradas EM SILÊNCIO: o
+    relatório dizia "30 manuais" e usava zero, resultando em "0 erros" e
+    nenhuma sugestão possível.
+    """
+    import io
+    from contextlib import redirect_stdout
+    from scripts.calibrate_threshold import (incluir_rotuladas, juntar_rotulos,
+                                             sugerir)
+
+    db, ids, trilha = _banco_recall("janela")
+    alfa, beta = ids["Alfa"], ids["Beta"]
+    hoje = time.strftime("%Y-%m-%d")
+    base = time.mktime(time.strptime(f"{hoje} 06:00:00", "%Y-%m-%d %H:%M:%S"))
+
+    antigos = []
+    for i in range(5):
+        eid = db.add_event(alfa, "Alfa", 0.40 + i * 0.01, f"v{i}.jpg", 1,
+                           ts=base + i)
+        db.set_detection_label("evento", eid, "errado", "Operador",
+                               pessoa_correta=beta)
+        antigos.append(eid)
+    for i in range(40):
+        db.add_event(alfa, "Alfa", 0.75, f"n{i}.jpg", 1, ts=base + 3600 + i)
+    db.close_attendance(hoje, "Operador", 1, 0)
+
+    # A janela estreita (20) deixa os 5 antigos de fora, como no caso real.
+    janela = db.list_detections(limit=20)
+    assert not ({f"evento:{e}" for e in antigos}
+                & {f"evento:{d['id']}" for d in janela
+                   if d["fonte"] == "evento"}), "cenário inválido"
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        completo = incluir_rotuladas(db, janela)
+    assert len(completo) == len(janela) + 5, len(completo)
+    assert "fora da janela" in buf.getvalue(), buf.getvalue()
+
+    labels, origem = juntar_rotulos(db, completo)
+    assert origem["manual"] == 5, origem
+    assert origem["orfaos"] == 0, origem
+
+    buf2 = io.StringIO()
+    with redirect_stdout(buf2):
+        sugerir(completo, labels, origem, 0.363)
+    saida = buf2.getvalue()
+    assert "erros: 5" in saida, saida
+    assert "SEPARADAS" in saida, saida
+
+    # Sem a inclusão, o mesmo cenário produzia zero erro e nenhuma sugestão —
+    # exatamente a saída confusa que motivou a correção.
+    labels_curto, origem_curto = juntar_rotulos(db, janela)
+    buf3 = io.StringIO()
+    with redirect_stdout(buf3):
+        sugerir(janela, labels_curto, origem_curto, 0.363)
+    assert "erros: 0" in buf3.getvalue()
+    # e a contagem não pode mais MENTIR dizendo que há manuais em uso
+    assert origem_curto["manual"] == 0, origem_curto
+    assert origem_curto["orfaos"] == 5, origem_curto
+    return ("rótulo fora da janela é recuperado; contagem de 'manuais' passa "
+            "a refletir só o que entra no cálculo")
+
+
+@teste
+def calibracao_mostra_cobertura_e_confusoes():
+    """Responde 'minhas marcações adiantaram?' — cobertura, margem e pares."""
+    import io
+    from contextlib import redirect_stdout
+    from scripts.calibrate_threshold import cobertura, sugerir
+
+    db, ids, trilha = _banco_recall("cobertura")
+    # 6 detecções: 3 conferidas certas, 2 corrigidas para outra pessoa,
+    # 1 marcada errada sem dizer de quem é.
+    det, labels = [], {}
+    for i, s in enumerate((0.80, 0.78, 0.76)):
+        det.append({"fonte": "evento", "id": i + 1, "score": s, "name": "Alfa"})
+        labels[f"evento:{i + 1}"] = "certo"
+    for i, (s, alvo) in enumerate(((0.44, ids["Beta"]), (0.41, ids["Beta"]),
+                                   (0.39, None)), start=4):
+        det.append({"fonte": "evento", "id": i, "score": s, "name": "Alfa"})
+        labels[f"evento:{i}"] = "errado"
+        db.set_detection_label("evento", i, "errado", "Operador",
+                               pessoa_correta=alvo)
+
+    origem = {"chamada": 3, "manual": 3, "total": 6}
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        cobertura(db, det, labels, origem)
+        sugerir(det, labels, origem, 0.363)
+    saida = buf.getvalue()
+
+    assert "6 de 6 detecções conferidas (100%)" in saida, saida
+    assert "3 acerto(s), 3 erro(s)" in saida, saida
+    # O par confundido é a informação mais acionável: aponta quem recadastrar
+    assert "Alfa -> Beta: 2x" in saida, saida
+    assert "1 erro(s) sem dizer de quem era" in saida, saida
+    # Margem: 0.76 - 0.44 = 0.32
+    assert "Margem: 0.320" in saida, saida
+    assert "0.6" in saida, "ponto médio entre 0.44 e 0.76"
+
+    # Sem correção de identidade, não inventa par de confusão
+    buf2 = io.StringIO()
+    with redirect_stdout(buf2):
+        cobertura(db, det[:3], {k: labels[k] for k in list(labels)[:3]},
+                  {"chamada": 3, "manual": 0, "total": 3})
+    assert "Confusões identificadas" not in buf2.getvalue(), buf2.getvalue()
+    return ("cobertura em %, veredito, pares confundidos, erros sem alvo "
+            "e margem entre as distribuições")
+
+
+@teste
+def correcao_move_a_deteccao_para_a_pessoa_certa():
+    """Marcar 'não é ela, é a fulana' tira da lista de uma e põe na da outra.
+
+    Sem isso, marcar erro não limpava nada: o rosto errado continuava
+    aparecendo sob o nome errado e a revisão nunca convergia.
+    """
+    try:
+        import fastapi.testclient  # noqa: F401
+    except ImportError:
+        return "PULADO: fastapi.testclient indisponível"
+
+    import importlib
+    c, _ = _api_cliente("correcao", host="127.0.0.1")
+    api = importlib.import_module("api")
+    db = api.db
+
+    alfa = db.add_person("Alfa")
+    beta = db.add_person("Beta")
+    e1 = db.add_event(alfa, "Alfa", 0.90, "20260101/a.jpg", 1)
+    e2 = db.add_event(alfa, "Alfa", 0.41, "20260101/b.jpg", 1)   # na verdade Beta
+    e3 = db.add_event(alfa, "Alfa", 0.38, "20260101/c.jpg", 1)   # nem é aluno
+    db.add_event(None, "Desconhecido", 0.20, "20260101/d.jpg", 0)
+
+    def ids(person_id):
+        r = c.get("/detections", params={"person_id": person_id}).json()
+        return {d["id"] for d in r["deteccoes"] if d["fonte"] == "evento"}
+
+    assert ids(alfa) == {e1, e2, e3}, ids(alfa)
+    assert ids(beta) == set()
+
+    # "não é a Alfa, é a Beta"
+    r = c.post("/detections/label", json={
+        "fonte": "evento", "detection_id": e2, "rotulo": "errado",
+        "pessoa_correta": beta, "autor": "Operador"})
+    assert r.status_code == 200, r.text
+
+    # "não é a Alfa, e não é ninguém cadastrado"
+    c.post("/detections/label", json={
+        "fonte": "evento", "detection_id": e3, "rotulo": "errado",
+        "pessoa_correta": None})
+
+    assert ids(alfa) == {e1}, "a corrigida tinha que sair da lista da Alfa"
+    assert ids(beta) == {e2}, "e entrar na da Beta"
+
+    # O balde de desconhecidos junta os não reconhecidos e os marcados como
+    # não cadastrados — é onde se procura quem passou e o sistema não conhece.
+    desc = c.get("/detections", params={"person_id": -1}).json()["deteccoes"]
+    assert e3 in {d["id"] for d in desc}, "marcado 'não cadastrado' devia ir p/ lá"
+    assert any(not d["is_known"] for d in desc), "e os não reconhecidos também"
+    assert e1 not in {d["id"] for d in desc}
+
+    # A correção viaja no payload, para a tela poder mostrar
+    d2 = next(d for d in c.get("/detections").json()["deteccoes"]
+              if d["id"] == e2 and d["fonte"] == "evento")
+    assert d2["rotulo"] == "errado" and d2["efetivo_nome"] == "Beta", d2
+
+    # Pessoa inexistente é recusada, não gravada torta
+    assert c.post("/detections/label", json={
+        "fonte": "evento", "detection_id": e1, "rotulo": "errado",
+        "pessoa_correta": 99999}).status_code == 400
+
+    # 'certo' não carrega alvo: estado contraditório esperando para confundir
+    db.set_detection_label("evento", e1, "certo", "x", pessoa_correta=beta)
+    with db._connect() as con:
+        alvo = con.execute("SELECT pessoa_correta FROM detection_labels "
+                           "WHERE fonte='evento' AND detection_id=?",
+                           (e1,)).fetchone()[0]
+    assert alvo is None, "acerto não pode guardar 'pessoa correta'"
+
+    # Desfazer devolve a detecção para quem o sistema disse
+    c.request("DELETE", "/detections/label",
+              params={"fonte": "evento", "detection_id": e2})
+    assert ids(alfa) == {e1, e2}, "desfazer devia trazer de volta"
+    return ("corrigida muda de lista; balde de desconhecidos; alvo inválido "
+            "recusado; acerto não guarda alvo; desfazer reverte")
+
+
+@teste
+def chamada_ignora_foto_marcada_como_errada():
+    """A 'melhor captura' não pode ser uma foto que alguém disse não ser dela."""
+    try:
+        import fastapi.testclient  # noqa: F401
+    except ImportError:
+        return "PULADO: fastapi.testclient indisponível"
+
+    import importlib
+    c, _ = _api_cliente("foto_errada", host="127.0.0.1")
+    api = importlib.import_module("api")
+    db = api.db
+
+    hoje = time.strftime("%Y-%m-%d")
+    alfa = db.add_person("Alfa")
+    alta = db.add_event(alfa, "Alfa", 0.95, "20260101/alta.jpg", 1)
+    db.add_event(alfa, "Alfa", 0.60, "20260101/media.jpg", 1)
+
+    d = c.get("/attendance", params={"dia": hoje}).json()
+    p = next(x for x in d["presentes"] if x["nome"] == "Alfa")
+    assert p["foto_url"].endswith("alta.jpg"), p
+
+    # A de maior score era de outra pessoa: a foto tem que passar para a
+    # próxima, senão a chamada contradiz a própria conferência.
+    c.post("/detections/label", json={"fonte": "evento", "detection_id": alta,
+                                      "rotulo": "errado"})
+    d = c.get("/attendance", params={"dia": hoje}).json()
+    p = next(x for x in d["presentes"] if x["nome"] == "Alfa")
+    assert p["foto_url"].endswith("media.jpg"), p
+    return "foto marcada como errada deixa de ser a melhor captura do dia"
 
 
 @teste

@@ -250,7 +250,10 @@ def loop_realtime(cfg, engine, db, live_path, cam, modo_fixo=False):
                 last_seen[key] = now
 
                 snapshot = store.save(live if live is not None else frame, name)
-                db.add_event(pid, name, score, snapshot, known)
+                # `now` é o instante do frame, o mesmo usado no cooldown acima.
+                # Deixar o banco carimbar a hora do insert somaria a latência
+                # do processamento ao horário da passagem.
+                db.add_event(pid, name, score, snapshot, known, ts=now)
                 print(f"[evento] {name} (score={score:.3f}) -> {snapshot}", flush=True)
 
             if live is not None and now - last_live > LIVE_WRITE_SECONDS:

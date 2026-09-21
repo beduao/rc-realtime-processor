@@ -83,9 +83,22 @@ function desenharLupa() {
   const acoes = $("#lupa-acoes");
   acoes.innerHTML = "";
   for (const a of it.acoes || []) {
-    const b = criar("button", { textContent: a.rotulo, className: a.classe || "" });
-    b.addEventListener("click", async () => { await a.aoClicar(); });
-    acoes.append(b);
+    if (a.tipo === "escolha") {
+      // Seletor + botão: usado para dizer DE QUEM é o rosto ao marcar erro.
+      const sel = criar("select");
+      for (const o of a.opcoes) {
+        sel.append(criar("option", { value: o.valor, textContent: o.rotulo }));
+      }
+      const b = criar("button", { textContent: a.rotulo,
+                                  className: a.classe || "" });
+      b.addEventListener("click", () => a.aoClicar(sel.value));
+      acoes.append(sel, b);
+    } else {
+      const b = criar("button", { textContent: a.rotulo,
+                                  className: a.classe || "" });
+      b.addEventListener("click", async () => { await a.aoClicar(); });
+      acoes.append(b);
+    }
   }
 }
 
@@ -475,10 +488,23 @@ async function carregarDeteccoes() {
  * e sem revisão marcada a calibração não tem teto para o limiar. */
 let deteccoesNaTela = [];
 
-async function marcarErro(d) {
+/* `pessoaCorreta`: id de quem é de verdade, ou null para "não é ninguém
+ * cadastrado". A distinção importa — null manda a detecção para o balde
+ * Desconhecido, que é onde se procura quem passou e o sistema não conhece. */
+async function marcarErro(d, pessoaCorreta = null) {
   await api("/detections/label", { metodo: "POST", corpo: {
     fonte: d.fonte, detection_id: d.id, rotulo: "errado",
+    pessoa_correta: pessoaCorreta,
     autor: $("#autor").value.trim() } });
+}
+
+function opcoesDeIdentidade(excluir) {
+  const ops = [{ valor: "", rotulo: "— quem é? —" }];
+  for (const p of pessoas) {
+    if (p.id !== excluir) ops.push({ valor: String(p.id), rotulo: p.name });
+  }
+  ops.push({ valor: "desconhecido", rotulo: "Não é ninguém cadastrado" });
+  return ops;
 }
 
 async function desmarcarErro(d) {
@@ -493,17 +519,22 @@ function abrirLupaDeDeteccoes(alvo) {
     titulo: `${d.nome} · ${d.score.toFixed(2)}`,
     meta: `${d.quando.slice(0, 10)} ${d.quando.slice(11, 19)} · ` +
           `${d.fonte === "trilha" ? "lote" : "ao vivo"}` +
-          (d.rotulo === "errado" ? " · marcada como erro" : ""),
+          (d.rotulo === "errado"
+            ? ` · corrigido: ${d.efetivo_nome || "não cadastrado"}` : ""),
     acoes: !d.is_known ? [] : [d.rotulo === "errado" ? {
       rotulo: "Desfazer marcação",
       aoClicar: async () => { await desmarcarErro(d); fecharLupa(); carregarDeteccoes(); },
     } : {
+      tipo: "escolha",
       rotulo: "Não é essa pessoa",
       classe: "perigo",
+      opcoes: opcoesDeIdentidade(d.person_id),
       // Segue para a próxima em vez de fechar: revisão em lote fica fluida,
       // e é assim que se acumula o rótulo de erro que a calibração precisa.
-      aoClicar: async () => {
-        await marcarErro(d);
+      aoClicar: async (valor) => {
+        const alvo = valor === "desconhecido" ? null
+                   : valor ? Number(valor) : null;
+        await marcarErro(d, alvo);
         d.rotulo = "errado";
         if (lupa.i < lupa.itens.length - 1) andarLupa(1); else desenharLupa();
       },
@@ -528,6 +559,11 @@ function cartaoDeteccao(d) {
     textContent: `${d.is_known ? "" : "? "}${d.nome} · ${d.score.toFixed(2)}` }));
   info.append(criar("div", { className: "meta",
     textContent: `${d.quando.slice(11, 19)} · ${d.fonte === "trilha" ? "lote" : "ao vivo"}` }));
+  if (d.rotulo === "errado") {
+    info.append(criar("div", { className: "redundante",
+      textContent: d.efetivo_nome ? `corrigido: é ${d.efetivo_nome}`
+                                  : "corrigido: não cadastrado" }));
+  }
   c.append(info);
 
   if (d.rotulo === "errado") {
@@ -538,11 +574,10 @@ function cartaoDeteccao(d) {
     });
     c.append(b);
   } else if (d.is_known) {
+    // No cartão, abre a lupa: dizer de quem é o rosto exige VER o rosto, e
+    // decidir isso numa miniatura de 155px é adivinhação.
     const b = criar("button", { textContent: "não é essa pessoa" });
-    b.addEventListener("click", async () => {
-      await marcarErro(d);
-      carregarDeteccoes();
-    });
+    b.addEventListener("click", () => abrirLupaDeDeteccoes(d));
     c.append(b);
   }
   return c;
@@ -643,6 +678,7 @@ $("#cad-capturar").addEventListener("click", async () => {
       session_id: sessaoCad.session_id } });
     if (r.ok) {
       desenharCadastro(r.samples);
+      if (r.aviso) { erro.textContent = r.aviso; erro.hidden = false; }
     } else {
       // A API explica o motivo (sem rosto, sem imagem, conflito de câmera).
       // Repassar em vez de inventar texto genérico foi a lição do painel
@@ -706,6 +742,9 @@ async function recarregarListasDePessoas() {
   const antes = f.value;
   f.innerHTML = "";
   f.append(criar("option", { value: "0", textContent: "Todas" }));
+  // -1 junta os não reconhecidos e os marcados como "não é ninguém
+  // cadastrado". É onde se procura quem passou e o sistema não conhece.
+  f.append(criar("option", { value: "-1", textContent: "Desconhecido" }));
   for (const p of pessoas) {
     f.append(criar("option", { value: p.id,
       textContent: `${p.name} (${p.embeddings} amostra(s))` }));
@@ -882,6 +921,7 @@ $("#add-amostra").addEventListener("click", async () => {
     const r = await api(`/people/${pessoaAtual.id}/samples`, { metodo: "POST" });
     if (r.ok) {
       await recarregarListasDePessoas();
+      if (r.aviso) { erro.textContent = r.aviso; erro.hidden = false; }
     } else {
       erro.textContent = r.message || "não capturou";
       erro.hidden = false;

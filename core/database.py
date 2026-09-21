@@ -172,12 +172,20 @@ class Database:
                 -- acerto do reconhecimento; decidir quem esteve na escola é a
                 -- aba Chamada. Misturar faria uma revisão de fotos mexer na
                 -- frequência do aluno sem que ninguém pedisse.
+                -- `pessoa_correta` guarda QUEM de fato é, quando se sabe. A
+                -- semântica, com rotulo='errado':
+                --   pessoa_correta = N     -> é a pessoa N
+                --   pessoa_correta = NULL  -> não é ninguém cadastrado
+                -- Isso transforma o rótulo de um binário em par
+                -- (detecção -> identidade real), que é o que permite medir de
+                -- verdade: sem o alvo, "errado" só diz o que NÃO é.
                 CREATE TABLE IF NOT EXISTS detection_labels (
-                    fonte        TEXT    NOT NULL,   -- 'evento' | 'trilha'
-                    detection_id INTEGER NOT NULL,
-                    rotulo       TEXT    NOT NULL,   -- 'certo' | 'errado'
-                    autor        TEXT,
-                    created_at   REAL    NOT NULL,
+                    fonte          TEXT    NOT NULL,  -- 'evento' | 'trilha'
+                    detection_id   INTEGER NOT NULL,
+                    rotulo         TEXT    NOT NULL,  -- 'certo' | 'errado'
+                    pessoa_correta INTEGER,
+                    autor          TEXT,
+                    created_at     REAL    NOT NULL,
                     PRIMARY KEY (fonte, detection_id)
                 );
                 """
@@ -210,6 +218,13 @@ class Database:
             # continua lá, intacto, para o caso de o Censo Escolar voltar a
             # ser necessário. Remover coluna em SQLite é operação destrutiva
             # e o ganho seria só estético.
+            # Rótulo ganhou o alvo da correção depois de existir.
+            rot = {r["name"] for r in con.execute(
+                "PRAGMA table_info(detection_labels)")}
+            if rot and "pessoa_correta" not in rot:
+                con.execute("ALTER TABLE detection_labels "
+                            "ADD COLUMN pessoa_correta INTEGER")
+
             pessoas = {r["name"] for r in con.execute("PRAGMA table_info(people)")}
             if "matricula" not in pessoas:
                 con.execute("ALTER TABLE people ADD COLUMN matricula TEXT")
@@ -406,14 +421,32 @@ class Database:
         return Gallery(matrix=matrix, ids=ids, names=names)
 
     # ---- eventos --------------------------------------------------------------
-    def add_event(self, person_id, name, score, snapshot_path, is_known) -> int:
+    def add_event(self, person_id, name, score, snapshot_path, is_known,
+                  ts: float = None) -> int:
+        """Registra um reconhecimento. `ts` é o instante da OBSERVAÇÃO.
+
+        Quando omitido usa a hora do insert, o que embute a latência do
+        processamento — embedding, anotação e gravação do JPEG — no horário
+        registrado. São centenas de milissegundos que:
+
+          - deslocam o horário da passagem, que é o dado que a chamada expõe;
+          - fazem o intervalo entre eventos gravados ficar MENOR que o
+            `event_cooldown_seconds`, porque o cooldown é medido no início do
+            frame e o `ts` no fim. Era a causa da instabilidade do teste do
+            worker: intervalos de 0.28 s com cooldown de 0.3 s.
+
+        O worker passa o instante do frame. O padrão continua existindo para
+        quem grava fora do laço (testes, scripts).
+        """
         with self._connect() as con:
             cur = con.execute(
                 """
                 INSERT INTO events(person_id, name, score, ts, snapshot_path, is_known)
                 VALUES(?, ?, ?, ?, ?, ?)
                 """,
-                (person_id, name, float(score), time.time(), snapshot_path, 1 if is_known else 0),
+                (person_id, name, float(score),
+                 time.time() if ts is None else float(ts),
+                 snapshot_path, 1 if is_known else 0),
             )
             return int(cur.lastrowid)
 
@@ -534,73 +567,114 @@ class Database:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    # Valor de `person_id` que seleciona quem NÃO é ninguém cadastrado.
+    DESCONHECIDO = -1
+
     def deteccoes_de(self, person_id=None, inicio: float = None,
                      fim: float = None, limit: int = 200) -> list[dict]:
-        """Detecções das duas origens, com filtro opcional de pessoa e período.
+        """Detecções das duas origens, filtráveis pela identidade CORRIGIDA.
 
         A aba de reconhecimentos lia só `events`, e por isso ficava vazia no
         modo captura — o modo que roda na escola. Aqui as duas origens vêm
-        juntas, com `fonte` distinguindo, e cada uma já traz a foto e a base
-        correta (elas ficam em diretórios diferentes).
+        juntas, com `fonte` distinguindo, e cada uma já traz a foto.
 
-        `person_id=None` traz todo mundo, inclusive os desconhecidos, que são
-        justamente os que interessam quando se suspeita de falso negativo.
+        **O filtro usa a identidade efetiva, não a que o sistema afirmou.**
+        Quando alguém marca "não é essa pessoa, é a fulana", a detecção sai da
+        lista de quem o sistema disse e entra na da fulana. Sem isso, marcar
+        erro não limpava nada: o rosto errado continuava aparecendo sob o nome
+        errado, e a revisão não convergia nunca.
+
+            efetivo = pessoa_correta, quando o rótulo diz 'errado'
+                      person_id do sistema, caso contrário
+
+        `person_id=None` traz todos. `DESCONHECIDO` traz quem ficou sem
+        identidade — os não reconhecidos pelo sistema e também os que foram
+        marcados como "não é ninguém cadastrado". Esse balde é o que permite
+        procurar falso negativo: quem está lá deveria estar em algum nome.
         """
-        cond_t = ["t.status = 'processado'"]
-        cond_e = ["1=1"]
-        args_t, args_e = [], []
-        if person_id is not None:
-            cond_t.append("t.person_id = ?")
-            cond_e.append("person_id = ?")
-            args_t.append(int(person_id))
-            args_e.append(int(person_id))
+        cond, args = [], []
         if inicio is not None:
-            cond_t.append("t.started_at >= ?")
-            cond_e.append("ts >= ?")
-            args_t.append(inicio)
-            args_e.append(inicio)
+            cond.append("ts >= ?")
+            args.append(inicio)
         if fim is not None:
-            cond_t.append("t.started_at < ?")
-            cond_e.append("ts < ?")
-            args_t.append(fim)
-            args_e.append(fim)
+            cond.append("ts < ?")
+            args.append(fim)
+        if person_id is not None:
+            if int(person_id) == self.DESCONHECIDO:
+                cond.append("efetivo IS NULL")
+            else:
+                cond.append("efetivo = ?")
+                args.append(int(person_id))
+        onde = ("WHERE " + " AND ".join(cond)) if cond else ""
 
+        # O LEFT JOIN traz o rótulo de cada detecção; `efetivo` é calculado na
+        # subconsulta para poder ser filtrado e ordenado do lado de fora. O
+        # LIMIT fica DEPOIS do filtro — aplicá-lo antes devolveria menos linhas
+        # que o pedido sempre que houvesse correção no meio.
         sql = f"""
-            SELECT 'trilha' AS fonte, t.id, t.person_id, t.name, t.score,
-                   t.started_at AS ts,
-                   (SELECT path FROM track_crops c WHERE c.track_id = t.id
-                     ORDER BY quality DESC LIMIT 1) AS foto,
-                   CASE WHEN t.person_id IS NOT NULL THEN 1 ELSE 0 END AS is_known
-            FROM tracks t WHERE {' AND '.join(cond_t)}
-            UNION ALL
-            SELECT 'evento' AS fonte, id, person_id, name, score, ts,
-                   snapshot_path AS foto, is_known
-            FROM events WHERE {' AND '.join(cond_e)}
+            SELECT * FROM (
+                SELECT 'trilha' AS fonte, t.id, t.person_id, t.name, t.score,
+                       t.started_at AS ts,
+                       (SELECT path FROM track_crops c WHERE c.track_id = t.id
+                         ORDER BY quality DESC LIMIT 1) AS foto,
+                       CASE WHEN t.person_id IS NOT NULL THEN 1 ELSE 0 END
+                           AS is_known,
+                       l.rotulo, l.pessoa_correta,
+                       CASE WHEN l.rotulo = 'errado' THEN l.pessoa_correta
+                            ELSE t.person_id END AS efetivo
+                FROM tracks t
+                LEFT JOIN detection_labels l
+                       ON l.fonte = 'trilha' AND l.detection_id = t.id
+                WHERE t.status = 'processado'
+                UNION ALL
+                SELECT 'evento' AS fonte, e.id, e.person_id, e.name, e.score,
+                       e.ts, e.snapshot_path AS foto, e.is_known,
+                       l.rotulo, l.pessoa_correta,
+                       CASE WHEN l.rotulo = 'errado' THEN l.pessoa_correta
+                            ELSE e.person_id END AS efetivo
+                FROM events e
+                LEFT JOIN detection_labels l
+                       ON l.fonte = 'evento' AND l.detection_id = e.id
+            )
+            {onde}
             ORDER BY ts DESC LIMIT ?
         """
         with self._connect() as con:
-            rows = con.execute(sql, (*args_t, *args_e, int(limit))).fetchall()
+            rows = con.execute(sql, (*args, int(limit))).fetchall()
         return [dict(r) for r in rows]
 
     # ---- rótulos por detecção -------------------------------------------------
     def set_detection_label(self, fonte: str, detection_id: int, rotulo: str,
-                            autor: str = "") -> None:
-        """Marca uma detecção como 'certo' ou 'errado'."""
+                            autor: str = "", pessoa_correta=None) -> None:
+        """Marca uma detecção como 'certo' ou 'errado'.
+
+        `pessoa_correta` só faz sentido com 'errado', e NULL ali significa
+        "não é ninguém cadastrado" — diferente de "não sei", que seria não
+        rotular. Com 'certo' é forçado a NULL: guardar alvo num acerto criaria
+        um estado contraditório esperando para confundir alguém.
+        """
         if rotulo not in ("certo", "errado"):
             raise ValueError("rotulo deve ser 'certo' ou 'errado'")
         if fonte not in ("evento", "trilha"):
             raise ValueError("fonte deve ser 'evento' ou 'trilha'")
+        alvo = None
+        if rotulo == "errado" and pessoa_correta is not None:
+            alvo = int(pessoa_correta)
+            if self.get_person(alvo) is None:
+                raise ValueError(f"pessoa {alvo} não existe")
         with self._connect() as con:
             con.execute(
                 """
                 INSERT INTO detection_labels
-                       (fonte, detection_id, rotulo, autor, created_at)
-                VALUES (?, ?, ?, ?, ?)
+                       (fonte, detection_id, rotulo, pessoa_correta, autor,
+                        created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(fonte, detection_id) DO UPDATE SET
-                    rotulo=excluded.rotulo, autor=excluded.autor,
-                    created_at=excluded.created_at
+                    rotulo=excluded.rotulo,
+                    pessoa_correta=excluded.pessoa_correta,
+                    autor=excluded.autor, created_at=excluded.created_at
                 """,
-                (fonte, int(detection_id), rotulo, autor, time.time()),
+                (fonte, int(detection_id), rotulo, alvo, autor, time.time()),
             )
 
     def remove_detection_label(self, fonte: str, detection_id: int) -> int:
@@ -615,6 +689,64 @@ class Database:
             return {f"{r['fonte']}:{r['detection_id']}": r["rotulo"]
                     for r in con.execute(
                         "SELECT fonte, detection_id, rotulo FROM detection_labels")}
+
+    def detections_by_keys(self, chaves) -> list[dict]:
+        """Busca detecções específicas por "fonte:id", fora de qualquer janela.
+
+        `list_detections` devolve as N mais recentes, o que serve para o
+        histograma mas descarta rótulo antigo. E rótulo é caro: cada um é
+        alguém olhando uma foto e decidindo. Perder isso porque o worker
+        gerou mais eventos depois é inaceitável — foi o que aconteceu, com
+        211 marcações ignoradas em silêncio.
+        """
+        por_fonte = {"evento": [], "trilha": []}
+        for c in chaves:
+            fonte, _, ident = str(c).partition(":")
+            if fonte in por_fonte and ident.isdigit():
+                por_fonte[fonte].append(int(ident))
+        if not por_fonte["evento"] and not por_fonte["trilha"]:
+            return []
+
+        linhas = []
+        with self._connect() as con:
+            if por_fonte["evento"]:
+                marcas = ",".join("?" * len(por_fonte["evento"]))
+                linhas += [dict(r) for r in con.execute(
+                    f"""SELECT 'evento' AS fonte, id, person_id, name, score, ts,
+                               snapshot_path, is_known
+                        FROM events WHERE id IN ({marcas})""",
+                    por_fonte["evento"])]
+            if por_fonte["trilha"]:
+                marcas = ",".join("?" * len(por_fonte["trilha"]))
+                linhas += [dict(r) for r in con.execute(
+                    f"""SELECT 'trilha' AS fonte, t.id, t.person_id, t.name,
+                               t.score, t.started_at AS ts,
+                               (SELECT path FROM track_crops c
+                                 WHERE c.track_id = t.id
+                                 ORDER BY quality DESC LIMIT 1) AS snapshot_path,
+                               CASE WHEN t.person_id IS NOT NULL THEN 1 ELSE 0 END
+                                   AS is_known
+                        FROM tracks t WHERE t.id IN ({marcas})""",
+                    por_fonte["trilha"])]
+        return linhas
+
+    def detection_labels_detalhados(self) -> dict:
+        """{"fonte:id": {rotulo, pessoa_correta, nome_correto, autor}}.
+
+        A versão simples basta para calcular o limiar, que só precisa do
+        binário. Esta existe para responder "de quem ERA o rosto", que é o que
+        diz quais cadastros estão sendo confundidos entre si — informação mais
+        acionável que o limiar, porque aponta a pessoa a recadastrar.
+        """
+        with self._connect() as con:
+            rows = con.execute(
+                """
+                SELECT l.fonte, l.detection_id, l.rotulo, l.pessoa_correta,
+                       l.autor, p.name AS nome_correto
+                FROM detection_labels l
+                LEFT JOIN people p ON p.id = l.pessoa_correta
+                """).fetchall()
+        return {f"{r['fonte']}:{r['detection_id']}": dict(r) for r in rows}
 
     def importar_rotulos(self, rotulos: dict) -> int:
         """Importa rótulos no formato {"fonte:id": "certo"}, sem sobrescrever.
@@ -659,26 +791,35 @@ class Database:
 
         Devolve `fonte` porque as duas origens guardam imagem em bases
         diferentes: `realtime` em snapshots/, `captura` em tracks/.
+
+        Detecção marcada como 'errado' é EXCLUÍDA: mostrar como "melhor
+        captura" de alguém uma foto que uma pessoa já declarou não ser dela
+        seria contradizer a própria conferência.
         """
         with self._connect() as con:
             rows = con.execute(
                 """
                 SELECT person_id, foto, fonte, score FROM (
-                    SELECT person_id, score, 'captura' AS fonte,
+                    SELECT t.person_id, t.score, 'captura' AS fonte,
                            (SELECT path FROM track_crops c
                              WHERE c.track_id = t.id
-                             ORDER BY quality DESC LIMIT 1) AS foto
+                             ORDER BY quality DESC LIMIT 1) AS foto,
+                           l.rotulo
                     FROM tracks t
-                    WHERE status = 'processado' AND person_id IS NOT NULL
-                      AND started_at >= ? AND started_at < ?
+                    LEFT JOIN detection_labels l
+                           ON l.fonte = 'trilha' AND l.detection_id = t.id
+                    WHERE t.status = 'processado' AND t.person_id IS NOT NULL
+                      AND t.started_at >= ? AND t.started_at < ?
                     UNION ALL
-                    SELECT person_id, score, 'realtime' AS fonte,
-                           snapshot_path AS foto
-                    FROM events
-                    WHERE is_known = 1 AND person_id IS NOT NULL
-                      AND ts >= ? AND ts < ?
+                    SELECT e.person_id, e.score, 'realtime' AS fonte,
+                           e.snapshot_path AS foto, l.rotulo
+                    FROM events e
+                    LEFT JOIN detection_labels l
+                           ON l.fonte = 'evento' AND l.detection_id = e.id
+                    WHERE e.is_known = 1 AND e.person_id IS NOT NULL
+                      AND e.ts >= ? AND e.ts < ?
                 )
-                WHERE foto IS NOT NULL
+                WHERE foto IS NOT NULL AND (rotulo IS NULL OR rotulo <> 'errado')
                 ORDER BY person_id, score DESC
                 """,
                 (day_start, day_end, day_start, day_end),
