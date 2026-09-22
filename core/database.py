@@ -218,6 +218,20 @@ class Database:
             # continua lá, intacto, para o caso de o Censo Escolar voltar a
             # ser necessário. Remover coluna em SQLite é operação destrutiva
             # e o ganho seria só estético.
+            # Recorte LIMPO do rosto de cada evento.
+            #
+            # O `snapshot_path` do modo realtime guarda o frame ANOTADO — com
+            # a caixa e o nome desenhados — porque é o que serve para uma
+            # pessoa conferir quem foi reconhecido e em que contexto. Mas isso
+            # o torna inútil como amostra de cadastro: o embedding sairia de
+            # uma imagem com um retângulo sobre o rosto.
+            #
+            # O modo captura já guarda recorte limpo em `track_crops`. Esta
+            # coluna dá ao realtime a mesma capacidade.
+            eventos = {r["name"] for r in con.execute("PRAGMA table_info(events)")}
+            if "crop_path" not in eventos:
+                con.execute("ALTER TABLE events ADD COLUMN crop_path TEXT")
+
             # Rótulo ganhou o alvo da correção depois de existir.
             rot = {r["name"] for r in con.execute(
                 "PRAGMA table_info(detection_labels)")}
@@ -422,7 +436,7 @@ class Database:
 
     # ---- eventos --------------------------------------------------------------
     def add_event(self, person_id, name, score, snapshot_path, is_known,
-                  ts: float = None) -> int:
+                  ts: float = None, crop_path: str = None) -> int:
         """Registra um reconhecimento. `ts` é o instante da OBSERVAÇÃO.
 
         Quando omitido usa a hora do insert, o que embute a latência do
@@ -441,12 +455,13 @@ class Database:
         with self._connect() as con:
             cur = con.execute(
                 """
-                INSERT INTO events(person_id, name, score, ts, snapshot_path, is_known)
-                VALUES(?, ?, ?, ?, ?, ?)
+                INSERT INTO events(person_id, name, score, ts, snapshot_path,
+                                   is_known, crop_path)
+                VALUES(?, ?, ?, ?, ?, ?, ?)
                 """,
                 (person_id, name, float(score),
                  time.time() if ts is None else float(ts),
-                 snapshot_path, 1 if is_known else 0),
+                 snapshot_path, 1 if is_known else 0, crop_path),
             )
             return int(cur.lastrowid)
 

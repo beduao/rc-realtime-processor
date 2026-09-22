@@ -32,7 +32,7 @@ from core.camera import camera_from_config
 from core.config import (frame_image_path, live_image_path, load_config_or_exit,
                          project_path, reload_config)
 from core.database import Database
-from core.draw import draw_face
+from core.draw import crop_face, draw_face
 from core.face_engine import FaceEngine
 from core.imagem import escrever as escrever_imagem
 from core.storage import SnapshotStore
@@ -250,10 +250,18 @@ def loop_realtime(cfg, engine, db, live_path, cam, modo_fixo=False):
                 last_seen[key] = now
 
                 snapshot = store.save(live if live is not None else frame, name)
+                # Recorte LIMPO, do frame sem anotação: o snapshot acima pode
+                # ter caixa e nome desenhados (é o que serve para conferir),
+                # e uma imagem com retângulo sobre o rosto não pode virar
+                # amostra de cadastro. Tirado do `frame`, nunca do `live`.
+                crop = store.save(crop_face(frame, face), f"{name}_crop",
+                                  subdir=time.strftime("%Y%m%d/recortes",
+                                                       time.localtime(now)))
                 # `now` é o instante do frame, o mesmo usado no cooldown acima.
                 # Deixar o banco carimbar a hora do insert somaria a latência
                 # do processamento ao horário da passagem.
-                db.add_event(pid, name, score, snapshot, known, ts=now)
+                db.add_event(pid, name, score, snapshot, known, ts=now,
+                             crop_path=crop)
                 print(f"[evento] {name} (score={score:.3f}) -> {snapshot}", flush=True)
 
             if live is not None and now - last_live > LIVE_WRITE_SECONDS:
