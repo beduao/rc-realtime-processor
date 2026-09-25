@@ -14,6 +14,27 @@
 const $ = (sel) => document.querySelector(sel);
 const criar = (tag, props = {}) => Object.assign(document.createElement(tag), props);
 
+/* ----------------------------------------------------------- imagens ---- */
+
+/* Acrescenta `largura` à URL da foto, para a API servir uma miniatura.
+ *
+ * Nas listas a foto aparece a 60px (chamada) ou ~155px (grade), mas o que
+ * trafegava era o frame inteiro de 640x480 com 56 KB — o navegador baixava
+ * tudo e descartava 99% ao encolher. Com 50 alunos eram 2,7 MB para mostrar
+ * 50 quadradinhos; com miniatura são 0,1 MB.
+ *
+ * O dobro do tamanho de exibição, para não borrar em tela de alta densidade.
+ * A lupa NÃO usa isto: lá o frame inteiro é o ponto, é onde se decide se o
+ * rosto é de quem o sistema disse.
+ */
+const MINI_LINHA = 128;     // linha da chamada, exibida a 60px
+const MINI_GRADE = 320;     // cartões da grade, exibidos a ~155px
+
+function comLargura(url, largura) {
+  if (!url) return url;
+  return url + (url.includes("?") ? "&" : "?") + `largura=${largura}`;
+}
+
 /* --------------------------------------------------------------- rede ---- */
 
 async function api(caminho, opcoes = {}) {
@@ -316,7 +337,8 @@ function linhaPessoa(p, presente) {
   // nome, não um rosto — e são essas confirmações que alimentam a calibração
   // e a medição de recall.
   if (p.foto_url) {
-    const img = criar("img", { src: p.foto_url, loading: "lazy",
+    const img = criar("img", { src: comLargura(p.foto_url, MINI_LINHA),
+                               loading: "lazy",
                                alt: `melhor captura de ${p.nome}` });
     img.addEventListener("click", (ev) => {
       // CRÍTICO: a linha é um <label> em volta do checkbox, então um clique
@@ -548,7 +570,8 @@ function cartaoDeteccao(d) {
   if (d.rotulo === "errado") c.classList.add("errada");
 
   if (d.foto_url) {
-    const img = criar("img", { src: d.foto_url, loading: "lazy",
+    const img = criar("img", { src: comLargura(d.foto_url, MINI_GRADE),
+                               loading: "lazy",
                                alt: `detecção de ${d.nome}` });
     img.addEventListener("click", () => abrirLupaDeDeteccoes(d));
     c.append(img);
@@ -657,7 +680,8 @@ function desenharCadastro(amostras) {
   }
   for (const a of amostras) {
     const t = criar("div", { className: "tira" });
-    t.append(criar("img", { src: a.snapshot_url, alt: `amostra ${a.index + 1}` }));
+    t.append(criar("img", { src: comLargura(a.snapshot_url, MINI_LINHA),
+                            alt: `amostra ${a.index + 1}` }));
     const b = criar("button", { textContent: "remover" });
     b.addEventListener("click", async () => {
       const r = await api("/enroll/sample/delete", { metodo: "POST", corpo: {
@@ -853,7 +877,8 @@ function abrirLupaDeAmostras(alvo) {
 function cartaoAmostra(a, total) {
   const c = criar("div", { className: "cartao" });
   if (a.snapshot_url) {
-    const img = criar("img", { src: a.snapshot_url, loading: "lazy",
+    const img = criar("img", { src: comLargura(a.snapshot_url, MINI_GRADE),
+                               loading: "lazy",
                                alt: `amostra ${a.id}` });
     img.addEventListener("click", () => abrirLupaDeAmostras(a));
     c.append(img);

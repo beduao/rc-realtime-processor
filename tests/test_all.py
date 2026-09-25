@@ -2367,6 +2367,71 @@ def rotulos_ficam_no_banco_e_nao_mexem_na_presenca():
 
 
 @teste
+def miniatura_encolhe_sem_regerar_e_sem_vazar():
+    """Lista pede miniatura; a lupa continua com a original."""
+    try:
+        import fastapi.testclient  # noqa: F401
+    except ImportError:
+        return "PULADO: fastapi.testclient indisponível"
+
+    import importlib
+    from core.imagem import LARGURAS_MINIATURA, caminho_miniatura, escrever
+
+    c, _ = _api_cliente("miniatura", host="127.0.0.1")
+    api = importlib.import_module("api")
+
+    base = api.SNAP_BASE / "20260925"
+    base.mkdir(parents=True, exist_ok=True)
+    grande = np.zeros((480, 640, 3), np.uint8)
+    grande[:, :, 1] = np.tile(np.arange(640, dtype=np.uint8), (480, 1))
+    assert escrever(base / "f.jpg", grande)
+    original = (base / "f.jpg").stat().st_size
+
+    # --- a miniatura é menor e tem as dimensões pedidas -------------------- #
+    r = c.get("/snapshots/20260925/f.jpg?largura=128")
+    assert r.status_code == 200, r.text
+    assert len(r.content) < original / 5, (len(r.content), original)
+    img = cv2.imdecode(np.frombuffer(r.content, np.uint8), cv2.IMREAD_COLOR)
+    assert img.shape[1] == 128, img.shape
+    assert img.shape[0] == 96, "proporção 4:3 tem que ser preservada"
+
+    # --- gera UMA vez: o Pi não pode redimensionar a cada carregamento ----- #
+    mini = caminho_miniatura(base / "f.jpg", 128)
+    assert mini.exists(), "devia ter guardado em disco"
+    marca = mini.stat().st_mtime_ns
+    time.sleep(0.01)
+    c.get("/snapshots/20260925/f.jpg?largura=128")
+    assert mini.stat().st_mtime_ns == marca, "regerou em vez de reusar o cache"
+
+    # --- a original continua intacta e é o que a lupa recebe --------------- #
+    r_orig = c.get("/snapshots/20260925/f.jpg")
+    assert len(r_orig.content) == original, "a original não pode ser alterada"
+    assert (base / "f.jpg").stat().st_size == original
+
+    # --- largura fora da lista é recusada, não gera arquivo ---------------- #
+    assert c.get("/snapshots/20260925/f.jpg?largura=999").status_code == 400
+    sobras = [p for p in base.iterdir() if "999" in p.name]
+    assert not sobras, f"largura livre encheria o cartão: {sobras}"
+    assert set(LARGURAS_MINIATURA) == {128, 320}, LARGURAS_MINIATURA
+
+    # --- miniatura de miniatura não acumula lixo --------------------------- #
+    r = c.get(f"/snapshots/20260925/{mini.name}?largura=320")
+    assert r.status_code == 200, r.text
+    assert not caminho_miniatura(mini, 320).exists(), "gerou mini da mini"
+
+    # --- a proteção de caminho continua valendo COM largura ---------------- #
+    assert c.get("/snapshots/../../etc/passwd?largura=128").status_code == 404
+
+    # --- a retenção alcança: fica na pasta do dia -------------------------- #
+    assert mini.parent == base, "miniatura fora da pasta do dia escaparia da retenção"
+
+    # --- cache do navegador, senão a primeira carga se repete sempre ------- #
+    assert "max-age" in r_orig.headers.get("cache-control", ""), r_orig.headers
+    return ("128px com 4:3 preservado; cache em disco reusado; original "
+            "intacta; largura livre recusada; traversal barrado")
+
+
+@teste
 def cadastro_avisa_quando_ha_mais_de_um_rosto():
     """Com duas pessoas em cena, a captura pega a ERRADA sem avisar.
 

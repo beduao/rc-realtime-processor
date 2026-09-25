@@ -56,6 +56,74 @@ def ler(caminho, flags: int = cv2.IMREAD_COLOR):
     return cv2.imdecode(buf, flags)
 
 
+# Larguras permitidas para miniatura. Lista FECHADA de propósito: um
+# parâmetro de largura livre deixaria qualquer cliente pedir mil valores
+# diferentes e encher o cartão SD com variações da mesma foto.
+#
+# 128 cobre a linha da chamada (exibida a 60px) e 320 cobre os cartões da
+# grade (~155px). O dobro do tamanho de exibição, para não borrar em tela de
+# alta densidade.
+LARGURAS_MINIATURA = (128, 320)
+
+_SUFIXO_MINIATURA = ".mini"
+
+
+def caminho_miniatura(original: Path, largura: int) -> Path:
+    """Onde a miniatura de `original` fica guardada.
+
+    Ao LADO da original, na mesma pasta do dia. Isso faz a retenção existente
+    alcançá-la sem alteração: apagar o diretório AAAAMMDD leva as miniaturas
+    junto, e nenhum acervo novo passa a crescer sem teto.
+    """
+    original = Path(original)
+    return original.with_name(
+        f"{original.stem}{_SUFIXO_MINIATURA}{largura}{original.suffix}")
+
+
+def gerar_miniatura(original, largura: int, qualidade: int = 85):
+    """Devolve o caminho da miniatura, criando-a se ainda não existir.
+
+    Gera UMA vez e guarda. Redimensionar custa ~10 ms no Pi 3B, e a chamada
+    com 50 alunos pediria 50 miniaturas — meio segundo de CPU disputando com
+    o reconhecimento, que precisa de 285 ms por rosto. Fazer isso a cada
+    carregamento trocaria espera de rede por espera de CPU, no processador
+    errado.
+
+    Devolve None se não der para gerar; quem chama cai na imagem original,
+    que é pior mas funciona.
+    """
+    if largura not in LARGURAS_MINIATURA:
+        return None
+    original = Path(original)
+    # Miniatura de miniatura não: as miniaturas ficam na mesma pasta e são
+    # servíveis pelo mesmo caminho, então alguém pedindo a redução de uma
+    # redução criaria `foto.mini128.mini320.jpg` — lixo acumulando sem
+    # utilidade nenhuma.
+    if _SUFIXO_MINIATURA in original.stem:
+        return original
+    destino = caminho_miniatura(original, largura)
+    try:
+        if destino.exists() and destino.stat().st_mtime >= original.stat().st_mtime:
+            return destino
+    except OSError:
+        return None
+
+    img = ler(original)
+    if img is None:
+        return None
+    h, w = img.shape[:2]
+    if w <= largura:
+        # Já é menor que o alvo: copiar seria desperdício, serve a original.
+        return original
+    nova_altura = max(1, int(round(h * largura / w)))
+    # INTER_AREA é o certo para REDUZIR: faz média dos pixels da região, em vez
+    # de amostrar. Reduzir com interpolação linear produz serrilhado.
+    menor = cv2.resize(img, (largura, nova_altura), interpolation=cv2.INTER_AREA)
+    if not escrever(destino, menor, [int(cv2.IMWRITE_JPEG_QUALITY), qualidade]):
+        return None
+    return destino
+
+
 def _substituir_com_retry(tmp: Path, destino: Path, tentativas: int = 12,
                           espera: float = 0.02) -> bool:
     """`os.replace` resistente ao bloqueio de arquivo aberto do Windows.

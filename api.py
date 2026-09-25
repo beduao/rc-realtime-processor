@@ -42,6 +42,7 @@ from core.database import (Database, MatriculaDuplicada,
                           normalizar_matricula)
 from core.draw import crop_face, draw_face
 from core.face_engine import FaceEngine
+from core.imagem import LARGURAS_MINIATURA, gerar_miniatura
 from core.imagem import ler as ler_imagem
 from core.storage import SnapshotStore
 
@@ -1199,12 +1200,14 @@ def reopen_attendance(dia: str = Query(...)):
 
 
 @app.get("/snapshots/{path:path}")
-def snapshot(path: str):
-    return _servir_imagem(SNAP_BASE, path, "Snapshot não encontrado.")
+def snapshot(path: str, largura: int = Query(
+        0, description="0 = original; 128 ou 320 = miniatura")):
+    return _servir_imagem(SNAP_BASE, path, "Snapshot não encontrado.", largura)
 
 
 @app.get("/tracks/{path:path}")
-def track_crop(path: str):
+def track_crop(path: str, largura: int = Query(
+        0, description="0 = original; 128 ou 320 = miniatura")):
     """Recorte guardado pelo modo captura.
 
     Os recortes ficam em `tracking.crops_dir`, base DIFERENTE da de snapshots.
@@ -1241,14 +1244,30 @@ def _montar_painel():
               name="painel")
 
 
-def _servir_imagem(base, path: str, erro: str):
+def _servir_imagem(base, path: str, erro: str, largura: int = 0):
     full = (base / path).resolve()
     # is_relative_to compara COMPONENTES de caminho. Um `startswith` de string
     # deixaria passar diretório irmão de nome parecido ("snapshots-privado" ao
     # lado de "snapshots"). O `.resolve()` barra o "../../etc/passwd".
     if not full.is_relative_to(base) or not full.is_file():
         raise HTTPException(404, erro)
-    return FileResponse(str(full), media_type="image/jpeg")
+
+    if largura:
+        if largura not in LARGURAS_MINIATURA:
+            raise HTTPException(
+                400, f"Largura não suportada. Use uma de: "
+                     f"{', '.join(map(str, LARGURAS_MINIATURA))}.")
+        mini = gerar_miniatura(full, largura)
+        if mini is not None:
+            full = mini
+        # Falhou a geração? Serve a original. Foto grande demais é melhor que
+        # foto nenhuma numa tela de conferência.
+
+    # Cache do navegador: a imagem de uma detecção NUNCA muda — o caminho
+    # carrega data e hora. Sem isto, cada recarga da chamada rebaixa tudo, e
+    # é justamente a primeira carga que esta otimização existe para encolher.
+    return FileResponse(str(full), media_type="image/jpeg",
+                        headers={"Cache-Control": "public, max-age=86400"})
 
 
 @app.get("/live.jpg")
