@@ -709,6 +709,14 @@ def set_mode_edita_preservando_comentarios():
     comentarios_antes = origem.count("#")
 
     env = dict(os.environ, FACIAL_CONFIG=cfg_path, PYTHONPATH=RAIZ)
+    # O exemplo vem em captura (o modo da escola); vai para realtime antes,
+    # para a troca abaixo ser uma troca de verdade.
+    subprocess.run([sys.executable, "scripts/set_mode.py", "realtime"],
+                   cwd=RAIZ, env=env, capture_output=True, text=True)
+    meio = open(cfg_path, encoding="utf-8").read()
+    assert yaml.safe_load(meio)["worker"]["mode"] == "realtime", meio[:200]
+    assert meio.count("#") == comentarios_antes, "perdeu comentários do config"
+
     r = subprocess.run([sys.executable, "scripts/set_mode.py", "captura"],
                        cwd=RAIZ, env=env, capture_output=True, text=True)
     assert r.returncode == 0, r.stdout + r.stderr
@@ -2654,10 +2662,10 @@ def correcao_move_a_deteccao_para_a_pessoa_certa():
         "pessoa_correta": beta, "autor": "Operador"})
     assert r.status_code == 200, r.text
 
-    # "não é a Alfa, e não é ninguém cadastrado"
+    # "não é a Alfa, e não é ninguém cadastrado" (-1; null é "não informado")
     c.post("/detections/label", json={
         "fonte": "evento", "detection_id": e3, "rotulo": "errado",
-        "pessoa_correta": None})
+        "pessoa_correta": -1})
 
     assert ids(alfa) == {e1}, "a corrigida tinha que sair da lista da Alfa"
     assert ids(beta) == {e2}, "e entrar na da Beta"
@@ -2938,6 +2946,550 @@ def camera_backend_por_plataforma():
         assert c.is_local_device, f"{fonte!r} devia ser dispositivo local"
     assert not cam.Camera("rtsp://host/stream").is_local_device
     return "DSHOW no Windows, V4L2 no Linux; RTSP no FFmpeg; MJPG habilitado"
+
+
+# --------------------------------------------------------------------------- #
+# correções da revisão de 2026-11
+# --------------------------------------------------------------------------- #
+def _status_worker(api, idade=0.0, **extra):
+    """Escreve o facial-status.json como o worker escreveria, com `idade` s."""
+    dados = {"mode": "captura", "updated_at": time.time() - idade, **extra}
+    with open(api.STATUS_PATH, "w", encoding="utf-8") as fh:
+        json.dump(dados, fh)
+
+
+class _CameraFalsa:
+    """Só registra se foi fechada. Abrir câmera de verdade aqui seria a webcam
+    da máquina de quem roda o teste."""
+
+    def __init__(self):
+        self.fechada = False
+
+    def stop(self):
+        self.fechada = True
+
+
+@teste
+def cadastro_cancelar_nao_apaga_fora_da_sessao():
+    """O id da sessão vem do cliente e virava caminho de rmtree.
+
+    `".."` apagava data/snapshots inteiro e `"../amostras"` as fotos de
+    cadastro de todo mundo. Agora só some a pasta de sessão que existia.
+    """
+    try:
+        import fastapi.testclient  # noqa: F401
+    except ImportError:
+        return "PULADO: fastapi.testclient indisponível"
+
+    c, pasta = _api_cliente("cancelar")
+    snaps = os.path.join(pasta, "snaps")
+    amostra = os.path.join(snaps, "amostras", "7", "a.jpg")
+    passagem = os.path.join(snaps, "20260101", "p.jpg")
+    for arq in (amostra, passagem):
+        os.makedirs(os.path.dirname(arq), exist_ok=True)
+        cv2.imwrite(arq, np.full((20, 20, 3), 80, np.uint8))
+
+    for malicioso in ("..", "../amostras", "../20260101", "../../"):
+        r = c.post("/enroll/cancel", json={"session_id": malicioso})
+        assert r.status_code == 200, r.text
+    assert os.path.exists(amostra), "cancelar com '..' apagou as amostras"
+    assert os.path.exists(passagem), "cancelar com '..' apagou as passagens"
+
+    # A própria storage recusa sair de enroll/, mesmo chamada direto
+    import importlib
+    api = importlib.import_module("api")
+    api.store.remove_dir("enroll/..")
+    api.store.remove_dir("enroll/../amostras")
+    assert os.path.exists(amostra) and os.path.exists(passagem)
+
+    # Sessão de verdade continua sendo limpa ao cancelar
+    sid = c.post("/enroll/start", json={"name": "Teste"}).json()["session_id"]
+    assert c.post("/enroll/capture", json={"session_id": sid}).json()["ok"]
+    dir_sessao = os.path.join(snaps, "enroll", sid)
+    assert os.path.isdir(dir_sessao)
+    c.post("/enroll/cancel", json={"session_id": sid})
+    assert not os.path.isdir(dir_sessao), "pasta da sessão cancelada ficou"
+    return ("'..' e '../amostras' não apagam nada; sessão real some ao cancelar")
+
+
+@teste
+def faxina_solta_a_camera_quando_o_worker_volta():
+    """A API abriu a webcam com o worker parado; o worker voltou e não
+    conseguia mais abrir o dispositivo. A faxina tem que soltar na hora."""
+    try:
+        import fastapi.testclient  # noqa: F401
+    except ImportError:
+        return "PULADO: fastapi.testclient indisponível"
+
+    import importlib
+    # "0" = webcam: dispositivo exclusivo, o caso que importa
+    _api_cliente("faxina_cam", **{"camera.rtsp_url": "0"})
+    api = importlib.import_module("api")
+    assert api._fonte_e_dispositivo_local()
+
+    # batimento: vivo até 30s; "encerrado" vale como parado na hora
+    _status_worker(api, idade=5)
+    assert api._worker_vivo()
+    _status_worker(api, idade=40)
+    assert not api._worker_vivo(), "status de 40s ainda contava como vivo"
+    _status_worker(api, idade=0, encerrado=True)
+    assert not api._worker_vivo(), "worker que avisou que saiu contava como vivo"
+
+    # worker no ar + câmera da API aberta -> solta, mesmo usada agora há pouco
+    cam = _CameraFalsa()
+    api._enroll_cam = cam
+    api._camera_usada_em = time.time()
+    _status_worker(api, idade=1)
+    r = api._varrer_cadastro()
+    assert r["camera_fechada"] == "worker no ar", r
+    assert cam.fechada and api._enroll_cam is None
+
+    # worker parado: câmera em uso recente fica; ociosa sem sessão fecha
+    _status_worker(api, idade=600)
+    cam = _CameraFalsa()
+    api._enroll_cam = cam
+    api._camera_usada_em = time.time()
+    assert api._varrer_cadastro()["camera_fechada"] is None
+    assert not cam.fechada, "fechou câmera que o preview estava usando"
+    api._camera_usada_em = time.time() - api.CAMERA_OCIOSA_SEGUNDOS - 5
+    assert api._varrer_cadastro()["camera_fechada"] == "ociosa"
+    assert cam.fechada
+
+    # /enroll/start não abre câmera local com o worker no ar, mesmo sem frame
+    from fastapi.testclient import TestClient
+    _status_worker(api, idade=1)
+    api.FRAME_PATH.unlink()
+    aberturas = []
+    api._get_camera = lambda: aberturas.append(1)
+    c = TestClient(api.app, client=("127.0.0.1", 45678))
+    assert c.post("/enroll/start", json={"name": "X"}).status_code == 200
+    assert not aberturas, "abriu a webcam com o worker no ar"
+    return ("worker vivo só com status < 30s; câmera solta quando o worker "
+            "volta e quando fica ociosa; start não disputa o dispositivo")
+
+
+@teste
+def faxina_expira_sessao_abandonada_e_pasta_orfa():
+    try:
+        import fastapi.testclient  # noqa: F401
+    except ImportError:
+        return "PULADO: fastapi.testclient indisponível"
+
+    import importlib
+    c, pasta = _api_cliente("faxina_sessao")
+    api = importlib.import_module("api")
+
+    sid = c.post("/enroll/start", json={"name": "Abandonada"}).json()["session_id"]
+    assert c.post("/enroll/capture", json={"session_id": sid}).json()["ok"]
+    dir_sessao = os.path.join(pasta, "snaps", "enroll", sid)
+    assert os.path.isdir(dir_sessao)
+
+    # dentro do prazo, nada muda
+    assert api._varrer_cadastro()["expiradas"] == []
+    # passado o prazo, a sessão e as fotos dela somem
+    depois = time.time() + api.SESSAO_EXPIRA_SEGUNDOS + 5
+    r = api._varrer_cadastro(agora=depois)
+    assert r["expiradas"] == [sid], r
+    assert not os.path.isdir(dir_sessao), "fotos da sessão expirada ficaram"
+    r = c.post("/enroll/capture", json={"session_id": sid})
+    assert r.status_code == 404 and "expirada" in r.json()["detail"], r.text
+
+    # usar a sessão renova o prazo: esta já estaria vencida sem o GET
+    sid2 = c.post("/enroll/start", json={"name": "Ativa"}).json()["session_id"]
+    api._sessions[sid2]["ultimo_uso"] = time.time() - api.SESSAO_EXPIRA_SEGUNDOS - 10
+    assert c.get("/enroll/status", params={"session_id": sid2}).status_code == 200
+    assert api._varrer_cadastro()["expiradas"] == [], "expirou sessão em uso"
+
+    # pasta de sessão que não existe mais (API reiniciou no meio): velha sai,
+    # recente fica
+    velha = os.path.join(pasta, "snaps", "enroll", "orfa_velha")
+    nova = os.path.join(pasta, "snaps", "enroll", "orfa_nova")
+    for d in (velha, nova):
+        os.makedirs(d, exist_ok=True)
+    antigo = time.time() - api.SESSAO_EXPIRA_SEGUNDOS - 60
+    os.utime(velha, (antigo, antigo))
+    assert api._varrer_cadastro()["orfas"] == 1
+    assert not os.path.isdir(velha) and os.path.isdir(nova)
+    return ("sessão parada 15 min expira com as fotos; uso renova; pasta "
+            "órfã velha removida, recente preservada")
+
+
+@teste
+def worker_publica_batimento_sem_depender_de_frame():
+    """O status saía só a cada 5 min, junto do log. Com a câmera travada nem
+    isso — e a API concluía 'worker parado' e tentava pegar a câmera."""
+    import importlib
+    from pathlib import Path
+    w = importlib.reload(importlib.import_module("worker"))
+    live = Path(TMP) / "batimento" / "live.jpg"
+    live.parent.mkdir(parents=True, exist_ok=True)
+    arq = live.with_name("facial-status.json")
+
+    w.PARAR.clear()
+    w.publicar_status(live, "captura", {"fixo": False, "pendentes": 3})
+    primeiro = json.load(open(arq, encoding="utf-8"))["updated_at"]
+    th = threading.Thread(target=w._batimento, args=(live, 0.2), daemon=True)
+    th.start()
+    try:
+        time.sleep(0.8)
+        st = json.load(open(arq, encoding="utf-8"))
+    finally:
+        w.PARAR.set()
+        th.join(timeout=3)
+        w.PARAR.clear()
+    assert not th.is_alive(), "batimento não parou com PARAR"
+    assert st["updated_at"] > primeiro, "batimento não republicou"
+    assert st["mode"] == "captura" and st["pendentes"] == 3, \
+        f"batimento perdeu o estado: {st}"
+    assert w.STATUS_EVERY_SECONDS <= 10
+    return "republica sozinho, mantém modo e extras, para com PARAR"
+
+
+@teste
+def fechamento_so_considera_pendencias_do_proprio_dia():
+    """Trilha pendente de HOJE não pode impedir fechar ONTEM, nem tornar
+    ontem 'incompleto' — e uma de ontem não trava hoje."""
+    try:
+        import fastapi.testclient  # noqa: F401
+    except ImportError:
+        return "PULADO: fastapi.testclient indisponível"
+
+    c, pasta = _api_cliente("fechar_dia")
+    from core.database import Database
+    db = Database(os.path.join(pasta, "dados.db"))
+    db.add_person("Ana")
+    hoje = time.localtime()
+    meia = time.mktime((hoje.tm_year, hoje.tm_mon, hoje.tm_mday, 0, 0, 0, 0, 0, -1))
+    dia_hoje = time.strftime("%Y-%m-%d", time.localtime(meia))
+    dia_ontem = time.strftime("%Y-%m-%d", time.localtime(meia - 12 * 3600))
+    crop = [{"path": "x.jpg", "quality": 1.0, "face": "[]"}]
+
+    db.add_track(meia + 9 * 3600, meia + 9 * 3600 + 1, 5, crop)   # hoje, pendente
+    assert db.count_pending_tracks() == 1
+    assert db.count_pending_tracks(meia - 86400, meia) == 0
+
+    d = c.get("/attendance", params={"dia": dia_ontem}).json()
+    assert d["completo"] is True and d["trilhas_pendentes"] == 0, d
+    r = c.post("/attendance/close", json={"dia": dia_ontem, "autor": "Op"})
+    assert r.status_code == 200, f"pendência de hoje travou ontem: {r.text}"
+
+    r = c.post("/attendance/close", json={"dia": dia_hoje, "autor": "Op"})
+    assert r.status_code == 409 and "deste dia" in r.json()["detail"], r.text
+    assert c.get("/attendance", params={"dia": dia_hoje}).json()["completo"] is False
+    return "ontem fecha com pendência de hoje; hoje continua travado pela sua"
+
+
+def _arquivo(base, rel, largura=40):
+    caminho = os.path.join(base, rel)
+    os.makedirs(os.path.dirname(caminho), exist_ok=True)
+    cv2.imwrite(caminho, np.full((30, largura, 3), 120, np.uint8))
+    return rel
+
+
+@teste
+def exclusao_leva_recorte_limpo_miniaturas_e_correcoes():
+    """'Excluir' precisa excluir: o recorte limpo do realtime e as miniaturas
+    ficavam no disco, e as correções de presença no banco."""
+    try:
+        import fastapi.testclient  # noqa: F401
+    except ImportError:
+        return "PULADO: fastapi.testclient indisponível"
+
+    import importlib
+    from core.imagem import caminho_miniatura
+    from pathlib import Path
+
+    for anonimizar in (False, True):
+        c, pasta = _api_cliente(f"excl_total_{int(anonimizar)}")
+        api = importlib.import_module("api")
+        db, snaps = api.db, os.path.join(pasta, "snaps")
+
+        alvo = db.add_person("Alvo")
+        outra = db.add_person("Outra")
+        v = np.ones(128, np.float32) / np.sqrt(128)
+        db.add_embedding(alvo, v, _arquivo(snaps, f"amostras/{alvo}/a.jpg"), 1.0)
+        ev = db.add_event(alvo, "Alvo", 0.9, _arquivo(snaps, "20260101/ev.jpg"), 1,
+                          crop_path=_arquivo(snaps, "20260101/recortes/ev_crop.jpg"))
+        # miniaturas como a API as gera, ao lado das originais
+        minis = []
+        for rel in ("20260101/ev.jpg", "20260101/recortes/ev_crop.jpg"):
+            for lg in (128, 320):
+                m = caminho_miniatura(Path(snaps) / rel, lg)
+                cv2.imwrite(str(m), np.zeros((5, 5, 3), np.uint8))
+                minis.append(m)
+        db.set_attendance_override("2026-01-01", alvo, True, "veio", "Op")
+        db.set_detection_label("evento", ev, "certo", "Op")
+        # detecção de OUTRA pessoa corrigida para "era a Alvo"
+        ev_outra = db.add_event(outra, "Outra", 0.5, "20260101/o.jpg", 1)
+        db.set_detection_label("evento", ev_outra, "errado", "Op", pessoa_correta=alvo)
+
+        r = c.delete(f"/people/{alvo}",
+                     params={"anonimizar": str(anonimizar).lower()})
+        assert r.status_code == 200, r.text
+
+        for rel in ("20260101/ev.jpg", "20260101/recortes/ev_crop.jpg"):
+            assert not os.path.exists(os.path.join(snaps, rel)), \
+                f"{rel} ficou no disco (anonimizar={anonimizar})"
+        sobrou = [str(m) for m in minis if m.exists()]
+        assert not sobrou, f"miniaturas ficaram: {sobrou}"
+        assert db.attendance_overrides("2026-01-01") == {}, "correção ficou"
+        rotulos = db.detection_labels_detalhados()
+        assert f"evento:{ev}" not in rotulos, "rótulo da pessoa excluída ficou"
+        assert rotulos[f"evento:{ev_outra}"]["pessoa_correta"] == db.DESCONHECIDO, \
+            "correção apontando para a excluída deveria virar 'ninguém cadastrado'"
+        if anonimizar:
+            linha = next(e for e in db.list_events(10) if e["id"] == ev)
+            assert linha["crop_path"] is None and linha["snapshot_path"] is None
+
+    # excluir UMA amostra leva as miniaturas dela
+    c, pasta = _api_cliente("excl_amostra")
+    api = importlib.import_module("api")
+    snaps = os.path.join(pasta, "snaps")
+    p = api.db.add_person("P")
+    e1 = api.db.add_embedding(p, v, _arquivo(snaps, f"amostras/{p}/1.jpg"), 1.0)
+    api.db.add_embedding(p, v, _arquivo(snaps, f"amostras/{p}/2.jpg"), 1.0)
+    mini = caminho_miniatura(Path(snaps) / f"amostras/{p}/1.jpg", 320)
+    cv2.imwrite(str(mini), np.zeros((5, 5, 3), np.uint8))
+    assert c.delete(f"/embeddings/{e1}").status_code == 200
+    assert not mini.exists(), "miniatura da amostra excluída ficou"
+    return ("recorte limpo, snapshot e miniaturas apagados nos dois modos; "
+            "correções e rótulos da pessoa saem; amostra leva a miniatura")
+
+
+@teste
+def rotulo_distingue_ninguem_cadastrado_de_nao_informado():
+    """Os dois eram NULL: a tela lia 'ninguém cadastrado', a calibração lia
+    'não informado'. Agora 'ninguém' é -1 e NULL é só 'não informado'."""
+    import io
+    from contextlib import redirect_stdout
+    from scripts.calibrate_threshold import cobertura
+
+    db, ids, _ = _banco_recall("ninguem")
+    alfa = ids["Alfa"]
+    e_ninguem = db.add_event(alfa, "Alfa", 0.40, "a.jpg", 1)
+    e_sem_alvo = db.add_event(alfa, "Alfa", 0.39, "b.jpg", 1)
+    e_beta = db.add_event(alfa, "Alfa", 0.41, "c.jpg", 1)
+    db.set_detection_label("evento", e_ninguem, "errado", "Op",
+                           pessoa_correta=db.DESCONHECIDO)
+    db.set_detection_label("evento", e_sem_alvo, "errado", "Op")
+    db.set_detection_label("evento", e_beta, "errado", "Op",
+                           pessoa_correta=ids["Beta"])
+
+    det = db.deteccoes_de(limit=10)
+    por_id = {d["id"]: d for d in det}
+    assert por_id[e_ninguem]["pessoa_correta"] == -1
+    assert por_id[e_sem_alvo]["pessoa_correta"] is None
+    # os dois sem identidade vão para o balde de desconhecidos
+    balde = {d["id"] for d in db.deteccoes_de(db.DESCONHECIDO, limit=10)}
+    assert {e_ninguem, e_sem_alvo} <= balde and e_beta not in balde, balde
+    assert {d["id"] for d in db.deteccoes_de(ids["Beta"], limit=10)} == {e_beta}
+
+    deteccoes = [{"fonte": "evento", "id": i, "score": s, "name": "Alfa"}
+                 for i, s in ((e_ninguem, .40), (e_sem_alvo, .39), (e_beta, .41))]
+    labels = {f"evento:{i}": "errado" for i in (e_ninguem, e_sem_alvo, e_beta)}
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        cobertura(db, deteccoes, labels, {"chamada": 0, "manual": 3, "total": 3})
+    saida = buf.getvalue()
+    assert "Alfa -> Beta: 1x" in saida, saida
+    assert "1 erro(s) de quem não é cadastrado" in saida, saida
+    assert "1 erro(s) sem dizer de quem era" in saida, saida
+    assert "None" not in saida, f"'ninguém' virou par de confusão: {saida}"
+    return ("-1 = ninguém cadastrado, NULL = não informado; ambos no balde; "
+            "calibração conta cada um no seu lugar")
+
+
+@teste
+def calibracao_review_nao_quebra_ao_revisar():
+    """`--review` morria com NameError na primeira detecção a revisar."""
+    import builtins
+    import io
+    from contextlib import redirect_stdout
+    from core.config import Config
+    from scripts.calibrate_threshold import review
+
+    db, ids, trilha = _banco_recall("review")
+    trilha(time.time(), "Alfa", 0.8)
+    respostas = iter(["s", "q"])
+    original = builtins.input
+    builtins.input = lambda *_: next(respostas)
+    buf = io.StringIO()
+    try:
+        with redirect_stdout(buf):
+            review(db, Config({"recognition": {"cosine_threshold": 0.363}}),
+                   db.list_detections(), "127.0.0.1", 8000)
+    finally:
+        builtins.input = original
+    assert "a revisar à mão" in buf.getvalue(), buf.getvalue()
+    assert list(db.detection_labels().values()) == ["certo"]
+    return "revisão roda, grava o rótulo respondido e sai no 'q'"
+
+
+@teste
+def limpeza_compacta_o_banco_de_verdade():
+    """O VACUUM era pedido chamando purge de novo, que já não apagava nada —
+    e sem nada apagado o VACUUM não rodava. Nunca rodou."""
+    import subprocess
+    from core.database import Database
+
+    pasta = os.path.join(TMP, "vacuum")
+    os.makedirs(pasta, exist_ok=True)
+    banco = os.path.join(pasta, "dados.db")
+    db = Database(banco)
+    antigo = time.time() - 400 * 86400
+    # Fecha a conexão explicitamente: em WAL os dados só chegam ao arquivo
+    # principal no checkpoint, e o tamanho medido abaixo sairia enganoso.
+    con = db._connect()
+    con.executemany(
+        "INSERT INTO events(person_id,name,score,ts,snapshot_path,is_known) "
+        "VALUES(NULL,?,0.1,?,NULL,0)",
+        [("x" * 400, antigo) for _ in range(3000)])
+    con.commit()
+    con.close()
+    antes = os.path.getsize(banco)
+
+    cfg = yaml.safe_load(open(os.path.join(RAIZ, "config.pi.example.yaml"),
+                              encoding="utf-8"))
+    cfg["storage"]["db_path"] = banco
+    cfg["storage"]["snapshots_dir"] = os.path.join(pasta, "snaps")
+    cfg["storage"]["live_path"] = os.path.join(pasta, "live.jpg")
+    cfg["tracking"]["crops_dir"] = os.path.join(pasta, "tracks")
+    caminho = os.path.join(pasta, "cfg.yaml")
+    yaml.safe_dump(cfg, open(caminho, "w", encoding="utf-8"), allow_unicode=True)
+    env = dict(os.environ, FACIAL_CONFIG=caminho, PYTHONPATH=RAIZ)
+    r = subprocess.run([sys.executable, "scripts/cleanup_snapshots.py"],
+                       cwd=RAIZ, env=env, capture_output=True, text=True,
+                       encoding="utf-8")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "banco compactado" in r.stdout, r.stdout
+    depois = os.path.getsize(banco)
+    assert depois < antes / 2, f"banco não encolheu: {antes} -> {depois}"
+    return f"banco de {antes // 1024} KB para {depois // 1024} KB após a limpeza"
+
+
+@teste
+def recorte_de_trilha_serve_miniatura():
+    """`/tracks/` ignorava `largura` — o modo da escola nunca tinha miniatura."""
+    try:
+        import fastapi.testclient  # noqa: F401
+    except ImportError:
+        return "PULADO: fastapi.testclient indisponível"
+
+    # crops_dir explícito: o padrão é o data/tracks real do projeto. E o
+    # arquivo é escrito pelo caminho do TMP, não pelo TRACKS_BASE resolvido,
+    # que tem o "ã" do usuário e faria o cv2.imwrite falhar calado.
+    trilhas = os.path.join(TMP, "tracks_mini", "tracks")
+    c, pasta = _api_cliente("tracks_mini", **{"tracking.crops_dir": trilhas})
+    _arquivo(trilhas, "20260101/t.jpg", largura=400)
+    r = c.get("/tracks/20260101/t.jpg", params={"largura": 128})
+    assert r.status_code == 200, r.text
+    img = cv2.imdecode(np.frombuffer(r.content, np.uint8), cv2.IMREAD_COLOR)
+    assert img.shape[1] == 128, f"veio com {img.shape[1]}px"
+    assert c.get("/tracks/20260101/t.jpg", params={"largura": 77}).status_code == 400
+    return "recorte de 400px servido com 128px; largura livre recusada"
+
+
+@teste
+def url_da_camera_sem_senha_e_find_camera_no_cp1252():
+    import subprocess
+    from core.camera import url_sem_senha
+    assert url_sem_senha("rtsp://admin:s3gr@do@10.0.0.5:554/x") == \
+        "rtsp://admin:***@10.0.0.5:554/x"
+    assert url_sem_senha("rtsp://10.0.0.5/x") == "rtsp://10.0.0.5/x"
+    assert url_sem_senha("0") == "0"
+    assert url_sem_senha("rtsp://host/caminho@x") == "rtsp://host/caminho@x"
+
+    # Console cp1252 (Windows): imprimir ⚠ depois de importar o find_camera
+    # tem que funcionar — antes, o processo morria com UnicodeEncodeError.
+    env = dict(os.environ, PYTHONIOENCODING="cp1252", PYTHONPATH=RAIZ)
+    r = subprocess.run([sys.executable, "-c",
+                        "import scripts.find_camera; print('\\u26a0 ok')"],
+                       cwd=RAIZ, env=env, capture_output=True)
+    assert r.returncode == 0, r.stderr.decode("utf-8", "replace")
+    return "senha mascarada (inclusive com @ na senha); ⚠ não derruba o find_camera"
+
+
+@teste
+def cadastro_avisa_e_marca_amostra_borrada():
+    """Rosto borrado vira um embedding genérico, que atrai capturas ruins de
+    OUTRAS pessoas — a causa confirmada da confusão lais -> bia. A captura
+    avisa, a amostra fica marcada e a aba Pessoas aponta quais trocar."""
+    try:
+        import fastapi.testclient  # noqa: F401
+    except ImportError:
+        return "PULADO: fastapi.testclient indisponível"
+
+    import importlib
+    c, pasta = _api_cliente("nitidez")
+    api = importlib.import_module("api")
+    assert api.NITIDEZ_MINIMA == 300, api.NITIDEZ_MINIMA
+    frame = os.path.join(pasta, "facial-frame.jpg")
+    ruido = np.random.RandomState(3).randint(0, 255, (480, 640, 3), dtype=np.uint8)
+    borrado = cv2.GaussianBlur(ruido, (0, 0), 8)
+
+    # nítido (o ruído do _api_cliente): sem aviso, marcado como ok
+    sid = c.post("/enroll/start", json={"name": "Teste"}).json()["session_id"]
+    r = c.post("/enroll/capture", json={"session_id": sid}).json()
+    assert r["ok"] and not r.get("aviso"), r
+    assert r["samples"][0]["nitidez_baixa"] is False, r["samples"]
+
+    # borrado: avisa, mas CAPTURA — o limiar depende da câmera
+    cv2.imwrite(frame, borrado)
+    r = c.post("/enroll/capture", json={"session_id": sid}).json()
+    assert r["ok"] and r["count"] == 2, r
+    assert r.get("aviso") and "nitidez baixa" in r["aviso"], r
+    assert r["samples"][1]["nitidez_baixa"] is True, r["samples"]
+    assert r["samples"][1]["nitidez"] < 300, r["samples"]
+
+    # borrado E com duas pessoas em cena: os dois avisos juntos
+    api.engine.detect = lambda img: [face_em(200, 150, 120), face_em(20, 20, 60)]
+    r = c.post("/enroll/capture", json={"session_id": sid}).json()
+    assert "MAIOR" in r["aviso"] and "nitidez baixa" in r["aviso"], r["aviso"]
+    api.engine.detect = lambda img: [face_em(200, 150, 120)]
+
+    # depois de concluir, a aba Pessoas diz quais trocar
+    pid = c.post("/enroll/finish", json={"session_id": sid}).json()["id"]
+    v = np.ones(128, np.float32) / np.sqrt(128)
+    api.db.add_embedding(pid, v, None, None)       # amostra antiga, sem nitidez
+    d = c.get(f"/people/{pid}/samples").json()
+    marcas = sorted(str(a["nitidez_baixa"]) for a in d["samples"])
+    assert marcas == ["False", "None", "True", "True"], marcas
+    assert d["nitidez_minima"] == 300
+
+    # "adicionar amostra" na aba Pessoas avisa do mesmo jeito
+    r = c.post(f"/people/{pid}/samples").json()
+    assert r["ok"] and r["nitidez_baixa"] is True and "nitidez" in r["aviso"], r
+
+    # 0 desliga: nada de aviso nem de marca
+    c2, pasta2 = _api_cliente("nitidez_off", **{"enroll.nitidez_minima": 0})
+    cv2.imwrite(os.path.join(pasta2, "facial-frame.jpg"), borrado)
+    sid = c2.post("/enroll/start", json={"name": "X"}).json()["session_id"]
+    r = c2.post("/enroll/capture", json={"session_id": sid}).json()
+    assert r["ok"] and not r.get("aviso"), r
+    assert r["samples"][0]["nitidez_baixa"] is None, r["samples"]
+    return ("borrada avisa e é capturada mesmo assim; marca na sessão e na aba "
+            "Pessoas; amostra antiga fica sem marca; 0 desliga")
+
+
+@teste
+def painel_monta_aviso_como_texto_e_dia_pelo_servidor():
+    """Guardas estáticas do app.js para duas regressões fáceis de reintroduzir."""
+    import re
+    fonte = open(os.path.join(RAIZ, "web", "app.js"), encoding="utf-8").read()
+    corpo = re.search(r"function faixa\([^)]*\)\s*\{(.*?)\n\}", fonte, re.S)
+    assert corpo, "não achei a função faixa"
+    assert "innerHTML" not in corpo.group(1), "faixa voltou a usar innerHTML"
+    assert "<b>" not in fonte and "<code>" not in fonte, \
+        "HTML em string: monte com negrito()/codigo()"
+    assert not re.search(r"toISOString\(\)\.slice\(0,\s*10\)", fonte), \
+        "dia em UTC: depois das 21h vira o dia seguinte"
+    assert "worker_live_age_seconds" not in fonte, \
+        "indicador do worker deve usar o batimento (worker_ativo)"
+
+    sh = open(os.path.join(RAIZ, "install_pi.sh"), encoding="utf-8").read()
+    assert "disable --now facial-batch.timer" not in sh, \
+        "instalador voltou a desligar o lote"
+    return "faixa sem innerHTML; sem data UTC; instalador mantém o lote ligado"
 
 
 # --------------------------------------------------------------------------- #

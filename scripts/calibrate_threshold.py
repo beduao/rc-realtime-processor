@@ -233,15 +233,18 @@ def review(db: Database, cfg, deteccoes: list[dict], ip: str, porta: int) -> Non
         print("\nSem identificações para revisar ainda.")
         return
 
-    combinado, _ = juntar_rotulos(db, deteccoes)
+    # `origem` traz a contagem de manuais. A linha abaixo usava `manuais`, que
+    # só existe dentro de juntar_rotulos — o --review morria com NameError
+    # assim que havia algo a revisar.
+    combinado, origem = juntar_rotulos(db, deteccoes)
     # Do menor para o maior score: os erros se concentram no início, então você
     # encontra os problemas nas primeiras respostas.
     conhecidos.sort(key=lambda d: d["score"])
     pendentes = [d for d in conhecidos if chave(d) not in combinado]
 
     print(f"\n{len(pendentes)} a revisar à mão "
-          f"({len(combinado)} já rotulados, sendo {len(manuais)} manuais e o "
-          f"resto vindo de chamadas conferidas).")
+          f"({len(combinado)} já rotulados, sendo {origem['manual']} manuais e "
+          f"o resto vindo de chamadas conferidas).")
     if not pendentes:
         print("  Nada pendente — as chamadas conferidas já cobriram tudo.")
     print("Responda:  s = acertou   n = ERROU (outra pessoa)   p = pular   q = sair\n")
@@ -301,12 +304,19 @@ def cobertura(db: Database, deteccoes: list[dict], labels: dict,
     # exatamente quem recadastrar.
     detalhes = db.detection_labels_detalhados()
     confusoes = Counter()
-    sem_alvo = 0
+    sem_alvo = ninguem = 0
+
+    def eh_pessoa(info):
+        alvo = info.get("pessoa_correta")
+        return alvo is not None and alvo != Database.DESCONHECIDO
+
     for k in errados:
         info = detalhes.get(k) or {}
         disse = por_chave[k].get("name") or "?"
-        if info.get("pessoa_correta"):
+        if eh_pessoa(info):
             confusoes[(disse, info["nome_correto"])] += 1
+        elif info.get("pessoa_correta") == Database.DESCONHECIDO:
+            ninguem += 1
         else:
             sem_alvo += 1
 
@@ -318,7 +328,7 @@ def cobertura(db: Database, deteccoes: list[dict], labels: dict,
         scores_par = {}
         for k in errados:
             info = detalhes.get(k) or {}
-            if not info.get("pessoa_correta"):
+            if not eh_pessoa(info):
                 continue
             par = (por_chave[k].get("name") or "?", info["nome_correto"])
             scores_par.setdefault(par, []).append(por_chave[k]["score"])
@@ -341,11 +351,18 @@ def cobertura(db: Database, deteccoes: list[dict], labels: dict,
                       f"{disse} -> {era}.")
                 print("    Isso não é 'o reconhecimento está ruim', é um")
                 print(f"    cadastro específico. Antes de qualquer ajuste, abra")
-                print(f"    as amostras de '{disse}' no painel e confira de quem")
-                print("    é o rosto nelas. Cadastro feito na frente da câmera")
-                print("    com outra pessoa em quadro pode ter capturado a")
-                print("    pessoa errada — e aí a galeria de um contém o rosto")
-                print("    do outro, o que produz exatamente este padrão.")
+                print(f"    as amostras de '{disse}' no painel e confira duas")
+                print("    coisas:")
+                print("      - a QUALIDADE: amostra borrada ou com o rosto mal")
+                print("        visível vira um embedding genérico, que atrai")
+                print("        capturas ruins de outras pessoas. Foi a causa")
+                print("        confirmada da confusão lais -> bia;")
+                print("      - de QUEM é o rosto: cadastro com outra pessoa em")
+                print("        quadro pode ter capturado a pessoa errada.")
+                print("    Nos dois casos a solução é trocar as amostras.")
+    if ninguem:
+        print(f"\n  {ninguem} erro(s) de quem não é cadastrado: o limiar deixou")
+        print("  um estranho passar como aluno.")
     if sem_alvo:
         print(f"\n  {sem_alvo} erro(s) sem dizer de quem era. Informar a pessoa")
         print("  certa ao marcar transforma o rótulo em par (detecção -> quem")

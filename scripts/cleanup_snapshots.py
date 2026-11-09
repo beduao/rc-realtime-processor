@@ -146,7 +146,8 @@ def main() -> int:
         tr = db.purge_tracks_before(corte_reg)
         print(f"  banco: {ev} evento(s) e {tr} trilha(s) removidas")
         if (ev or tr) and not args.no_vacuum:
-            db.purge_events_before(corte_reg, vacuum=True)   # dispara o VACUUM
+            db.vacuum()
+            print("  banco compactado (VACUUM)")
 
     total_snaps = _dir_size_mb(snaps) if snaps.exists() else 0.0
     total_tracks = _dir_size_mb(tracks) if tracks.exists() else 0.0

@@ -13,14 +13,16 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import cv2  # noqa: E402
 
-from core.camera import camera_from_config  # noqa: E402
+from core.camera import camera_from_config, url_sem_senha  # noqa: E402
 from core.config import load_config_or_exit, project_path  # noqa: E402
 from core.imagem import escrever as escrever_imagem  # noqa: E402
 
 
 def main() -> int:
     cfg = load_config_or_exit()
-    print("Conectando em:", cfg.camera.rtsp_url)
+    # Sem a senha: este script roda no install_pi.sh e a saída vai parar no
+    # terminal, em print de tela e no histórico de suporte.
+    print("Conectando em:", url_sem_senha(cfg.camera.rtsp_url))
     cam = camera_from_config(cfg).start()
     print("Backend:", "V4L2 (dispositivo local)" if cam.is_local_device else "FFmpeg (RTSP/arquivo)")
     try:

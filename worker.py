@@ -46,6 +46,11 @@ LIVE_JPEG_QUALITY = 70          # menor = menos CPU e menos escrita em disco
 FRAME_WRITE_SECONDS = 0.5       # frame limpo publicado para o cadastro da API
 FRAME_JPEG_QUALITY = 95         # alto: dele saem os embeddings do cadastro
 STATS_EVERY_SECONDS = 300.0     # log periódico de saúde (aparece no journalctl)
+# Batimento: o status é republicado neste intervalo por uma thread própria.
+# A API considera o worker parado quando o status passa de 30s. Antes o status
+# só saía junto do log de 5 em 5 minutos, e a API achava o worker morto em ~80%
+# do tempo — justamente a informação que a impede de disputar a câmera.
+STATUS_EVERY_SECONDS = 10.0
 
 # Encerramento limpo. Sem isto, o SIGTERM do `systemctl stop/restart` mata o
 # processo na hora e o `finally` do modo captura nunca roda — as trilhas de quem
@@ -87,14 +92,29 @@ def modo_do_config(padrao: str = "realtime") -> str:
     return modo
 
 
+# Último estado publicado. A thread de batimento o republica com hora nova, e
+# o lock evita que ela e o laço principal escrevam o mesmo `.part` ao mesmo
+# tempo.
+_status_atual: dict = {}
+_status_lock = threading.Lock()
+
+
 def publicar_status(live_path, modo: str, extra: dict = None):
     """Publica o estado do worker ao lado do preview (tmpfs, não gasta o SD).
 
     É assim que a API sabe o modo REAL em execução — que pode diferir do
-    config.yaml quando o modo foi fixado por --mode na linha de comando.
+    config.yaml quando o modo foi fixado por --mode na linha de comando — e se
+    o worker está vivo, pelo `updated_at`.
     """
-    dados = {"mode": modo, "updated_at": time.time(), "pid": os.getpid()}
-    dados.update(extra or {})
+    with _status_lock:
+        _status_atual.clear()
+        _status_atual.update({"mode": modo, **(extra or {})})
+        _gravar_status(live_path)
+
+
+def _gravar_status(live_path):
+    """Grava `_status_atual` com a hora de agora. Chamar com o lock em mãos."""
+    dados = {**_status_atual, "updated_at": time.time(), "pid": os.getpid()}
     caminho = live_path.with_name("facial-status.json")
     tmp = str(caminho) + ".part"
     try:
@@ -103,6 +123,20 @@ def publicar_status(live_path, modo: str, extra: dict = None):
         os.replace(tmp, str(caminho))
     except OSError:
         pass    # status é informativo; falhar aqui não pode parar o worker
+
+
+def _batimento(live_path, intervalo: float = STATUS_EVERY_SECONDS):
+    """Republica o status periodicamente, chegue frame ou não.
+
+    Thread separada de propósito: quando a câmera trava, o laço principal
+    fica girando em `frame is None` e nunca chega à publicação. É exatamente
+    nessa hora que a API não pode concluir "worker parado" e tentar abrir a
+    câmera — o processo continua vivo e dono do dispositivo.
+    """
+    while not PARAR.wait(intervalo):
+        with _status_lock:
+            if _status_atual:
+                _gravar_status(live_path)
 
 
 def _escrever_jpeg(path, image, qualidade) -> bool:
@@ -443,6 +477,8 @@ def main(argv=None):
     engine, db, live_path, cam = _setup(cfg)
     origem = "--mode" if modo_fixo else "config.yaml"
     print(f"[worker] modo inicial: {modo} (de {origem})", flush=True)
+    threading.Thread(target=_batimento, args=(live_path,), daemon=True,
+                     name="batimento").start()
 
     try:
         while not PARAR.is_set():
@@ -453,6 +489,10 @@ def main(argv=None):
             modo = proximo
     finally:
         cam.stop()
+        # Avisa que saiu, em vez de deixar a API esperar o status envelhecer.
+        # PARAR antes, para o batimento não sobrescrever o aviso.
+        PARAR.set()
+        publicar_status(live_path, modo, {"fixo": modo_fixo, "encerrado": True})
     print("[worker] encerrado.", flush=True)
 
 

@@ -175,7 +175,12 @@ class Database:
                 -- `pessoa_correta` guarda QUEM de fato é, quando se sabe. A
                 -- semântica, com rotulo='errado':
                 --   pessoa_correta = N     -> é a pessoa N
-                --   pessoa_correta = NULL  -> não é ninguém cadastrado
+                --   pessoa_correta = -1    -> não é ninguém cadastrado
+                --   pessoa_correta = NULL  -> não foi informado de quem é
+                --                             (todo rótulo anterior à coluna)
+                -- "Ninguém cadastrado" era NULL no começo, o que o tornava
+                -- indistinguível dos rótulos antigos: a tela lia NULL como
+                -- "ninguém" e a calibração como "não informado".
                 -- Isso transforma o rótulo de um binário em par
                 -- (detecção -> identidade real), que é o que permite medir de
                 -- verdade: sem o alvo, "errado" só diz o que NÃO é.
@@ -358,6 +363,10 @@ class Database:
              "tracks":    [...]}   # relativos a tracking.crops_dir
         """
         with self._connect() as con:
+            # `crop_path` entra junto: é o recorte LIMPO do rosto que o modo
+            # realtime grava ao lado do snapshot. Ficou de fora quando a coluna
+            # foi criada, e a exclusão passou a deixar exatamente o dado mais
+            # identificante — o rosto sem moldura — para trás no disco.
             snapshots = [r["p"] for r in con.execute(
                 """
                 SELECT snapshot_path AS p FROM embeddings
@@ -365,7 +374,10 @@ class Database:
                 UNION ALL
                 SELECT snapshot_path AS p FROM events
                  WHERE person_id=? AND snapshot_path IS NOT NULL
-                """, (person_id, person_id))]
+                UNION ALL
+                SELECT crop_path AS p FROM events
+                 WHERE person_id=? AND crop_path IS NOT NULL
+                """, (person_id, person_id, person_id))]
             tracks = [r["path"] for r in con.execute(
                 """
                 SELECT tc.path FROM track_crops tc
@@ -376,10 +388,34 @@ class Database:
             # embeddings e a pessoa saem sempre — sem eles não há reconhecimento
             con.execute("DELETE FROM embeddings WHERE person_id=?", (person_id,))
 
+            # Correções de presença dela: guardam motivo e autor ligados à
+            # pessoa, e sem a pessoa não alimentam mais nada.
+            con.execute("DELETE FROM attendance_overrides WHERE person_id=?",
+                        (person_id,))
+
+            # Rótulos das detecções DELA saem nos dois modos: um rótulo é uma
+            # afirmação sobre a identidade de alguém. Precisa rodar antes de
+            # mexer em events/tracks, enquanto o person_id ainda as localiza.
+            con.execute(
+                """
+                DELETE FROM detection_labels
+                 WHERE (fonte = 'evento' AND detection_id IN
+                          (SELECT id FROM events WHERE person_id = ?))
+                    OR (fonte = 'trilha' AND detection_id IN
+                          (SELECT id FROM tracks WHERE person_id = ?))
+                """, (person_id, person_id))
+            # Detecções de OUTROS que foram corrigidas para "era esta pessoa"
+            # passam a "não é ninguém cadastrado" — o que, removida a pessoa,
+            # é literalmente verdade. Continuam contando como erro do sistema.
+            con.execute(
+                "UPDATE detection_labels SET pessoa_correta=? "
+                "WHERE pessoa_correta=?", (self.DESCONHECIDO, person_id))
+
             if anonimizar:
                 con.execute(
                     "UPDATE events SET person_id=NULL, name=?, snapshot_path=NULL, "
-                    "is_known=0 WHERE person_id=?", (ANONIMO, person_id))
+                    "crop_path=NULL, is_known=0 WHERE person_id=?",
+                    (ANONIMO, person_id))
                 con.execute(
                     "UPDATE tracks SET person_id=NULL, name=? WHERE person_id=?",
                     (ANONIMO, person_id))
@@ -533,6 +569,26 @@ class Database:
                 "UPDATE tracks SET status='pendente' WHERE status='processado'"
             ).rowcount or 0
 
+    def count_pending_tracks(self, inicio: float = None, fim: float = None) -> int:
+        """Trilhas pendentes, opcionalmente só as que começaram em [inicio, fim).
+
+        A chamada de um dia só depende das trilhas DAQUELE dia. Contar as
+        pendentes do banco inteiro fazia o fechamento ser recusado durante a
+        aula inteira: no modo captura sempre há alguém que acabou de passar e
+        ainda espera o lote, que roda a cada 10 minutos.
+        """
+        cond, args = ["status = 'pendente'"], []
+        if inicio is not None:
+            cond.append("started_at >= ?")
+            args.append(inicio)
+        if fim is not None:
+            cond.append("started_at < ?")
+            args.append(fim)
+        with self._connect() as con:
+            return int(con.execute(
+                f"SELECT COUNT(*) FROM tracks WHERE {' AND '.join(cond)}",
+                args).fetchone()[0])
+
     def count_tracks_by_status(self) -> dict:
         with self._connect() as con:
             rows = con.execute(
@@ -582,7 +638,9 @@ class Database:
             ).fetchall()
         return [dict(r) for r in rows]
 
-    # Valor de `person_id` que seleciona quem NÃO é ninguém cadastrado.
+    # Valor de `person_id` que seleciona quem NÃO é ninguém cadastrado. É
+    # também o que `detection_labels.pessoa_correta` guarda para "não é
+    # ninguém cadastrado" — o NULL ficou reservado para "não informado".
     DESCONHECIDO = -1
 
     def deteccoes_de(self, person_id=None, inicio: float = None,
@@ -603,9 +661,10 @@ class Database:
                       person_id do sistema, caso contrário
 
         `person_id=None` traz todos. `DESCONHECIDO` traz quem ficou sem
-        identidade — os não reconhecidos pelo sistema e também os que foram
-        marcados como "não é ninguém cadastrado". Esse balde é o que permite
-        procurar falso negativo: quem está lá deveria estar em algum nome.
+        identidade — os não reconhecidos pelo sistema, os marcados como "não é
+        ninguém cadastrado" e os marcados errados sem dizer de quem eram. Esse
+        balde é o que permite procurar falso negativo: quem está lá deveria
+        estar em algum nome. A coluna `pessoa_correta` distingue os casos.
         """
         cond, args = [], []
         if inicio is not None:
@@ -635,7 +694,8 @@ class Database:
                        CASE WHEN t.person_id IS NOT NULL THEN 1 ELSE 0 END
                            AS is_known,
                        l.rotulo, l.pessoa_correta,
-                       CASE WHEN l.rotulo = 'errado' THEN l.pessoa_correta
+                       CASE WHEN l.rotulo = 'errado'
+                            THEN NULLIF(l.pessoa_correta, {self.DESCONHECIDO})
                             ELSE t.person_id END AS efetivo
                 FROM tracks t
                 LEFT JOIN detection_labels l
@@ -645,7 +705,8 @@ class Database:
                 SELECT 'evento' AS fonte, e.id, e.person_id, e.name, e.score,
                        e.ts, e.snapshot_path AS foto, e.is_known,
                        l.rotulo, l.pessoa_correta,
-                       CASE WHEN l.rotulo = 'errado' THEN l.pessoa_correta
+                       CASE WHEN l.rotulo = 'errado'
+                            THEN NULLIF(l.pessoa_correta, {self.DESCONHECIDO})
                             ELSE e.person_id END AS efetivo
                 FROM events e
                 LEFT JOIN detection_labels l
@@ -663,10 +724,12 @@ class Database:
                             autor: str = "", pessoa_correta=None) -> None:
         """Marca uma detecção como 'certo' ou 'errado'.
 
-        `pessoa_correta` só faz sentido com 'errado', e NULL ali significa
-        "não é ninguém cadastrado" — diferente de "não sei", que seria não
-        rotular. Com 'certo' é forçado a NULL: guardar alvo num acerto criaria
-        um estado contraditório esperando para confundir alguém.
+        `pessoa_correta` só faz sentido com 'errado':
+            N     -> é a pessoa N
+            -1    -> não é ninguém cadastrado (`DESCONHECIDO`)
+            None  -> errado, mas sem dizer de quem é
+        Com 'certo' é forçado a NULL: guardar alvo num acerto criaria um estado
+        contraditório esperando para confundir alguém.
         """
         if rotulo not in ("certo", "errado"):
             raise ValueError("rotulo deve ser 'certo' ou 'errado'")
@@ -675,7 +738,7 @@ class Database:
         alvo = None
         if rotulo == "errado" and pessoa_correta is not None:
             alvo = int(pessoa_correta)
-            if self.get_person(alvo) is None:
+            if alvo != self.DESCONHECIDO and self.get_person(alvo) is None:
                 raise ValueError(f"pessoa {alvo} não existe")
         with self._connect() as con:
             con.execute(
@@ -1041,9 +1104,19 @@ class Database:
             con.close()
 
         if removed and vacuum:
-            con = sqlite3.connect(self.path, timeout=30, isolation_level=None)
-            try:
-                con.execute("VACUUM")
-            finally:
-                con.close()
+            self.vacuum()
         return removed
+
+    def vacuum(self) -> None:
+        """Compacta o arquivo do banco, devolvendo ao disco o espaço apagado.
+
+        Método próprio porque a limpeza apaga eventos E trilhas e só depois
+        quer compactar. Antes ela pedia o VACUUM chamando de novo
+        `purge_events_before`, que na segunda vez não apagava nada — e sem
+        nada apagado o VACUUM não rodava. Nunca rodou.
+        """
+        con = sqlite3.connect(self.path, timeout=30, isolation_level=None)
+        try:
+            con.execute("VACUUM")
+        finally:
+            con.close()

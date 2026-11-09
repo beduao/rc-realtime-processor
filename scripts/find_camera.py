@@ -37,6 +37,11 @@ from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Importar `core` reconfigura a saída para UTF-8 (ver core/__init__.py). Este
+# script não usa nada de lá, mas imprime "⚠" — e no console cp1252 do Windows
+# isso derrubava o processo com UnicodeEncodeError.
+import core  # noqa: E402,F401
+
 # Portas que denunciam o tipo de equipamento.
 PORTS = {
     554: "RTSP (é isto que o projeto precisa)",

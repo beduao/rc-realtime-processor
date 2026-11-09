@@ -226,6 +226,23 @@ class Camera:
         self.stop()
 
 
+def url_sem_senha(url) -> str:
+    """URL da câmera para mostrar em tela ou log, com a senha trocada por ***.
+
+    `rtsp://admin:segredo@10.0.0.5/...` -> `rtsp://admin:***@10.0.0.5/...`.
+    `rsplit` no "@" porque senha de câmera às vezes tem "@" sem codificar.
+    """
+    texto = str(url)
+    if "//" not in texto or "@" not in texto:
+        return texto
+    prefixo, resto = texto.split("//", 1)
+    credenciais, host = resto.rsplit("@", 1)
+    if "/" in credenciais:          # o "@" estava no caminho, não há senha
+        return texto
+    usuario = credenciais.split(":", 1)[0]
+    return f"{prefixo}//{usuario}:***@{host}"
+
+
 def camera_from_config(cfg) -> "Camera":
     """Cria a Camera a partir do config.yaml (usado por worker, API e scripts).
 

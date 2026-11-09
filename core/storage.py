@@ -38,9 +38,18 @@ class SnapshotStore:
         return str(prefix / fname)
 
     def remove_dir(self, subdir: str) -> None:
-        """Remove uma subpasta de snapshots (ex.: amostras de um cadastro cancelado)."""
+        """Remove a pasta temporária de uma sessão de cadastro (`enroll/<id>`).
+
+        Só aceita pasta ESTRITAMENTE dentro de `enroll/`. A versão anterior
+        aceitava qualquer coisa sob a base de snapshots — inclusive a própria
+        base: `enroll/..` resolvia para `data/snapshots` e o rmtree levava
+        todas as fotos, e `enroll/../amostras` levava as de cadastro de todo
+        mundo. Como o id da sessão vem do cliente, isso estava a uma
+        requisição de distância.
+        """
         import shutil
 
+        raiz = (self.base / "enroll").resolve()
         target = (self.base / subdir).resolve()
-        if str(target).startswith(str(self.base.resolve())) and target.is_dir():
+        if target != raiz and target.is_relative_to(raiz) and target.is_dir():
             shutil.rmtree(target, ignore_errors=True)

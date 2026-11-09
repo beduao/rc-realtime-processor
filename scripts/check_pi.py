@@ -24,7 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import cv2  # noqa: E402
 import numpy as np  # noqa: E402
 
-from core.camera import camera_from_config  # noqa: E402
+from core.camera import camera_from_config, url_sem_senha  # noqa: E402
 from core.config import live_image_path, load_config_or_exit, project_path  # noqa: E402
 from core.database import Database  # noqa: E402
 
@@ -134,13 +134,7 @@ def check_config_and_models() -> bool:
     good = True
 
     url = str(cfg.camera.rtsp_url)
-    safe = url
-    if "@" in url and "//" in url:
-        prefix, rest = url.split("//", 1)
-        creds, host = rest.split("@", 1)
-        user = creds.split(":", 1)[0]
-        safe = f"{prefix}//{user}:***@{host}"
-    print(f"      rtsp:    {safe}")
+    print(f"      rtsp:    {url_sem_senha(url)}")
 
     if "SENHA_CODIFICADA" in url or "SUA_SENHA" in url:
         print(BAD + "a URL RTSP ainda é o exemplo — edite o config.yaml")

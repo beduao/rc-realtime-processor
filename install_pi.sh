@@ -292,16 +292,14 @@ else
   sudo systemctl enable --now facial-cleanup.timer >/dev/null
   ok "facial-api, facial-worker e facial-cleanup.timer habilitados no boot"
 
-  # O lote só faz sentido no modo captura; ligar sozinho evita ter que
-  # lembrar disso depois de trocar o modo no config.
-  if grep -qE '^\s*mode:\s*"?captura"?' "$CFG"; then
-    sudo systemctl enable --now facial-batch.timer >/dev/null
-    ok "modo captura detectado: facial-batch.timer habilitado (lote a cada 10 min)"
-  else
-    sudo systemctl disable --now facial-batch.timer >/dev/null 2>&1 || true
-    printf '      modo realtime: o lote fica desligado. Se trocar para captura,\n'
-    printf '      rode: sudo systemctl enable --now facial-batch.timer\n'
-  fi
+  # O lote fica SEMPRE ligado. Antes ele era ligado ou desligado conforme o
+  # modo no momento da instalação — mas o modo se troca em execução (set_mode),
+  # e reinstalar em realtime desligava o timer. Depois, ao voltar para
+  # captura, as trilhas se acumulavam sem reconhecimento, a chamada não
+  # fechava e a retenção acabava apagando os recortes. Sem pendência, o lote
+  # termina em segundos sem fazer nada.
+  sudo systemctl enable --now facial-batch.timer >/dev/null
+  ok "facial-batch.timer habilitado (lote a cada 10 min; ocioso sem pendência)"
 
   sleep 4
   for svc in facial-api facial-worker; do

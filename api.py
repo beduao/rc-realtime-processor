@@ -27,6 +27,7 @@ import shutil
 import threading
 import time
 import uuid
+from contextlib import asynccontextmanager
 
 import cv2
 import numpy as np
@@ -42,7 +43,7 @@ from core.database import (Database, MatriculaDuplicada,
                           normalizar_matricula)
 from core.draw import crop_face, draw_face
 from core.face_engine import FaceEngine
-from core.imagem import LARGURAS_MINIATURA, gerar_miniatura
+from core.imagem import LARGURAS_MINIATURA, caminho_miniatura, gerar_miniatura
 from core.imagem import ler as ler_imagem
 from core.storage import SnapshotStore
 
@@ -61,6 +62,30 @@ STATUS_PATH = LIVE_PATH.with_name("facial-status.json")
 FRAME_PATH = frame_image_path(cfg)
 FRAME_MAX_AGE = 5.0        # acima disso o frame do worker é velho demais
 ENROLL_TARGET = int(cfg.enroll.frames_to_capture)  # amostras sugeridas por pessoa
+
+# Nitidez mínima de uma amostra de cadastro — a variância do Laplaciano do
+# recorte, o mesmo número que a aba Pessoas mostra como "nitidez". 0 desliga.
+#
+# Por que avisar: rosto borrado ou mal visível vira um embedding genérico,
+# parecido com o de qualquer outro rosto borrado, e na galeria ele "atrai"
+# capturas ruins de OUTRAS pessoas. Foi a causa da confusão lais -> bia: três
+# amostras dela tinham nitidez 171, 257 e 274, e nenhuma amostra boa do piloto
+# ficou abaixo de 407. O 300 sai daí — dados da webcam do PC. A escala muda
+# com câmera e resolução, então confira as amostras boas no Pi antes de
+# confiar no padrão.
+_nitidez_cfg = cfg.enroll.get("nitidez_minima")
+NITIDEZ_MINIMA = 300.0 if _nitidez_cfg is None else float(_nitidez_cfg)
+
+# Status do worker mais velho que isto = worker parado. Ele republica a cada
+# 10s (worker.STATUS_EVERY_SECONDS); 30s tolera duas publicações perdidas.
+WORKER_VIVO_SEGUNDOS = 30
+# Sessão de cadastro sem uso por este tempo expira. Sem prazo, quem fechasse
+# o navegador no meio deixava a sessão — e a câmera que ela segura — para
+# sempre na memória da API.
+SESSAO_EXPIRA_SEGUNDOS = 15 * 60
+# Câmera aberta pela API, sem sessão e sem uso por este tempo, é fechada.
+CAMERA_OCIOSA_SEGUNDOS = 60
+VARREDURA_SEGUNDOS = 30    # intervalo da faxina do cadastro
 
 # --------------------------------------------------------------------------- #
 # Autenticação por EXPOSIÇÃO, não por flag.
@@ -212,7 +237,19 @@ def autorizar(request: Request):
     return consumidor, None
 
 
-app = FastAPI(title="Reconhecimento Facial — API")
+@asynccontextmanager
+async def _ciclo_de_vida(_app):
+    """Mantém a faxina do cadastro rodando enquanto a API estiver no ar."""
+    parar = threading.Event()
+    threading.Thread(target=_faxina_periodica, args=(parar,), daemon=True,
+                     name="faxina-cadastro").start()
+    try:
+        yield
+    finally:
+        parar.set()
+
+
+app = FastAPI(title="Reconhecimento Facial — API", lifespan=_ciclo_de_vida)
 
 
 # Middleware, e não `dependencies=[Depends(...)]` no app: as rotas /docs,
@@ -234,8 +271,10 @@ async def autenticacao(request: Request, call_next):
 
 # ---- estado das sessões de cadastro --------------------------------------- #
 _lock = threading.Lock()
-_sessions: dict[str, dict] = {}   # session_id -> {name, samples:[{index,embedding,snapshot}]}
+# session_id -> {name, matricula, ultimo_uso, samples:[{index,embedding,snapshot}]}
+_sessions: dict[str, dict] = {}
 _enroll_cam: Camera | None = None
+_camera_usada_em = 0.0     # último frame que a API tirou da própria câmera
 
 
 def _frame_do_worker():
@@ -284,11 +323,19 @@ def frame_para_cadastro():
     # câmera, e escondeu por semanas que o frame do worker não estava sendo
     # alcançado (no Pi porque não era publicado; no Windows porque o imread
     # não lia caminho com acento).
-    if _fonte_e_dispositivo_local() and _worker_vivo():
+    if not _pode_abrir_camera():
         return None, "conflito"
 
+    global _camera_usada_em
     cam = _get_camera()
-    return cam.read(), "camera"
+    _camera_usada_em = time.time()
+    frame = cam.read()
+    if frame is None:
+        # Câmera recém-aberta ainda sem o primeiro frame. Em "adicionar
+        # amostra" ela é aberta no próprio clique; sem esta espera o primeiro
+        # clique respondia "sem imagem" e só o segundo funcionava.
+        frame = cam.read_wait(timeout=2.0)
+    return frame, "camera"
 
 
 def _porque_sem_imagem(origem: str) -> str:
@@ -310,27 +357,191 @@ def _fonte_e_dispositivo_local() -> bool:
     return _parse_source(cfg.camera.rtsp_url)[1] != cv2.CAP_FFMPEG
 
 
-def _worker_vivo() -> bool:
-    """O worker publicou status recentemente?"""
+def _ler_status() -> dict:
+    """Último status publicado pelo worker, ou {} se não houver/estiver ilegível."""
     try:
         with open(STATUS_PATH, encoding="utf-8") as fh:
             st = json.load(fh)
     except (OSError, ValueError):
+        return {}
+    return st if isinstance(st, dict) else {}
+
+
+def _worker_vivo() -> bool:
+    """O worker está no ar — e, portanto, dono da câmera?
+
+    O worker republica o status a cada 10s por uma thread própria, chegue
+    frame ou não. O limite antigo era 60s com publicação a cada 5 minutos, e
+    a resposta era "parado" na maior parte do tempo.
+
+    `encerrado` é o aviso que o worker deixa ao sair, para a API não ter que
+    esperar o status envelhecer.
+    """
+    st = _ler_status()
+    if not st or st.get("encerrado"):
         return False
-    return time.time() - float(st.get("updated_at", 0)) < 60
+    try:
+        return time.time() - float(st.get("updated_at", 0)) < WORKER_VIVO_SEGUNDOS
+    except (TypeError, ValueError):
+        return False
+
+
+def _pode_abrir_camera() -> bool:
+    """A API pode abrir a câmera sem tomá-la do worker?
+
+    RTSP aceita várias conexões, então sempre pode. Webcam e CSI aceitam um
+    processo só: com o worker no ar, abrir aqui é disputar o dispositivo.
+    """
+    return not (_fonte_e_dispositivo_local() and _worker_vivo())
+
+
+def _soltar_camera() -> None:
+    """Fecha a câmera da API. O stop() fica fora do lock: ele espera a thread
+    de captura terminar, e segurar o lock nesse tempo travaria as rotas."""
+    global _enroll_cam
+    with _lock:
+        cam, _enroll_cam = _enroll_cam, None
+    if cam is not None:
+        cam.stop()
 
 
 def _maybe_close_camera():
-    global _enroll_cam
     with _lock:
-        if not _sessions and _enroll_cam is not None:
-            _enroll_cam.stop()
-            _enroll_cam = None
+        livre = not _sessions and _enroll_cam is not None
+    if livre:
+        _soltar_camera()
+
+
+def _sessao(session_id: str) -> dict:
+    """Sessão de cadastro viva, já marcada como usada agora. 404 se não há."""
+    with _lock:
+        sess = _sessions.get(session_id)
+        if sess is not None:
+            sess["ultimo_uso"] = time.time()
+    if sess is None:
+        raise HTTPException(
+            404, "Sessão de cadastro inválida ou expirada (expira após "
+                 f"{SESSAO_EXPIRA_SEGUNDOS // 60} minutos sem uso). Cancele e "
+                 "comece de novo.")
+    return sess
+
+
+def _varrer_cadastro(agora: float | None = None) -> dict:
+    """Faxina do cadastro: solta a câmera, expira sessões, limpa pastas órfãs.
+
+    Roda a cada VARREDURA_SEGUNDOS numa thread (ver `_ciclo_de_vida`). É
+    função à parte para o teste poder chamá-la direto, sem esperar.
+
+    Regras, da mais importante para a menos:
+
+      1. Câmera local aberta pela API + worker no ar -> solta NA HORA. Era o
+         que parava a captura em silêncio: a API abria a webcam com o worker
+         parado, o worker voltava e não conseguia mais abrir o dispositivo.
+         Ele tenta reabrir a cada poucos segundos, então soltar aqui basta.
+      2. Sessão sem uso há SESSAO_EXPIRA_SEGUNDOS expira, levando a pasta
+         temporária com as fotos dela.
+      3. Sem sessão e sem uso há CAMERA_OCIOSA_SEGUNDOS, a câmera fecha.
+         Não fecha logo após "adicionar amostra" de propósito: o preview da
+         aba Pessoas continua usando-a enquanto a tela está aberta.
+      4. Pastas `enroll/<sessão>` sem sessão viva e mais velhas que o prazo
+         são apagadas. Sobram quando a API reinicia no meio de um cadastro, e
+         são fotos de rosto sem dono.
+    """
+    agora = time.time() if agora is None else agora
+
+    motivo = None
+    with _lock:
+        aberta = _enroll_cam is not None
+    if aberta:
+        if not _pode_abrir_camera():
+            motivo = "worker no ar"
+        else:
+            with _lock:
+                ociosa = (not _sessions
+                          and agora - _camera_usada_em > CAMERA_OCIOSA_SEGUNDOS)
+            if ociosa:
+                motivo = "ociosa"
+        if motivo:
+            _soltar_camera()
+
+    with _lock:
+        expiradas = [sid for sid, s in _sessions.items()
+                     if agora - s.get("ultimo_uso", agora) > SESSAO_EXPIRA_SEGUNDOS]
+        for sid in expiradas:
+            _sessions.pop(sid, None)
+        vivas = set(_sessions)
+    for sid in expiradas:
+        store.remove_dir(f"enroll/{sid}")
+    if expiradas:
+        _maybe_close_camera()
+
+    orfas = 0
+    pasta = SNAP_BASE / "enroll"
+    if pasta.is_dir():
+        for d in pasta.iterdir():
+            if not d.is_dir() or d.name in vivas:
+                continue
+            try:
+                velha = agora - d.stat().st_mtime > SESSAO_EXPIRA_SEGUNDOS
+            except OSError:
+                continue
+            if velha:
+                store.remove_dir(f"enroll/{d.name}")
+                orfas += 1
+
+    if motivo or expiradas or orfas:
+        print(f"[api] faxina do cadastro: câmera "
+              f"{'fechada (' + motivo + ')' if motivo else 'sem mudança'}, "
+              f"{len(expiradas)} sessão(ões) expirada(s), {orfas} pasta(s) "
+              "órfã(s) removida(s)", flush=True)
+    return {"camera_fechada": motivo, "expiradas": expiradas, "orfas": orfas}
+
+
+def _faxina_periodica(parar: threading.Event) -> None:
+    while not parar.wait(VARREDURA_SEGUNDOS):
+        try:
+            _varrer_cadastro()
+        except Exception as exc:                           # noqa: BLE001
+            # Faxina falhando não pode derrubar a API nem parar de tentar.
+            print(f"[api] faxina do cadastro falhou: {type(exc).__name__}: "
+                  f"{exc}", flush=True)
 
 
 def _public_samples(sess: dict):
-    return [{"index": s["index"], "snapshot_url": f"/snapshots/{s['snapshot']}"}
+    return [{"index": s["index"], "snapshot_url": f"/snapshots/{s['snapshot']}",
+             "nitidez": s.get("quality"),
+             "nitidez_baixa": _nitidez_baixa(s.get("quality"))}
             for s in sess["samples"]]
+
+
+def _nitidez_baixa(valor):
+    """True/False conforme NITIDEZ_MINIMA; None quando não dá para dizer —
+    amostra antiga, gravada antes de a nitidez existir, ou aviso desligado."""
+    if valor is None or NITIDEZ_MINIMA <= 0:
+        return None
+    return float(valor) < NITIDEZ_MINIMA
+
+
+def _aviso_nitidez(nitidez):
+    if not _nitidez_baixa(nitidez):
+        return None
+    return (f"Amostra com nitidez baixa ({nitidez:.0f}; o mínimo é "
+            f"{NITIDEZ_MINIMA:.0f}). Rosto borrado ou mal visível atrapalha "
+            "mais do que ajuda: o sistema passa a confundir outras pessoas com "
+            "esta. Remova a amostra e capture de novo, com a pessoa parada, de "
+            "frente e com o rosto iluminado.")
+
+
+def _avisos_da_amostra(n_rostos: int, nitidez):
+    """Avisos de uma captura num texto só, ou None se não há nada a dizer.
+
+    Avisa e NÃO recusa: o número de nitidez depende da câmera, e recusar com
+    um limiar mal calibrado travaria o cadastro inteiro. A amostra fica, a
+    pessoa vê o aviso e a miniatura marcada, e decide.
+    """
+    avisos = [a for a in (_aviso_multiplos_rostos(n_rostos),
+                          _aviso_nitidez(nitidez)) if a]
+    return " ".join(avisos) or None
 
 
 AMOSTRAS_SUBDIR = "amostras"          # snapshots/amostras/<person_id>/
@@ -381,6 +592,7 @@ def _redundancia(amostras: list[dict]) -> list[dict]:
                              if a["snapshot_path"] else None),
             "created_at": a["created_at"],
             "quality": a["quality"],
+            "nitidez_baixa": _nitidez_baixa(a["quality"]),
             "similaridade_maxima": round(melhor, 3) if parceiro else None,
             "parecida_com": parceiro,
         })
@@ -414,24 +626,20 @@ def health():
 
     # Modo REAL em execução, publicado pelo worker. Difere do config.yaml
     # quando o worker foi iniciado com --mode.
-    worker_mode, tracks_pending = None, None
-    try:
-        with open(STATUS_PATH, encoding="utf-8") as fh:
-            st = json.load(fh)
-        if time.time() - st.get("updated_at", 0) < 600:
-            worker_mode = st.get("mode")
-            tracks_pending = st.get("pendentes")
-    except (OSError, ValueError):
-        pass
+    vivo = _worker_vivo()
+    st = _ler_status() if vivo else {}
 
     return {
         "ok": True,
         "enroll_target": ENROLL_TARGET,
         "opencv": cv2.__version__,
         "people": len(db.list_people()),
-        "worker_live_age_seconds": live_age,   # None ou muito alto => worker parado
-        "worker_mode": worker_mode,            # None => worker parado ou antigo
-        "tracks_pending": tracks_pending,      # só no modo captura
+        # Pelo batimento do worker, não pela idade do live.jpg: o preview só
+        # é escrito com `draw_annotations` ligado e quando chega frame.
+        "worker_ativo": vivo,
+        "worker_live_age_seconds": live_age,
+        "worker_mode": st.get("mode"),         # None => worker parado
+        "tracks_pending": st.get("pendentes"),  # só no modo captura
         "enroll_session_active": bool(_sessions),
         # "worker" => cadastro usa o frame publicado (funciona com o worker no ar);
         # "camera" => a API abre a câmera (só possível com o worker parado)
@@ -442,17 +650,21 @@ def health():
 # ---- cadastro interativo -------------------------------------------------- #
 @app.post("/enroll/start")
 def enroll_start(req: StartReq):
+    global _camera_usada_em
     name = req.name.strip()
     if not name:
         raise HTTPException(400, "Nome é obrigatório.")
-    # Só abre a câmera se o worker NÃO estiver publicando frames — com webcam
-    # USB, tentar abrir enquanto ele roda falha (dispositivo exclusivo).
-    if _frame_do_worker() is None:
+    # Só abre a câmera se o worker não estiver publicando frames E não estiver
+    # com o dispositivo. Frame atrasado não quer dizer worker parado: com a
+    # câmera travada ele continua vivo e dono da webcam.
+    if _frame_do_worker() is None and _pode_abrir_camera():
         _get_camera()
+        _camera_usada_em = time.time()
     sid = uuid.uuid4().hex[:12]
     with _lock:
         _sessions[sid] = {"name": name, "samples": [],
-                          "matricula": normalizar_matricula(req.matricula)}
+                          "matricula": normalizar_matricula(req.matricula),
+                          "ultimo_uso": time.time()}
     return {"session_id": sid, "name": name, "target": ENROLL_TARGET}
 
 
@@ -499,9 +711,7 @@ def enroll_preview():
 @app.post("/enroll/capture")
 def enroll_capture(req: SessionReq):
     """Captura UMA amostra a partir do frame atual (1 embedding por chamada)."""
-    sess = _sessions.get(req.session_id)
-    if sess is None:
-        raise HTTPException(404, "Sessão inválida ou expirada.")
+    sess = _sessao(req.session_id)
     frame, origem = frame_para_cadastro()
     if frame is None:
         return {"ok": False, "message": _porque_sem_imagem(origem)}
@@ -514,15 +724,16 @@ def enroll_capture(req: SessionReq):
     vec = engine.embed(frame, face)
     index = len(sess["samples"])
     crop = crop_face(frame, face)
+    nitidez = _nitidez(crop)
     snapshot = store.save(crop, f"{sess['name']}_s{index + 1}", subdir=f"enroll/{req.session_id}")
     sess["samples"].append({"index": index, "embedding": vec, "snapshot": snapshot,
-                            "quality": _nitidez(crop)})
+                            "quality": nitidez})
     return {"ok": True, "count": len(sess["samples"]), "target": ENROLL_TARGET,
             "samples": _public_samples(sess),
-            # Segunda barreira contra cadastrar a pessoa errada. A primeira é
-            # visual, no preview; esta avisa depois do clique, porque quem
-            # cadastra costuma estar olhando para o botão, não para a imagem.
-            "aviso": _aviso_multiplos_rostos(len(rostos))}
+            # Avisa depois do clique porque quem cadastra costuma estar
+            # olhando para o botão, não para a imagem: pessoa errada em cena
+            # (a primeira barreira é a marcação no preview) e rosto borrado.
+            "aviso": _avisos_da_amostra(len(rostos), nitidez)}
 
 
 def _aviso_multiplos_rostos(n: int):
@@ -537,9 +748,7 @@ def _aviso_multiplos_rostos(n: int):
 
 @app.post("/enroll/sample/delete")
 def enroll_delete(req: SampleDelReq):
-    sess = _sessions.get(req.session_id)
-    if sess is None:
-        raise HTTPException(404, "Sessão inválida ou expirada.")
+    sess = _sessao(req.session_id)
     if 0 <= req.index < len(sess["samples"]):
         sess["samples"].pop(req.index)
         for i, s in enumerate(sess["samples"]):  # reindexa
@@ -549,18 +758,14 @@ def enroll_delete(req: SampleDelReq):
 
 @app.get("/enroll/status")
 def enroll_status(session_id: str):
-    sess = _sessions.get(session_id)
-    if sess is None:
-        raise HTTPException(404, "Sessão inválida ou expirada.")
+    sess = _sessao(session_id)
     return {"name": sess["name"], "count": len(sess["samples"]),
             "target": ENROLL_TARGET, "samples": _public_samples(sess)}
 
 
 @app.post("/enroll/finish")
 def enroll_finish(req: SessionReq):
-    sess = _sessions.get(req.session_id)
-    if sess is None:
-        raise HTTPException(404, "Sessão inválida ou expirada.")
+    sess = _sessao(req.session_id)
     if not sess["samples"]:
         raise HTTPException(422, "Capture pelo menos uma amostra antes de concluir.")
     try:
@@ -592,8 +797,13 @@ def enroll_finish(req: SessionReq):
 @app.post("/enroll/cancel")
 def enroll_cancel(req: SessionReq):
     with _lock:
-        _sessions.pop(req.session_id, None)
-    store.remove_dir(f"enroll/{req.session_id}")
+        sess = _sessions.pop(req.session_id, None)
+    # Só apaga a pasta de uma sessão que EXISTIA. O id vem do cliente, e
+    # usá-lo direto no caminho deixava `".."` apagar data/snapshots inteiro.
+    # Cancelar sessão desconhecida segue respondendo ok: ela pode ter
+    # expirado, e o efeito desejado — não existir mais — já vale.
+    if sess is not None:
+        store.remove_dir(f"enroll/{req.session_id}")
     _maybe_close_camera()
     return {"ok": True}
 
@@ -605,11 +815,26 @@ def people():
 
 
 def _apagar_arquivo(base, rel: str) -> bool:
-    """Remove um arquivo dentro de `base`, recusando caminho que escape dela."""
+    """Remove um arquivo dentro de `base` E as miniaturas dele.
+
+    As miniaturas moram ao lado da original (`foto.mini128.jpg`) e são cópia
+    reduzida do mesmo rosto. Apagar só a original deixava a foto da pessoa
+    excluída no disco, em tamanho menor.
+
+    `is_relative_to` compara componentes de caminho; o `startswith` de antes
+    aceitava diretório irmão de nome parecido.
+    """
     if not rel:
         return False
     alvo = (base / rel).resolve()
-    if not str(alvo).startswith(str(base)) or not alvo.is_file():
+    if alvo == base or not alvo.is_relative_to(base):
+        return False
+    for largura in LARGURAS_MINIATURA:
+        try:
+            caminho_miniatura(alvo, largura).unlink(missing_ok=True)
+        except OSError:
+            pass
+    if not alvo.is_file():
         return False
     alvo.unlink(missing_ok=True)
     return True
@@ -642,7 +867,7 @@ def delete_person(person_id: int,
                              for r in arquivos["tracks"])
 
     pasta = (SNAP_BASE / AMOSTRAS_SUBDIR / str(person_id)).resolve()
-    if str(pasta).startswith(str(SNAP_BASE)) and pasta.is_dir():
+    if pasta != SNAP_BASE and pasta.is_relative_to(SNAP_BASE) and pasta.is_dir():
         shutil.rmtree(pasta, ignore_errors=True)
 
     return {
@@ -717,7 +942,8 @@ def person_samples(person_id: int):
         raise HTTPException(404, "Pessoa não encontrada.")
     amostras = db.list_embeddings(person_id)
     return {"person": pessoa, "samples": _redundancia(amostras),
-            "sem_foto": sum(1 for a in amostras if not a["snapshot_path"])}
+            "sem_foto": sum(1 for a in amostras if not a["snapshot_path"]),
+            "nitidez_minima": NITIDEZ_MINIMA or None}
 
 
 @app.post("/people/{person_id}/samples")
@@ -742,14 +968,18 @@ def add_sample(person_id: int):
 
     vec = engine.embed(frame, face)
     crop = crop_face(frame, face)
+    nitidez = _nitidez(crop)
     n = db.count_embeddings(person_id) + 1
     caminho = _guardar_amostra(person_id, crop, f"{pessoa['name']}_s{n}")
-    eid = db.add_embedding(person_id, vec, caminho, _nitidez(crop))
-    _maybe_close_camera()
+    eid = db.add_embedding(person_id, vec, caminho, nitidez)
+    # A câmera, se foi a API que abriu, NÃO fecha aqui: o preview da aba
+    # Pessoas segue usando-a. Quem fecha é a faxina (`_varrer_cadastro`),
+    # depois de um minuto sem uso ou na hora em que o worker volta.
     return {"ok": True, "id": eid, "origem": origem,
             "snapshot_url": f"/snapshots/{caminho}",
             "total": db.count_embeddings(person_id),
-            "aviso": _aviso_multiplos_rostos(len(rostos))}
+            "nitidez": nitidez, "nitidez_baixa": _nitidez_baixa(nitidez),
+            "aviso": _avisos_da_amostra(len(rostos), nitidez)}
 
 
 @app.delete("/embeddings/{embedding_id}")
@@ -768,13 +998,8 @@ def delete_sample(embedding_id: int):
                  "remover, ou exclua a pessoa inteira.")
 
     db.delete_embedding(embedding_id)
-    if amostra["snapshot_path"]:
-        arq = (SNAP_BASE / amostra["snapshot_path"]).resolve()
-        # is_relative_to, não startswith: comparação de prefixo de string
-        # deixaria passar diretório irmão de nome parecido. Mesmo defeito que
-        # já foi corrigido na rota de snapshots — este escapou na ocasião.
-        if arq.is_relative_to(SNAP_BASE) and arq.is_file():
-            arq.unlink(missing_ok=True)
+    # Mesma rotina da exclusão de pessoa: leva as miniaturas junto.
+    _apagar_arquivo(SNAP_BASE, amostra["snapshot_path"])
     return {"deleted": embedding_id,
             "restantes": db.count_embeddings(amostra["person_id"])}
 
@@ -841,7 +1066,9 @@ def _montar_chamada(dia: str = "", inicio: str = "", fim: str = "") -> dict:
     correcoes = db.attendance_overrides(dia_iso)
     fechamento = db.attendance_closure(dia_iso)
     todos = db.list_people()
-    pendentes = db.count_tracks_by_status().get("pendente", 0)
+    # Só as pendências DESTE período. As do banco inteiro faziam qualquer dia
+    # parecer incompleto enquanto houvesse alguém passando hoje.
+    pendentes = db.count_pending_tracks(t0, t1)
 
     presentes, ausentes = [], []
     n_marcados_presentes = n_marcados_ausentes = 0
@@ -1090,8 +1317,8 @@ class RotuloReq(BaseModel):
     detection_id: int
     rotulo: str = "errado"
     autor: str = ""
-    # Quem é de verdade. Ausente (ou null) com rotulo='errado' significa
-    # "não é ninguém cadastrado".
+    # Quem é de verdade, com rotulo='errado': o id da pessoa; -1 para "não é
+    # ninguém cadastrado"; ausente (null) para "não sei de quem é".
     pessoa_correta: int | None = None
 
 
@@ -1179,11 +1406,17 @@ class CloseReq(BaseModel):
 def close_attendance(req: CloseReq):
     """Fecha a chamada do dia, marcando que uma pessoa a conferiu."""
     dia = _validar_dia(req.dia)
-    pendentes = db.count_tracks_by_status().get("pendente", 0)
+    # Pendências só do dia que está sendo fechado. Contar as do banco inteiro
+    # recusava o fechamento durante a aula toda: no modo captura sempre há
+    # alguém que acabou de passar esperando o lote.
+    t0, t1 = _janela(dia, "", "")
+    pendentes = db.count_pending_tracks(t0, t1)
     if pendentes:
         raise HTTPException(
-            409, f"Há {pendentes} trilha(s) aguardando reconhecimento. Rode o "
-                 "lote antes de fechar, senão a chamada fecha incompleta: "
+            409, f"Há {pendentes} trilha(s) deste dia aguardando "
+                 "reconhecimento, e fechar agora fecharia a chamada "
+                 "incompleta. O lote roda sozinho a cada 10 minutos: tente de "
+                 "novo em alguns minutos. Para adiantar, no Pi: "
                  "python scripts/recognize_batch.py")
 
     resumo = _montar_chamada(dia=dia)
@@ -1216,7 +1449,7 @@ def track_crop(path: str, largura: int = Query(
     devolviam 404 para tudo que viesse do modo captura — justamente o modo
     usado em produção.
     """
-    return _servir_imagem(TRACKS_BASE, path, "Recorte não encontrado.")
+    return _servir_imagem(TRACKS_BASE, path, "Recorte não encontrado.", largura)
 
 
 @app.get("/")

@@ -174,10 +174,10 @@ async function iniciar() {
   $("#estado-api").textContent =
     s.consumidor === "local" ? "acesso local" : `sessão: ${s.consumidor}`;
 
-  const hoje = new Date().toISOString().slice(0, 10);
-  $("#dia").value = hoje;
-  $("#dia-rec").value = hoje;
-
+  // O dia NÃO é calculado aqui. `toISOString()` dá a data em UTC, que no
+  // Brasil vira o dia seguinte às 21h — e "Fechar" fecharia uma chamada que
+  // ainda não aconteceu. Com o campo vazio, a API responde com a chamada de
+  // hoje pelo relógio do Pi, e é ela que preenche os campos de data.
   await Promise.all([carregarChamada(), recarregarListasDePessoas()]);
   atualizarSaude();
   setInterval(atualizarSaude, 15000);
@@ -203,11 +203,9 @@ async function atualizarSaude() {
     const partes = [];
     if (h.worker_mode) partes.push(`modo ${h.worker_mode}`);
     if (h.tracks_pending) partes.push(`${h.tracks_pending} pendentes`);
-    if (h.worker_live_age_seconds != null && h.worker_live_age_seconds < 30) {
-      partes.push("worker ativo");
-    } else {
-      partes.push("worker parado?");
-    }
+    // Pelo batimento do worker. A idade do live.jpg enganava: ele só é
+    // escrito com `draw_annotations` ligado e quando chega frame.
+    partes.push(h.worker_ativo ? "worker ativo" : "worker parado?");
     $("#estado-api").textContent = partes.join(" · ");
     $("#estado-api").className = "estado";
   } catch { /* o erro já apareceu em outro lugar */ }
@@ -253,7 +251,7 @@ const ICONES = {
 };
 
 async function carregarChamada() {
-  const dia = $("#dia").value;
+  const dia = $("#dia").value;          // vazio na primeira carga = hoje no Pi
   try {
     chamada = await api(`/attendance?dia=${dia}`);
   } catch (e) {
@@ -261,12 +259,29 @@ async function carregarChamada() {
     $("#avisos").append(faixa("erro", `Falha ao carregar: ${e.message}`));
     return;
   }
+  if (!dia) {
+    $("#dia").value = chamada.periodo.dia;
+    if (!$("#dia-rec").value) $("#dia-rec").value = chamada.periodo.dia;
+  }
   desenharChamada();
 }
 
-function faixa(tipo, html) {
+/* Faixa de aviso. Monta o conteúdo como TEXTO, nunca como HTML.
+ *
+ * A versão anterior usava innerHTML, e várias mensagens carregam texto
+ * digitado por alguém: o `autor` do fechamento, o nome do aluno que vem no
+ * erro de matrícula duplicada. Um nome como `<img src=x onerror=...>` virava
+ * código rodando na tela de quem abrisse a chamada.
+ *
+ * Cada parte é uma string (texto puro) ou `negrito(...)` / `codigo(...)`. */
+const negrito = (texto) => ({ tag: "b", texto });
+const codigo = (texto) => ({ tag: "code", texto });
+
+function faixa(tipo, ...partes) {
   const d = criar("div", { className: `faixa ${tipo}` });
-  d.innerHTML = html;
+  for (const p of partes) {
+    d.append(typeof p === "string" ? p : criar(p.tag, { textContent: p.texto }));
+  }
   return d;
 }
 
@@ -291,14 +306,15 @@ function desenharChamada() {
   av.innerHTML = "";
   if (!d.completo) {
     av.append(faixa("erro",
-      `<b>${d.trilhas_pendentes} trilha(s) aguardando reconhecimento.</b> ` +
-      "A chamada está incompleta — rode o lote antes de conferir: " +
-      "<code>python scripts/recognize_batch.py</code>"));
+      negrito(`${d.trilhas_pendentes} trilha(s) deste dia aguardando reconhecimento.`),
+      " A chamada está incompleta. O lote roda sozinho a cada 10 minutos — " +
+      "recarregue em alguns minutos. Para adiantar, no Pi: ",
+      codigo("python scripts/recognize_batch.py")));
   }
   if (d.sem_matricula) {
     av.append(faixa("aviso",
-      `<b>${d.sem_matricula} aluno(s) sem matrícula.</b> ` +
-      "O sistema de gestão da escola não consegue casar esses registros."));
+      negrito(`${d.sem_matricula} aluno(s) sem matrícula.`),
+      " O sistema de gestão da escola não consegue casar esses registros."));
   }
   if (d.conferida) {
     const f = d.fechamento;
@@ -307,8 +323,8 @@ function desenharChamada() {
       ". Para alterar, reabra abaixo."));
   } else {
     av.append(faixa("aviso",
-      "Chamada <b>em aberto</b>. Quem não foi identificado pode ter passado " +
-      "sem ser detectado — confira antes de tratar como falta."));
+      "Chamada ", negrito("em aberto"), ". Quem não foi identificado pode ter " +
+      "passado sem ser detectado — confira antes de tratar como falta."));
   }
 
   $("#n-presentes").textContent = `(${d.presentes.length})`;
@@ -510,9 +526,19 @@ async function carregarDeteccoes() {
  * e sem revisão marcada a calibração não tem teto para o limiar. */
 let deteccoesNaTela = [];
 
-/* `pessoaCorreta`: id de quem é de verdade, ou null para "não é ninguém
- * cadastrado". A distinção importa — null manda a detecção para o balde
- * Desconhecido, que é onde se procura quem passou e o sistema não conhece. */
+/* `pessoaCorreta`: id de quem é de verdade; NINGUEM (-1) para "não é ninguém
+ * cadastrado"; null para "não sei de quem é". Os dois últimos vão para o balde
+ * Desconhecido, mas são coisas diferentes para a calibração: -1 diz que um
+ * estranho passou como aluno, null só diz que o sistema errou. Antes os dois
+ * eram gravados como null e não havia como separar. */
+const NINGUEM = -1;
+
+function textoCorrecao(d) {
+  if (d.efetivo_nome) return `corrigido: é ${d.efetivo_nome}`;
+  if (d.pessoa_correta === NINGUEM) return "corrigido: não é ninguém cadastrado";
+  return "corrigido: errado, sem dizer quem é";
+}
+
 async function marcarErro(d, pessoaCorreta = null) {
   await api("/detections/label", { metodo: "POST", corpo: {
     fonte: d.fonte, detection_id: d.id, rotulo: "errado",
@@ -541,8 +567,7 @@ function abrirLupaDeDeteccoes(alvo) {
     titulo: `${d.nome} · ${d.score.toFixed(2)}`,
     meta: `${d.quando.slice(0, 10)} ${d.quando.slice(11, 19)} · ` +
           `${d.fonte === "trilha" ? "lote" : "ao vivo"}` +
-          (d.rotulo === "errado"
-            ? ` · corrigido: ${d.efetivo_nome || "não cadastrado"}` : ""),
+          (d.rotulo === "errado" ? ` · ${textoCorrecao(d)}` : ""),
     acoes: !d.is_known ? [] : [d.rotulo === "errado" ? {
       rotulo: "Desfazer marcação",
       aoClicar: async () => { await desmarcarErro(d); fecharLupa(); carregarDeteccoes(); },
@@ -554,10 +579,13 @@ function abrirLupaDeDeteccoes(alvo) {
       // Segue para a próxima em vez de fechar: revisão em lote fica fluida,
       // e é assim que se acumula o rótulo de erro que a calibração precisa.
       aoClicar: async (valor) => {
-        const alvo = valor === "desconhecido" ? null
+        // "— quem é? —" sem escolha = não informado (null), que é diferente
+        // de afirmar que não é ninguém cadastrado.
+        const alvo = valor === "desconhecido" ? NINGUEM
                    : valor ? Number(valor) : null;
         await marcarErro(d, alvo);
         d.rotulo = "errado";
+        d.pessoa_correta = alvo;
         if (lupa.i < lupa.itens.length - 1) andarLupa(1); else desenharLupa();
       },
     }],
@@ -584,8 +612,7 @@ function cartaoDeteccao(d) {
     textContent: `${d.quando.slice(11, 19)} · ${d.fonte === "trilha" ? "lote" : "ao vivo"}` }));
   if (d.rotulo === "errado") {
     info.append(criar("div", { className: "redundante",
-      textContent: d.efetivo_nome ? `corrigido: é ${d.efetivo_nome}`
-                                  : "corrigido: não cadastrado" }));
+                               textContent: textoCorrecao(d) }));
   }
   c.append(info);
 
@@ -682,6 +709,15 @@ function desenharCadastro(amostras) {
     const t = criar("div", { className: "tira" });
     t.append(criar("img", { src: comLargura(a.snapshot_url, MINI_LINHA),
                             alt: `amostra ${a.index + 1}` }));
+    // A nitidez fica VISÍVEL em cada miniatura, não só no aviso do clique:
+    // o aviso some na captura seguinte, a marca continua até a remoção.
+    if (a.nitidez != null) {
+      if (a.nitidez_baixa) t.classList.add("borrada");
+      t.append(criar("div", {
+        className: a.nitidez_baixa ? "nitidez-baixa" : "nota",
+        textContent: a.nitidez_baixa ? `nitidez baixa (${Math.round(a.nitidez)})`
+                                     : `nitidez ${Math.round(a.nitidez)}` }));
+    }
     const b = criar("button", { textContent: "remover" });
     b.addEventListener("click", async () => {
       const r = await api("/enroll/sample/delete", { metodo: "POST", corpo: {
@@ -817,6 +853,17 @@ async function carregarAmostras() {
 
   const av = $("#avisos-pessoa");
   av.innerHTML = "";
+  // Primeiro aviso da lista: amostra borrada é a que mais estraga o
+  // reconhecimento, porque faz o sistema confundir OUTRAS pessoas com esta.
+  const borradas = dados.samples.filter(a => a.nitidez_baixa).length;
+  if (borradas) {
+    av.append(faixa("erro",
+      negrito(`${borradas} amostra(s) com nitidez baixa`),
+      ` (abaixo de ${Math.round(dados.nitidez_minima)}), marcadas em vermelho. ` +
+      "Rosto borrado faz o sistema confundir outras pessoas com esta. " +
+      "Adicione amostras nítidas primeiro e depois exclua estas — a última " +
+      "amostra de alguém não pode ser excluída."));
+  }
   if (dados.sem_foto) {
     av.append(faixa("aviso", `${dados.sem_foto} amostra(s) sem foto. São de ` +
       "antes de o sistema guardar a imagem de cada amostra — o vetor " +
@@ -845,7 +892,10 @@ function abrirLupaDeAmostras(alvo) {
   const comFoto = amostrasNaTela.filter(a => a.snapshot_url);
   const itens = comFoto.map(a => {
     const meta = [`#${a.id}`];
-    if (a.quality != null) meta.push(`nitidez ${Math.round(a.quality)}`);
+    if (a.quality != null) {
+      meta.push(`nitidez ${Math.round(a.quality)}` +
+                (a.nitidez_baixa ? " — baixa, substitua" : ""));
+    }
     if (a.similaridade_maxima != null) {
       meta.push(`similaridade máx. ${a.similaridade_maxima.toFixed(2)}` +
                 (a.similaridade_maxima >= 0.95
@@ -890,6 +940,12 @@ function cartaoAmostra(a, total) {
     partes.push(new Date(a.created_at * 1000).toLocaleDateString("pt-BR"));
   }
   info.append(criar("div", { className: "meta", textContent: partes.join(" · ") }));
+
+  if (a.nitidez_baixa) {
+    c.classList.add("borrada");
+    info.append(criar("div", { className: "nitidez-baixa",
+                               textContent: "nitidez baixa — substitua" }));
+  }
 
   if (a.similaridade_maxima != null) {
     const redundante = a.similaridade_maxima >= 0.95;

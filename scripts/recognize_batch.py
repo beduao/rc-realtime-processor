@@ -174,7 +174,8 @@ def presenca(db, dia: str) -> int:
     fechamento = db.attendance_closure(dia_iso)
     pessoas = db.list_people()
 
-    pend = db.count_tracks_by_status().get("pendente", 0)
+    # Só as pendências deste dia, pelo mesmo critério da API.
+    pend = db.count_pending_tracks(inicio, fim)
     print(f"\n=== Presença de {rotulo} ===")
     if fechamento:
         quando = time.strftime("%d/%m %H:%M", time.localtime(fechamento["closed_at"]))

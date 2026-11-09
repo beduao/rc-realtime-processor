@@ -198,6 +198,12 @@ label.campo-inline { display: flex; align-items: flex-start; gap: .55rem;
             aspect-ratio: 1; object-fit: cover; }
 .tira button { width: 100%; margin-top: .4rem; font-size: .75rem;
                padding: .28rem; }
+.tira .nota, .tira .nitidez-baixa { font-size: .72rem; margin-top: .3rem; }
+
+/* Amostra borrada: borda de erro e texto de destaque, na tira do cadastro e
+   no cartão da aba Pessoas. */
+.tira.borrada, .cartao.borrada { border-color: var(--erro); }
+.nitidez-baixa { color: #ff8f87; font-weight: 600; }
 
 /* ------------------------------------------------------------ lupa ------ */
 

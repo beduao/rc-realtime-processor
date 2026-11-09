@@ -88,8 +88,10 @@ worker:
   #    por votação — bem mais precisa. Use para grupos e chamada de presença.
   #      Reconhecer:  python scripts/recognize_batch.py
   #      Presença:    python scripts/recognize_batch.py --presenca
+  #
+  # O padrão é "captura" porque é o modo da chamada na escola.
   # ---------------------------------------------------------------------------
-  mode: "realtime"
+  mode: "captura"
   # O worker relê `mode` neste intervalo e troca SEM reiniciar o serviço. Use
   #   python scripts/set_mode.py captura
   # para alternar. Os demais parâmetros continuam exigindo reinício.
@@ -105,6 +107,11 @@ worker:
 enroll:
   frames_to_capture: 5
   capture_timeout_seconds: 15
+  # Abaixo desta nitidez a captura AVISA (não recusa) e a amostra fica marcada
+  # em vermelho no painel. Rosto borrado faz o sistema confundir outras pessoas
+  # com esta. 300 veio do piloto na webcam do PC; a escala muda com a câmera,
+  # então confira a nitidez das amostras boas na aba Pessoas e ajuste. 0 desliga.
+  nitidez_minima: 300
 
 # Rastreamento — só usado no modo "captura".
 tracking:
