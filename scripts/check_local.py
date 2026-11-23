@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Confere se esta máquina está pronta para rodar TUDO local (worker+API+painel).
+"""Confere se esta máquina está pronta para rodar TUDO local (worker + API).
 
 Feito para o cenário "câmera no meu PC, painel no localhost": lista o que
-falta antes de abrir os três terminais, em vez de deixar cada peça falhar com
-mensagem própria.
+falta antes de abrir os dois terminais, em vez de deixar cada peça falhar com
+mensagem própria. O painel é a interface web servida pela própria API, em
+/painel — não há processo à parte para ele.
 
     python scripts/check_local.py
     python scripts/check_local.py --camera 1     # testar outro índice
@@ -85,8 +86,7 @@ def checar_python():
         faltando.append("opencv-contrib-python-headless")
 
     for mod, pacote in (("numpy", "numpy"), ("yaml", "pyyaml"),
-                        ("fastapi", "fastapi"), ("uvicorn", "uvicorn"),
-                        ("streamlit", "streamlit"), ("requests", "requests")):
+                        ("fastapi", "fastapi"), ("uvicorn", "uvicorn")):
         try:
             __import__(mod)
         except ImportError:
@@ -94,9 +94,16 @@ def checar_python():
 
     if faltando:
         diz(ERRO, f"Pacotes faltando: {', '.join(faltando)}",
-            "python -m pip install -r requirements-pi.txt -r requirements-panel.txt")
+            "python -m pip install -r requirements-pi.txt")
     else:
-        diz(OK, "numpy, pyyaml, fastapi, uvicorn, streamlit, requests")
+        diz(OK, "numpy, pyyaml, fastapi, uvicorn")
+
+
+def _escola(cfg) -> tuple[str, str]:
+    """(id, nome) do bloco `escola:` do config, vazios se não houver."""
+    bloco = (cfg.get("escola") if cfg else None) or {}
+    return (str(bloco.get("id") or "").strip(),
+            str(bloco.get("nome") or "").strip())
 
 
 def checar_config():
@@ -116,6 +123,19 @@ def checar_config():
         return None
     diz(OK, "config.yaml carregado")
 
+    # Com um Pi por escola, a primeira pergunta de qualquer diagnóstico é
+    # "que máquina é esta?". Sem isto, duas saídas coladas lado a lado num
+    # chamado de suporte são indistinguíveis.
+    eid, enome = _escola(cfg)
+    if eid:
+        diz(OK, f"escola.id = {eid}" + (f" ({enome})" if enome else ""))
+    else:
+        diz(AVISO, "escola.id vazio" + (f" ({enome})" if enome else ""),
+            "Tudo bem num piloto de uma escola só. Com mais de uma, preencha\n"
+            "com o código que o sistema de gestão já usa: ele vai carimbado\n"
+            "na lista de presentes, e é por ele que a gestão sabe de qual\n"
+            "escola veio cada lista.")
+
     fonte = cfg.camera.rtsp_url
     if str(fonte).strip().isdigit():
         diz(OK, f"camera.rtsp_url = {fonte} (webcam local)")
@@ -125,14 +145,6 @@ def checar_config():
     else:
         diz(AVISO, f"camera.rtsp_url = {fonte}",
             "É uma URL/arquivo. Para a webcam deste PC, troque por 0.")
-
-    base = cfg.api.base_url
-    if "localhost" in base or "127.0.0.1" in base:
-        diz(OK, f"api.base_url = {base} (painel fala com a API local)")
-    else:
-        diz(ERRO, f"api.base_url = {base}",
-            "Aponta para outra máquina (o Pi). Rodando tudo aqui, use:\n"
-            "  base_url: \"http://localhost:8000\"")
 
     live = str((cfg.get("storage") or {}).get("live_path") or "")
     if live.startswith("/dev/shm"):
@@ -394,7 +406,7 @@ def checar_camera(indice, cfg=None):
 
 def checar_portas():
     secao("Portas")
-    for porta, quem in ((8000, "API"), (8501, "painel Streamlit")):
+    for porta, quem in ((8000, "API e painel"),):
         s = socket.socket()
         s.settimeout(0.4)
         livre = s.connect_ex(("127.0.0.1", porta)) != 0
@@ -409,7 +421,7 @@ def checar_portas():
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
-        description="Verifica se dá para rodar worker, API e painel nesta máquina.")
+        description="Verifica se dá para rodar worker e API (com o painel) nesta máquina.")
     ap.add_argument("--camera", type=int, default=None,
                     help="índice da webcam a testar (padrão: o do config)")
     args = ap.parse_args(argv)
@@ -433,6 +445,9 @@ def main(argv=None) -> int:
     checar_portas()
 
     print("\n" + "=" * 68)
+    # Repetido no resumo: é a parte da saída que alguém copia para o suporte.
+    eid, enome = _escola(cfg)
+    print(f"  Escola: {eid or '(sem escola.id)'}" + (f" — {enome}" if enome else ""))
     if problemas:
         print(f"  {len(problemas)} problema(s) a resolver antes de começar:")
         for p in problemas:
@@ -440,13 +455,12 @@ def main(argv=None) -> int:
         print("=" * 68)
         return 1
 
-    print("  Tudo pronto. Abra três terminais, com o venv ativado em cada:")
+    print("  Tudo pronto. Abra dois terminais, com o venv ativado em cada:")
     print()
     print("    1)  python -m uvicorn api:app --host 127.0.0.1 --port 8000")
     print("    2)  python worker.py")
-    print("    3)  python -m streamlit run panel/app.py")
     print()
-    print("  O painel abre em http://localhost:8501")
+    print("  O painel abre em http://localhost:8000/painel/")
     print("=" * 68)
     return 0
 

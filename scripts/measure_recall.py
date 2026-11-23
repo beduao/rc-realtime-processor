@@ -47,6 +47,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from core import chamada                     # noqa: E402
 from core.config import load_config          # noqa: E402
 from core.database import Database           # noqa: E402
 
@@ -562,20 +563,37 @@ def medir_chamada(db: Database) -> int:
             dia = time.strftime("%Y-%m-%d", time.localtime(d["ts"]))
             detectados[dia].add(int(d["person_id"]))
 
-    nomes = {p["id"]: p["name"] for p in db.list_people()}
+    # Com os removidos: quem saiu do cadastro continua nos dias em que estava.
+    nomes = {p["id"]: p["name"] for p in db.list_people(incluir_removidos=True)}
     linhas, fn_total, presentes_total = [], 0, 0
 
     for dia in sorted(fechados):
-        auto = detectados.get(dia, set())
-        # Presentes de verdade = detectados e não desmarcados, mais os marcados
-        # presente à mão.
-        marcados_presente = {pid for (d, pid), v in overrides.items()
-                             if d == dia and v == 1}
-        marcados_ausente = {pid for (d, pid), v in overrides.items()
-                            if d == dia and v == 0}
-        presentes = (auto - marcados_ausente) | marcados_presente
-        # Falso negativo: estava presente, o sistema não pegou.
-        fn = {pid for pid in marcados_presente if pid not in auto}
+        fech = db.attendance_closure(dia) or {}
+        versao = (db.attendance_version(dia, fech["versao"])
+                  if fech.get("versao") else None)
+        if versao is not None:
+            # Dia congelado: o que o sistema detectou e o que foi corrigido
+            # vêm da versão conferida. Recalcular a partir do banco erraria
+            # depois da retenção — sem as trilhas, todo presente marcado à mão
+            # viraria "perdido" e o recall cairia sem o sistema ter piorado.
+            p = versao["payload"]
+            presentes = {l["person_id"] for l in p["presentes"]
+                         if l.get("person_id") is not None}
+            fn = chamada.ids_por_origem(p, chamada.MANUAL_PRESENTE)
+            nomes.update({l["person_id"]: l["nome"] for l in chamada.linhas(p)
+                          if l.get("person_id") is not None})
+        else:
+            # Fechamento anterior às versões congeladas: recalcula como antes.
+            auto = detectados.get(dia, set())
+            # Presentes de verdade = detectados e não desmarcados, mais os
+            # marcados presente à mão.
+            marcados_presente = {pid for (d, pid), v in overrides.items()
+                                 if d == dia and v == 1}
+            marcados_ausente = {pid for (d, pid), v in overrides.items()
+                                if d == dia and v == 0}
+            presentes = (auto - marcados_ausente) | marcados_presente
+            # Falso negativo: estava presente, o sistema não pegou.
+            fn = {pid for pid in marcados_presente if pid not in auto}
 
         if not presentes:
             continue

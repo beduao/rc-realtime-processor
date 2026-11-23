@@ -7,6 +7,19 @@ camera:
   rtsp_url: "rtsp://admin:SUA_SENHA@192.168.0.10:554/cam/realmonitor?channel=1&subtype=1"
   reconnect_delay_seconds: 3
 
+escola:
+  # Qual escola é este Pi. Cada escola roda o seu, com a base só dos alunos
+  # dela — galeria menor é reconhecimento melhor, e biometria de criança fica
+  # contida na escola em vez de concentrada num servidor só.
+  #
+  # O `id` vai carimbado na lista de presentes entregue ao sistema de gestão,
+  # que recebe de várias escolas e precisa saber de quem é cada lista. Use o
+  # mesmo código que a gestão já usa; não invente um paralelo.
+  #
+  # Pode ficar vazio num piloto de escola única.
+  id: ""
+  nome: ""
+
 api:
   # Onde o uvicorn escuta. Informativo: o valor real vem do `--host` na linha
   # de comando. Para testar tudo numa máquina só, use 127.0.0.1 no uvicorn —

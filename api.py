@@ -36,11 +36,12 @@ from fastapi.responses import (FileResponse, JSONResponse, RedirectResponse,
                                Response)
 from pydantic import BaseModel
 
+from core import chamada
 from core.camera import Camera, camera_from_config
 from core.config import (frame_image_path, live_image_path, load_config,
                          project_path)
-from core.database import (Database, MatriculaDuplicada,
-                          normalizar_matricula)
+from core.database import (MODOS_EXCLUSAO, AlunoIdDuplicado, Database,
+                           normalizar_aluno_id)
 from core.draw import crop_face, draw_face
 from core.face_engine import FaceEngine
 from core.imagem import LARGURAS_MINIATURA, caminho_miniatura, gerar_miniatura
@@ -62,6 +63,26 @@ STATUS_PATH = LIVE_PATH.with_name("facial-status.json")
 FRAME_PATH = frame_image_path(cfg)
 FRAME_MAX_AGE = 5.0        # acima disso o frame do worker é velho demais
 ENROLL_TARGET = int(cfg.enroll.frames_to_capture)  # amostras sugeridas por pessoa
+
+# Qual escola é esta. Cada escola roda seu PRÓPRIO Pi, com sua própria base e
+# só os alunos dela — por isso aqui é uma constante de configuração, e não uma
+# coluna no banco.
+#
+# A decisão de não centralizar tem dois motivos, e os dois importam:
+#
+# Reconhecimento. O `match()` compara o rosto com a galeria inteira e fica com
+# o melhor. Juntar os alunos de várias escolas numa galeria só não pode
+# melhorar nada e aumenta o falso positivo de forma monotônica — é a mesma
+# matemática que produziu as 75 confusões `lais -> bia`. Galeria menor é
+# reconhecimento melhor, de graça.
+#
+# Proteção de dados. Biometria de criança de uma escola, no Pi daquela escola,
+# é um estrago contido. A de todas as escolas num servidor só é um alvo.
+#
+# Vazio é permitido: no piloto de uma escola só ninguém precisa preencher, e
+# exigir travaria quem só quer ligar a câmera e testar.
+ESCOLA_ID = str((cfg.get("escola") or {}).get("id") or "").strip()
+ESCOLA_NOME = str((cfg.get("escola") or {}).get("nome") or "").strip()
 
 # Nitidez mínima de uma amostra de cadastro — a variância do Laplaciano do
 # recorte, o mesmo número que a aba Pessoas mostra como "nitidez". 0 desliga.
@@ -271,7 +292,7 @@ async def autenticacao(request: Request, call_next):
 
 # ---- estado das sessões de cadastro --------------------------------------- #
 _lock = threading.Lock()
-# session_id -> {name, matricula, ultimo_uso, samples:[{index,embedding,snapshot}]}
+# session_id -> {name, aluno_id, ultimo_uso, samples:[{index,embedding,snapshot}]}
 _sessions: dict[str, dict] = {}
 _enroll_cam: Camera | None = None
 _camera_usada_em = 0.0     # último frame que a API tirou da própria câmera
@@ -602,9 +623,9 @@ def _redundancia(amostras: list[dict]) -> list[dict]:
 # ---- modelos de request --------------------------------------------------- #
 class StartReq(BaseModel):
     name: str
-    # Matrícula do aluno. Opcional no cadastro para não travar o
-    # piloto, mas sem ela o sistema da escola não consegue casar.
-    matricula: str = ""
+    # ID do aluno emitido pelo sistema de gestão. Opcional no cadastro para
+    # não travar o piloto, mas sem ele a escola não consegue casar o registro.
+    aluno_id: str = ""
 
 
 class SessionReq(BaseModel):
@@ -631,6 +652,10 @@ def health():
 
     return {
         "ok": True,
+        # Com vários Pis no ar, "qual é esse?" vira a primeira pergunta de
+        # qualquer suporte. Aqui ela se responde abrindo uma URL.
+        "escola_id": ESCOLA_ID or None,
+        "escola_nome": ESCOLA_NOME or None,
         "enroll_target": ENROLL_TARGET,
         "opencv": cv2.__version__,
         "people": len(db.list_people()),
@@ -663,7 +688,7 @@ def enroll_start(req: StartReq):
     sid = uuid.uuid4().hex[:12]
     with _lock:
         _sessions[sid] = {"name": name, "samples": [],
-                          "matricula": normalizar_matricula(req.matricula),
+                          "aluno_id": normalizar_aluno_id(req.aluno_id),
                           "ultimo_uso": time.time()}
     return {"session_id": sid, "name": name, "target": ENROLL_TARGET}
 
@@ -769,8 +794,8 @@ def enroll_finish(req: SessionReq):
     if not sess["samples"]:
         raise HTTPException(422, "Capture pelo menos uma amostra antes de concluir.")
     try:
-        person_id = db.add_person(sess["name"], sess.get("matricula"))
-    except MatriculaDuplicada as exc:
+        person_id = db.add_person(sess["name"], sess.get("aluno_id"))
+    except AlunoIdDuplicado as exc:
         raise HTTPException(409, str(exc)) from None
 
     # Move os recortes da pasta temporária da sessão para a pasta definitiva da
@@ -840,27 +865,43 @@ def _apagar_arquivo(base, rel: str) -> bool:
     return True
 
 
+_HISTORICO_POR_MODO = {
+    "manter_historico": "nome e ID do aluno mantidos nas chamadas; sem fotos",
+    "anonimizar": "preservado sem identificação",
+    "apagar": "apagado junto com a pessoa",
+}
+
+
 @app.delete("/people/{person_id}")
 def delete_person(person_id: int,
+                  modo: str = Query(
+                      "manter_historico",
+                      description="manter_historico (padrão): sai do cadastro e "
+                                  "das imagens, o nome fica nas chamadas | "
+                                  "anonimizar: as passagens ficam sem "
+                                  "identificar | apagar: some tudo"),
                   anonimizar: bool = Query(
-                      False, description="preserva as passagens sem identificar "
-                                         "quem passou, em vez de apagá-las")):
-    """Exclusão completa: pessoa, embeddings, histórico e TODAS as imagens.
+                      False, description="forma antiga de pedir modo=anonimizar")):
+    """Remove o aluno. Imagens e biometria saem SEMPRE; o modo decide o histórico.
 
-    Antes isso deixava para trás os eventos, os snapshots das passagens e os
-    recortes das trilhas — ou seja, imagem de rosto continuava no disco depois
-    de um pedido de exclusão. Para dado biométrico de criança, 'excluir' precisa
-    excluir de fato.
+    O padrão mantém nome e ID do aluno nas chamadas — presente ou ausente — nos
+    dias em que ele estava matriculado. Chamada é registro escolar e não deve
+    perder linhas porque a criança saiu da escola; o que é dado sensível é o
+    rosto, e é isso que sai: amostras, snapshots, recortes, miniaturas e os
+    embeddings (sem eles, o sistema deixa de reconhecê-lo).
 
-    Com `?anonimizar=true`, as linhas de passagem ficam com `person_id` nulo e
-    nome neutro: a contagem de "alguém passou às 7:42" sobrevive para
-    estatística, sem identificar. As IMAGENS são apagadas nos dois modos, porque
-    a foto do rosto é justamente o dado que identifica.
+    `anonimizar` e `apagar` continuam para o pedido de exclusão completa de um
+    responsável. Imagens de rosto não ficam no disco em nenhum dos três.
     """
+    if anonimizar:
+        modo = "anonimizar"
+    if modo not in MODOS_EXCLUSAO:
+        raise HTTPException(400, f"Modo inválido. Use um de: "
+                                 f"{', '.join(MODOS_EXCLUSAO)}.")
     if db.get_person(person_id) is None:
         raise HTTPException(404, "Pessoa não encontrada.")
 
-    arquivos = db.delete_person(person_id, anonimizar=anonimizar)
+    arquivos = db.delete_person(person_id, modo=modo)
 
     removidas = sum(_apagar_arquivo(SNAP_BASE, r) for r in arquivos["snapshots"])
     removidos_recortes = sum(_apagar_arquivo(TRACKS_BASE, r)
@@ -872,28 +913,29 @@ def delete_person(person_id: int,
 
     return {
         "deleted": person_id,
-        "modo": "anonimizado" if anonimizar else "apagado",
+        "modo": modo,
         "fotos_removidas": removidas,
         "recortes_removidos": removidos_recortes,
-        "historico": ("preservado sem identificação" if anonimizar
-                      else "apagado junto com a pessoa"),
+        "historico": _HISTORICO_POR_MODO[modo],
     }
 
 
 class RenameReq(BaseModel):
     name: str | None = None
-    matricula: str | None = None
+    aluno_id: str | None = None
 
 
 @app.patch("/people/{person_id}")
 def update_person(person_id: int, req: RenameReq):
-    """Altera nome e/ou matrícula. Campo ausente fica como está.
+    """Altera nome e/ou ID do aluno. Campo ausente fica como está.
 
-    A matrícula é o identificador que o sistema de gestão da escola usa para
-    casar os registros. Casar por nome é frágil: homônimos, acentuação e
-    digitação divergente quebram a associação.
+    O `aluno_id` é o identificador ESTÁVEL que o sistema de gestão emite, e é
+    por ele que os dois sistemas se casam. Não é a matrícula: a matrícula
+    carrega o ano ("2026/0142") e muda na virada, o que quebraria em janeiro
+    todo o cadastro biométrico feito até dezembro. Casar por nome é pior
+    ainda — homônimos, acentuação e digitação divergente.
 
-    Enviar `matricula: ""` limpa o campo.
+    Enviar `aluno_id: ""` limpa o campo.
     """
     if db.get_person(person_id) is None:
         raise HTTPException(404, "Pessoa não encontrada.")
@@ -907,30 +949,30 @@ def update_person(person_id: int, req: RenameReq):
         db.rename_person(person_id, nome)
         resposta["name"] = nome
 
-    if req.matricula is not None:
+    if req.aluno_id is not None:
         try:
-            gravado = db.set_person_matricula(person_id, req.matricula)
-        except MatriculaDuplicada as exc:
+            gravado = db.set_person_aluno_id(person_id, req.aluno_id)
+        except AlunoIdDuplicado as exc:
             raise HTTPException(409, str(exc)) from None
-        resposta["matricula"] = gravado
-        # Sem aviso de formato: o formato da matrícula não foi confirmado, e
-        # a versão anterior deste campo avisava com base numa suposição minha
+        resposta["aluno_id"] = gravado
+        # Sem aviso de formato: o formato do ID não foi confirmado, e a
+        # primeira versão deste campo avisava com base numa suposição minha
         # sobre o ID INEP que se mostrou errada. Validar o que não se conhece
         # transforma dado válido em dado recusado.
 
     return resposta
 
 
-@app.get("/people/by-matricula/{matricula:path}")
-def person_by_matricula(matricula: str):
-    """Busca aluno pela matrícula — porta de entrada para outro sistema.
+@app.get("/people/by-aluno-id/{aluno_id:path}")
+def person_by_aluno_id(aluno_id: str):
+    """Busca aluno pelo ID — porta de entrada para outro sistema.
 
-    `:path` no parâmetro porque o formato da matrícula não foi confirmado: se
-    ela contiver barra (comum em "2026/0142"), a rota precisa aceitar.
+    `:path` no parâmetro porque o formato do ID não foi confirmado: se ele
+    contiver barra, a rota precisa aceitar em vez de devolver 404.
     """
-    pessoa = db.person_by_matricula(matricula)
+    pessoa = db.person_by_aluno_id(aluno_id)
     if pessoa is None:
-        raise HTTPException(404, "Nenhum aluno cadastrado com esta matrícula.")
+        raise HTTPException(404, "Nenhum aluno cadastrado com este ID.")
     return pessoa
 
 
@@ -1048,64 +1090,183 @@ def _janela(dia: str, inicio: str, fim: str):
     return t0, t1
 
 
-def _montar_chamada(dia: str = "", inicio: str = "", fim: str = "") -> dict:
+_ISO = "%Y-%m-%dT%H:%M:%S%z"
+
+
+def _iso(ts: float) -> str:
+    return time.strftime(_ISO, time.localtime(ts))
+
+
+# Campos de detecção de uma linha — os que uma versão congelada empresta
+# quando os dados brutos do dia já foram apagados.
+_CAMPOS_DETECCAO = ("primeira_vez", "ultima_vez", "passagens", "melhor_score",
+                    "fontes")
+
+
+def _foto_existe(url: str) -> bool:
+    for prefixo, base in (("/snapshots/", SNAP_BASE), ("/tracks/", TRACKS_BASE)):
+        if url.startswith(prefixo):
+            alvo = (base / url[len(prefixo):]).resolve()
+            return alvo.is_relative_to(base) and alvo.is_file()
+    return False
+
+
+def _completar_aluno_id(p: dict) -> None:
+    """COMPATIBILIDADE com payload congelado ANTES da troca matricula -> aluno_id.
+
+    Não é sobra: não remova enquanto puder existir versão congelada daquela
+    época. Essas versões têm `matricula` em cada linha e `sem_matricula` no
+    topo, sem `aluno_id` nem `sem_aluno_id`. Servidas como estão, a lista de
+    presentes iria para a integração com `aluno_id: null` em todo mundo — e
+    `sem_aluno_id` acusando a turma inteira de cadastro incompleto.
+
+    O ID é completado AO SERVIR, a partir do cadastro atual (pelo
+    `person_id`), e o payload guardado não é reescrito. A versão congelada é
+    o registro de quem esteve presente; o identificador não é fato de
+    presença, é o vínculo com o outro sistema — o mesmo raciocínio de tirar
+    `foto_url` de foto que a retenção apagou. E é o ID de HOJE que casa com a
+    gestão: a matrícula antiga gravada na linha não casaria.
+
+    Linha sem `person_id` (anonimizada) continua sem ID. Alterações valem só
+    para esta resposta: `p` vem de `json.loads` a cada consulta.
+    """
+    antigas = [l for l in chamada.linhas(p) if "aluno_id" not in l]
+    if not antigas and "sem_matricula" not in p:
+        return                               # versão já no formato atual
+    ids = {pessoa["id"]: pessoa.get("aluno_id")
+           for pessoa in db.list_people(incluir_removidos=True)}
+    for l in antigas:
+        pid = l.get("person_id")
+        l["aluno_id"] = ids.get(pid) if pid is not None else None
+        # A chave velha sai da RESPOSTA. Ficando, quem consome receberia dois
+        # identificadores — e o `recontar` (que olha `aluno_id` OU
+        # `matricula`) contaria como cadastrado quem hoje está sem ID.
+        l.pop("matricula", None)
+    # `recontar` cria `sem_aluno_id`, mas não apaga o `sem_matricula` que o
+    # payload antigo já trazia: sem o pop, as duas chaves sairiam juntas.
+    p.pop("sem_matricula", None)
+    chamada.recontar(p)
+
+
+def _servir_versao(v: dict, vigente: int | None) -> dict:
+    """A chamada congelada, com os dados do fechamento aplicados por cima.
+
+    O payload foi gravado no instante ANTERIOR ao fechamento, então diz
+    `conferida: false` e traz o aviso de chamada aberta. Quem fechou, quando
+    e qual versão vêm da linha da versão.
+
+    `vigente` é a versão que o fechamento atual representa (None se o dia
+    está reaberto). Servir outra é servir histórico, e a resposta diz isso.
+    """
+    p = v["payload"]
+    for l in chamada.linhas(p):
+        # A retenção apaga as fotos bem antes do registro (7 dias nas trilhas,
+        # 30 nas passagens). Link para foto que não existe mais só produziria
+        # imagem quebrada na tela e 404 no sistema que consome.
+        if l.get("foto_url") and not _foto_existe(l["foto_url"]):
+            l.pop("foto_url", None)
+            l.pop("foto_score", None)
+    _completar_aluno_id(p)
+    eh_vigente = vigente is not None and v["versao"] == vigente
+    p.update({
+        "conferida": True,
+        "congelada": True,
+        "versao": v["versao"],
+        "versao_vigente": eh_vigente,
+        "ultima_versao": db.ultima_versao(p["periodo"]["dia"]),
+        "fechamento": {"em": _iso(v["closed_at"]), "autor": v["autor"] or None,
+                       "versao": v["versao"]},
+        "aviso": None if eh_vigente else (
+            f"Versão {v['versao']}, guardada como histórico: a chamada deste "
+            "dia foi reaberta ou fechada de novo depois dela, e esta não é "
+            "a versão vigente."),
+    })
+    return p
+
+
+def _montar_chamada(dia: str = "", inicio: str = "", fim: str = "",
+                    ao_vivo: bool = False) -> dict:
     """Monta a chamada. Função comum, NÃO rota.
 
     Existe separada porque a rota tem `Query(...)` nos parâmetros — chamá-la
     como função Python passaria os objetos de dependência em vez dos valores
     padrão. O fechamento precisa deste resumo, então ele chama daqui.
+
+    Dia fechado devolve a versão CONGELADA, não um recálculo — é o que impede
+    reprocessamento, exclusão ou retenção de mudarem em silêncio uma chamada
+    já conferida. `ao_vivo=True` força o recálculo (é o que o fechamento usa
+    para gerar a versão). Janela parcial (`inicio`/`fim`) também recalcula: a
+    versão congelada é do dia inteiro.
     """
 
     t0, t1 = _janela(dia, inicio, fim)
     dia_iso = time.strftime("%Y-%m-%d", time.localtime(t0))
+    dia_inteiro = not inicio and not fim
+    fechamento = db.attendance_closure(dia_iso)
+
+    if fechamento and fechamento.get("versao") and dia_inteiro and not ao_vivo:
+        v = db.attendance_version(dia_iso, fechamento["versao"])
+        if v is not None:
+            return _servir_versao(v, vigente=fechamento["versao"])
 
     automatico = {l["person_id"]: l for l in db.attendance(t0, t1)}
     # Foto da melhor detecção de cada pessoa, para a conferência humana poder
     # olhar o rosto antes de confirmar.
     fotos = db.melhores_fotos(t0, t1)
     correcoes = db.attendance_overrides(dia_iso)
-    fechamento = db.attendance_closure(dia_iso)
-    todos = db.list_people()
+    # Quem estava matriculado NESTE dia: os ativos e os removidos depois do
+    # início dele. Aluno removido do cadastro continua nas chamadas antigas
+    # (presente ou ausente) e some das seguintes.
+    todos = [p for p in db.list_people(incluir_removidos=True)
+             if p["removido_em"] is None or p["removido_em"] > t0]
     # Só as pendências DESTE período. As do banco inteiro faziam qualquer dia
     # parecer incompleto enquanto houvesse alguém passando hoje.
     pendentes = db.count_pending_tracks(t0, t1)
 
+    # Dia reaberto cujos dados brutos a retenção já apagou: sem isto, reabrir
+    # partiria do zero e mostraria todo mundo ausente. O que o sistema viu
+    # naquele dia só existe na última versão congelada, então ela vira a base
+    # do automático. As correções (que não são apagadas) seguem valendo.
+    base = None
+    if dia_inteiro and not automatico and not db.tem_registros_brutos(t0, t1):
+        base = db.attendance_version(dia_iso)
+    vistos_na_base = ({l["person_id"]: l for l in chamada.linhas(base["payload"])
+                       if l.get("detectado_pelo_sistema")} if base else {})
+
     presentes, ausentes = [], []
-    n_marcados_presentes = n_marcados_ausentes = 0
 
     for p in todos:
         pid = p["id"]
         auto = automatico.get(pid)
+        da_base = vistos_na_base.get(pid)
         corr = correcoes.get(pid)
-        detectado = auto is not None
+        detectado = auto is not None or da_base is not None
         # A correção manual, quando existe, prevalece sobre o automático.
         presente = bool(corr["presente"]) if corr else detectado
 
         if corr and corr["presente"] and not detectado:
-            origem = "manual_presente"          # falso negativo do reconhecimento
-            n_marcados_presentes += 1
+            origem = chamada.MANUAL_PRESENTE    # falso negativo do reconhecimento
         elif corr and not corr["presente"] and detectado:
-            origem = "manual_ausente"           # falso positivo do reconhecimento
-            n_marcados_ausentes += 1
+            origem = chamada.MANUAL_AUSENTE     # falso positivo do reconhecimento
         elif detectado:
             origem = "automatico"
         else:
             origem = "nao_identificado"
 
-        linha = {"person_id": pid, "matricula": p.get("matricula"),
+        linha = {"person_id": pid, "aluno_id": p.get("aluno_id"),
                  "nome": p["name"], "origem": origem,
-                 "detectado_pelo_sistema": detectado}
+                 "detectado_pelo_sistema": detectado,
+                 # Saiu do cadastro depois deste dia: fica na chamada, sem
+                 # foto (as imagens dele foram apagadas).
+                 "removido": p["removido_em"] is not None}
         if corr:
             linha["correcao"] = {"motivo": corr["motivo"] or None,
                                  "autor": corr["autor"] or None,
-                                 "em": time.strftime("%Y-%m-%dT%H:%M:%S%z",
-                                                     time.localtime(corr["created_at"]))}
+                                 "em": _iso(corr["created_at"])}
         if auto:
             linha.update({
-                "primeira_vez": time.strftime("%Y-%m-%dT%H:%M:%S%z",
-                                              time.localtime(auto["primeira"])),
-                "ultima_vez": time.strftime("%Y-%m-%dT%H:%M:%S%z",
-                                            time.localtime(auto["ultima"])),
+                "primeira_vez": _iso(auto["primeira"]),
+                "ultima_vez": _iso(auto["ultima"]),
                 "passagens": auto["passagens"],
                 "melhor_score": round(auto["melhor_score"], 3),
                 "fontes": (auto["fontes"] or "").split(","),
@@ -1115,19 +1276,22 @@ def _montar_chamada(dia: str = "", inicio: str = "", fim: str = "") -> dict:
             # saber dessa separação interna.
             foto = fotos.get(pid)
             if foto and foto["foto"]:
-                base = "/snapshots/" if foto["fonte"] == "realtime" else "/tracks/"
-                linha["foto_url"] = f"{base}{foto['foto']}"
+                url_base = "/snapshots/" if foto["fonte"] == "realtime" else "/tracks/"
+                linha["foto_url"] = f"{url_base}{foto['foto']}"
                 linha["foto_score"] = round(foto["score"], 3)
+        elif da_base:
+            # Sem foto: ela foi apagada junto com os dados brutos.
+            linha.update({k: da_base[k] for k in _CAMPOS_DETECCAO if k in da_base})
         (presentes if presente else ausentes).append(linha)
 
     presentes.sort(key=lambda x: (x.get("primeira_vez") or "~", x["nome"]))
     ausentes.sort(key=lambda x: x["nome"].lower())
 
-    return {
+    resposta = {
         "periodo": {
             "dia": dia_iso,
-            "inicio": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(t0)),
-            "fim": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(t1)),
+            "inicio": _iso(t0),
+            "fim": _iso(t1),
             "fuso": time.strftime("%Z", time.localtime(t0)),
         },
         "completo": pendentes == 0,
@@ -1135,35 +1299,47 @@ def _montar_chamada(dia: str = "", inicio: str = "", fim: str = "") -> dict:
         # `conferida` é mais forte que `completo`: significa que uma PESSOA
         # revisou e fechou. Quem for gravar falta deveria exigir isto.
         "conferida": fechamento is not None,
-        "fechamento": ({"em": time.strftime("%Y-%m-%dT%H:%M:%S%z",
-                                            time.localtime(fechamento["closed_at"])),
-                        "autor": fechamento["autor"] or None}
+        "fechamento": ({"em": _iso(fechamento["closed_at"]),
+                        "autor": fechamento["autor"] or None,
+                        "versao": fechamento.get("versao")}
                        if fechamento else None),
-        "total_cadastrados": len(todos),
-        "total_presentes": len(presentes),
-        # Quem está sem matrícula não pode ser casado pelo sistema da escola.
+        # Recalculada agora, não congelada. `ultima_versao` diz se este dia já
+        # foi fechado antes (e foi reaberto); `base`, se o automático veio de
+        # uma versão congelada porque os dados brutos já foram apagados.
+        "congelada": False,
+        "versao": None,
+        "ultima_versao": db.ultima_versao(dia_iso),
+        "base": ({"versao": base["versao"],
+                  "motivo": "os registros brutos deste dia já foram apagados "
+                            "pela retenção; o que o sistema detectou vem da "
+                            "última versão fechada"}
+                 if base else None),
+        # Os totais abaixo são preenchidos por `chamada.recontar`, a partir
+        # das listas — a mesma regra usada ao tirar alguém de uma versão.
+        "total_cadastrados": 0,
+        "total_presentes": 0,
+        # Quem está sem ID não pode ser casado pelo sistema da escola.
         # Exposto aqui para o problema aparecer antes de virar falta errada.
-        "sem_matricula": sum(1 for p in todos if not p.get("matricula")),
-        "correcoes": {
-            # Estes dois números medem o acerto do reconhecimento no dia:
-            # presentes marcados à mão = o sistema deixou passar;
-            # ausentes marcados à mão  = o sistema identificou errado.
-            "marcados_presentes": n_marcados_presentes,
-            "marcados_ausentes": n_marcados_ausentes,
-            "total": len(correcoes),
-        },
+        "sem_aluno_id": 0,
+        # `marcados_presentes` e `marcados_ausentes` medem o acerto do
+        # reconhecimento no dia: o primeiro conta quem o sistema deixou
+        # passar; o segundo, quem ele identificou errado.
+        "correcoes": {},
         "presentes": presentes,
         "ausentes": ausentes,
         "aviso": (None if fechamento else
                   "Chamada NÃO conferida. Quem não foi identificado pode ter "
                   "passado sem ser detectado — revise antes de registrar falta."),
     }
+    return chamada.recontar(resposta)
 
 
 @app.get("/attendance")
 def attendance(dia: str = Query("", description="AAAA-MM-DD; vazio = hoje"),
                inicio: str = Query("", description="HH:MM; vazio = 00:00"),
-               fim: str = Query("", description="HH:MM; vazio = 23:59")):
+               fim: str = Query("", description="HH:MM; vazio = 23:59"),
+               versao: int = Query(0, ge=0, description="0 = a vigente; "
+                                   "N = a versão congelada N do dia")):
     """Chamada do período, para consumo por outro sistema.
 
     Pontos de atenção para quem integra:
@@ -1171,6 +1347,12 @@ def attendance(dia: str = Query("", description="AAAA-MM-DD; vazio = hoje"),
     `conferida` — true só depois que uma PESSOA revisou e fechou a chamada.
       É o campo mais forte da resposta: só uma chamada conferida deveria
       alimentar registro de falta.
+
+    `congelada` / `versao` — chamada fechada é servida como foi conferida, e
+      não muda mais sozinha. Corrigir exige reabrir e fechar de novo, o que
+      gera uma versão nova: se `versao` for maior que a que você já gravou,
+      a chamada foi corrigida depois da entrega. `?versao=N` traz uma versão
+      anterior, e `/attendance/versoes` lista todas.
 
     `completo` — false quando ainda há trilhas aguardando reconhecimento. A
       chamada está INCOMPLETA nesse caso.
@@ -1186,9 +1368,102 @@ def attendance(dia: str = Query("", description="AAAA-MM-DD; vazio = hoje"),
 
     `person_id` é o identificador interno deste sistema. Casar por nome é
       frágil (homônimos, acentuação, digitação); para integração de verdade,
-      convém guardar a matrícula do aluno aqui e casar por ela.
+      convém guardar o `aluno_id` aqui e casar por ele.
     """
+    if versao:
+        t0, _ = _janela(dia, "", "")
+        dia_iso = time.strftime("%Y-%m-%d", time.localtime(t0))
+        v = db.attendance_version(dia_iso, versao)
+        if v is None:
+            raise HTTPException(404, f"O dia {dia_iso} não tem versão {versao}.")
+        fech = db.attendance_closure(dia_iso)
+        return _servir_versao(v, vigente=fech.get("versao") if fech else None)
     return _montar_chamada(dia, inicio, fim)
+
+
+@app.get("/attendance/presentes")
+def attendance_presentes(dia: str = Query("", description="AAAA-MM-DD; vazio = hoje")):
+    """Só quem está presente, só `aluno_id` e nome. Para a contagem da merenda.
+
+    Por que existe separada de `/attendance`: aquela devolve a chamada inteira
+    — ausentes, fotos, horários, versões, histórico de correção. Quem só
+    precisa contar pratos teria que saber ignorar tudo isso, e cada campo que
+    ele aprende a ler vira um acoplamento que trava mudança deste lado.
+
+    Sem `dia`, é HOJE pelo relógio do Pi. Isso é de propósito: se o outro
+    sistema montasse a data, um servidor em UTC pediria o dia seguinte depois
+    das 21h de Brasília. `?dia=` serve para consultar histórico.
+
+    Os dois campos de `meta` dizem o quanto confiar na lista, e valem mais que
+    o total:
+
+    `completo` — false quando ainda há trilhas esperando reconhecimento. A
+      lista está INCOMPLETA: pode faltar gente que já passou.
+
+    `conferida` — true só depois que uma pessoa revisou e fechou a chamada.
+      Enquanto for false, a lista é o que a máquina achou, sem ninguém ter
+      olhado. Não impede o uso (é esse o objetivo a longo prazo), mas é a
+      diferença entre contar prato a mais e registrar falta.
+
+    `sem_aluno_id` conta quantos dos presentes não têm ID cadastrado. Eles VÊM
+      na lista, com `aluno_id: null`, porque almoçam de todo jeito — só não dá
+      para casar com o cadastro da escola. Em operação normal é 0; se subir,
+      tem cadastro incompleto aqui, não aluno a menos. Linha anonimizada ou de
+      aluno removido também vem com `aluno_id: null`, mas NÃO conta: não há
+      cadastro para completar.
+
+    `escola_id` identifica de qual escola é esta lista. Cada escola roda seu
+      próprio Pi com sua própria base, então aqui ele é constante, vindo do
+      `config.yaml`. Vai na resposta porque quem consome recebe de várias
+      escolas e precisa saber de quem é cada lista sem depender do IP de
+      origem — IP muda quando a escola troca de rede, o `escola_id` não.
+      Sem escola no config, sai `null` — como no `/health`. String vazia num
+      lugar e `null` no outro obrigaria quem consome a tratar os dois.
+    """
+    c = _montar_chamada(dia)
+    # Contado ANTES da projeção abaixo, que descarta `person_id` e `removido` —
+    # sem eles não dá para separar o cadastro incompleto (corrigível) do aluno
+    # anonimizado ou removido (que não tem como ganhar ID). Mesma regra do
+    # `recontar`: esta lista vai para outro sistema, e um "falta ID" que
+    # ninguém pode resolver vira a cozinha procurando problema inexistente.
+    sem_id = sum(1 for l in c["presentes"] if chamada.falta_aluno_id(l))
+    # Ordem alfabética: a de `/attendance` é por horário de entrada, que aqui
+    # não interessa e dificultaria conferir a lista contra a sala.
+    presentes = sorted(({"aluno_id": l.get("aluno_id"), "nome": l["nome"]}
+                        for l in c["presentes"]),
+                       key=lambda p: p["nome"].lower())
+    return {
+        "escola_id": ESCOLA_ID or None,
+        "dia": c["periodo"]["dia"],
+        "total": len(presentes),
+        "presentes": presentes,
+        "meta": {
+            "conferida": c["conferida"],
+            "completo": c["completo"],
+            "sem_aluno_id": sem_id,
+        },
+    }
+
+
+@app.get("/attendance/versoes")
+def attendance_versoes(dia: str = Query(..., description="AAAA-MM-DD")):
+    """Histórico de fechamentos do dia: cada um é uma versão congelada."""
+    dia = _validar_dia(dia)
+    fech = db.attendance_closure(dia)
+    vigente = fech.get("versao") if fech else None
+    return {
+        "dia": dia,
+        "fechada": fech is not None,
+        "versao_vigente": vigente,
+        "versoes": [{
+            "versao": v["versao"],
+            "fechada_em": _iso(v["closed_at"]),
+            "autor": v["autor"] or None,
+            "presentes": v["payload"].get("total_presentes"),
+            "correcoes": (v["payload"].get("correcoes") or {}).get("total"),
+            "vigente": v["versao"] == vigente,
+        } for v in db.attendance_versions(dia)],
+    }
 
 
 class LoginReq(BaseModel):
@@ -1284,7 +1559,9 @@ def detections(person_id: int = Query(
     if dia:
         t0, t1 = _janela(dia, "", "")
     linhas = db.deteccoes_de(person_id or None, t0, t1, limit)
-    nomes = {p["id"]: p["name"] for p in db.list_people()}
+    # Com os removidos: detecção antiga de quem saiu do cadastro ainda mostra
+    # o nome de quem era.
+    nomes = {p["id"]: p["name"] for p in db.list_people(incluir_removidos=True)}
 
     saida = []
     for l in linhas:
@@ -1376,7 +1653,9 @@ def set_override(req: OverrideReq):
     cada correção é um erro dele, com o tipo identificado.
     """
     dia = _validar_dia(req.dia)
-    if db.get_person(req.person_id) is None:
+    # Removido do cadastro ainda pode ter a presença corrigida num dia em que
+    # estava matriculado — a chamada daquele dia continua aberta a conferência.
+    if db.get_person(req.person_id, incluir_removidos=True) is None:
         raise HTTPException(404, "Pessoa não encontrada.")
     if db.attendance_closure(dia) is not None:
         raise HTTPException(
@@ -1404,8 +1683,22 @@ class CloseReq(BaseModel):
 
 @app.post("/attendance/close")
 def close_attendance(req: CloseReq):
-    """Fecha a chamada do dia, marcando que uma pessoa a conferiu."""
+    """Fecha a chamada do dia e a congela numa versão nova.
+
+    A chamada fica guardada exatamente como estava na tela de quem fechou.
+    Depois disso, reprocessamento, exclusão de registro bruto ou retenção não
+    a alteram mais; corrigir exige reabrir e fechar de novo (versão N+1).
+    """
     dia = _validar_dia(req.dia)
+    # Fechar de novo sem reabrir criaria versão nova sem ninguém ter
+    # conferido nada — e esconderia que a anterior já tinha sido entregue.
+    ja = db.attendance_closure(dia)
+    if ja is not None:
+        qual = f" (versão {ja['versao']})" if ja.get("versao") else ""
+        raise HTTPException(
+            409, f"A chamada deste dia já está fechada{qual}. Para corrigir, "
+                 "reabra, ajuste e feche de novo — isso gera uma versão nova "
+                 "e mantém a anterior no histórico.")
     # Pendências só do dia que está sendo fechado. Contar as do banco inteiro
     # recusava o fechamento durante a aula toda: no modo captura sempre há
     # alguém que acabou de passar esperando o lote.
@@ -1419,17 +1712,24 @@ def close_attendance(req: CloseReq):
                  "novo em alguns minutos. Para adiantar, no Pi: "
                  "python scripts/recognize_batch.py")
 
-    resumo = _montar_chamada(dia=dia)
-    db.close_attendance(dia, req.autor.strip(), resumo["total_presentes"],
-                        resumo["correcoes"]["total"])
-    return {"ok": True, "dia": dia, "presentes": resumo["total_presentes"],
+    resumo = _montar_chamada(dia=dia, ao_vivo=True)
+    versao = db.close_attendance(dia, req.autor.strip(), resumo["total_presentes"],
+                                 resumo["correcoes"]["total"], payload=resumo)
+    return {"ok": True, "dia": dia, "versao": versao,
+            "presentes": resumo["total_presentes"],
             "correcoes": resumo["correcoes"]["total"]}
 
 
 @app.delete("/attendance/close")
 def reopen_attendance(dia: str = Query(...)):
-    """Reabre a chamada para nova conferência."""
-    return {"reaberta": db.reopen_attendance(_validar_dia(dia))}
+    """Reabre a chamada para nova conferência.
+
+    As versões congeladas continuam guardadas. Ao fechar de novo, a chamada
+    vira a versão seguinte; a anterior segue disponível em ?versao=N.
+    """
+    dia = _validar_dia(dia)
+    return {"reaberta": db.reopen_attendance(dia),
+            "ultima_versao": db.ultima_versao(dia)}
 
 
 @app.get("/snapshots/{path:path}")
@@ -1461,19 +1761,40 @@ def raiz():
 def _montar_painel():
     """Serve a interface web pela própria API, se os arquivos existirem.
 
-    Com isso o painel deixa de precisar de um processo próprio: eram três
-    (API, worker, Streamlit) e passam a ser dois. Um processo a menos é uma
-    coisa a menos para quebrar e para alguém ter que saber reiniciar — o que
-    importa quando quem opera não é quem desenvolveu.
+    Com isso o painel não precisa de processo próprio: a instalação tem dois
+    (API e worker). Um processo a menos é uma coisa a menos para quebrar e
+    para alguém ter que saber reiniciar — o que importa quando quem opera não
+    é quem desenvolveu.
 
-    Silenciosamente ignorado se a pasta não existir, para a API continuar
-    subindo em instalação que só usa o Streamlit.
+    Silenciosamente ignorado se a pasta não existir: a API continua subindo e
+    servindo as rotas de dados, só sem a tela.
     """
     pasta = project_path("web")
     if not pasta.is_dir():
         return
     from fastapi.staticfiles import StaticFiles
-    app.mount(PREFIXO_PAINEL, StaticFiles(directory=str(pasta), html=True),
+
+    class ArquivosDoPainel(StaticFiles):
+        """Arquivos da tela com `Cache-Control: no-cache`.
+
+        Sem o cabeçalho, o navegador decide sozinho por quanto tempo reusar a
+        cópia — e por uma regra que, para arquivo parado havia semanas, dá
+        dias sem nem perguntar. Depois de atualizar o Pi, quem já tinha usado
+        o painel seguia rodando o app.js ANTIGO contra a API nova. Visto na
+        prática: o style.css novo estava no servidor e a tela mostrava o velho.
+
+        `no-cache` não é "não guardar": o navegador guarda e, a cada abertura
+        da tela, pergunta se mudou. Sem mudança a resposta é um 304 sem corpo,
+        de poucos bytes; o arquivo só trafega de novo depois de atualização.
+        As fotos não passam por aqui e mantêm o cache de um dia.
+        """
+
+        async def get_response(self, path, scope):
+            resposta = await super().get_response(path, scope)
+            resposta.headers["Cache-Control"] = "no-cache"
+            return resposta
+
+    app.mount(PREFIXO_PAINEL, ArquivosDoPainel(directory=str(pasta), html=True),
               name="painel")
 
 

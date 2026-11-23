@@ -151,6 +151,40 @@ def reconhecer(cfg, db, limite: int, reprocessar: bool) -> int:
     return 0
 
 
+def _imprimir_congelada(payload: dict, versao: int) -> int:
+    """Dia fechado: imprime o que foi CONFERIDO, não um recálculo.
+
+    É a mesma versão congelada que a API serve. Recalcular aqui reabriria a
+    porta para o terminal e o painel discordarem sobre o mesmo dia — e, depois
+    da retenção, o recálculo mostraria todo mundo ausente.
+    """
+    print(f"Registro congelado (versão {versao}): reprocessamento e retenção "
+          "não o alteram.")
+
+    def marca(l):
+        if str(l.get("origem", "")).startswith("manual"):
+            return "✏️ manual"
+        return "" if l.get("detectado_pelo_sistema") else "não identificado"
+
+    print(f"\nPRESENTES ({len(payload['presentes'])}):")
+    for l in payload["presentes"]:
+        hora = l["primeira_vez"][11:16] if l.get("primeira_vez") else "--:--"
+        detalhe = (f"{l['passagens']} passagem(ns), score {l['melhor_score']:.3f} "
+                   if l.get("passagens") else "")
+        print(f"  {hora}  {l['nome']:<28} {detalhe}{marca(l)}")
+
+    print(f"\nAUSENTES ({len(payload['ausentes'])}):")
+    for l in payload["ausentes"]:
+        print(f"  {l['nome']:<28} {marca(l)}")
+
+    c = payload.get("correcoes") or {}
+    if c.get("marcados_presentes") or c.get("marcados_ausentes"):
+        print(f"\nCorreções do dia: o sistema deixou passar "
+              f"{c.get('marcados_presentes', 0)} e identificou "
+              f"{c.get('marcados_ausentes', 0)} por engano.")
+    return 0
+
+
 def presenca(db, dia: str) -> int:
     if dia:
         try:
@@ -172,7 +206,10 @@ def presenca(db, dia: str) -> int:
     # respostas diferentes para o mesmo dia — duas fontes de verdade.
     correcoes = db.attendance_overrides(dia_iso)
     fechamento = db.attendance_closure(dia_iso)
-    pessoas = db.list_people()
+    # Mesmo critério da API: quem estava matriculado no dia, inclusive quem
+    # foi removido do cadastro depois dele.
+    pessoas = [p for p in db.list_people(incluir_removidos=True)
+               if p["removido_em"] is None or p["removido_em"] > inicio]
 
     # Só as pendências deste dia, pelo mesmo critério da API.
     pend = db.count_pending_tracks(inicio, fim)
@@ -183,6 +220,12 @@ def presenca(db, dia: str) -> int:
         print(f"Conferida em {quando}{autor}.")
     else:
         print("NÃO conferida — confira no painel antes de tratar como falta.")
+
+    versao = (db.attendance_version(dia_iso, fechamento["versao"])
+              if fechamento and fechamento.get("versao") else None)
+    if versao is not None:
+        return _imprimir_congelada(versao["payload"], versao["versao"])
+
     if pend:
         print(f"⚠  {pend} trilha(s) ainda não reconhecida(s). Rode o "
               f"reconhecimento antes de usar este relatório.")

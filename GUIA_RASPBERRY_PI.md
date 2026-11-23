@@ -8,14 +8,16 @@ preparado para o Pi; este guia cobre o que faltava e como operar.
 ## 1. O que roda onde
 
 ```
-Câmera Intelbras ──RTSP──►  RASPBERRY PI 3B          SEU PC
-                            ├─ worker.py             └─ panel/app.py (Streamlit)
-                            ├─ api.py (porta 8000)      cadastro + histórico
-                            └─ data.db + snapshots      aponta p/ http://IP_DO_PI:8000
+Câmera Intelbras ──RTSP──►  RASPBERRY PI 3B                  SEU PC
+                            ├─ worker.py                     └─ navegador
+                            ├─ api.py (porta 8000)              http://IP_DO_PI:8000/painel/
+                            │    └─ serve o painel (web/)
+                            └─ data.db + snapshots
 ```
 
-O Pi faz o trabalho pesado e guarda os dados. O painel é só um cliente HTTP —
-não precisa de OpenCV nem toca a câmera.
+O Pi faz o trabalho pesado, guarda os dados e serve o painel. No PC não se
+instala nada: o painel abre no navegador e só fala com a API — não usa OpenCV
+nem toca a câmera.
 
 ---
 
@@ -348,14 +350,15 @@ interno do OpenCV.
 
 ## 5. Usar: cadastrar pessoas pelo painel (no seu PC)
 
-Sem cadastro, tudo aparece como "Desconhecido". No **seu PC**:
+Sem cadastro, tudo aparece como "Desconhecido". No **seu PC**, abra no
+navegador:
 
-```bash
-pip install -r requirements-panel.txt
-cp config.example.yaml config.yaml      # se ainda não existir
-# edite a linha:  base_url: "http://IP_DO_PI:8000"
-streamlit run panel/app.py
 ```
+http://IP_DO_PI:8000/painel/
+```
+
+e entre com o token que o `install_pi.sh` mostrou no fim (ele também está no
+`config.yaml` do Pi, em `api.token`). Nada a instalar no PC.
 
 No painel: **Cadastrar** → digite o nome → capture ~5 amostras com variações
 leves (frontal, levemente à esquerda, à direita, com e sem óculos se for o caso)
@@ -364,9 +367,9 @@ reiniciar nada.
 
 Verificar o Pi pelo navegador, sem painel:
 
-- `http://IP_DO_PI:8000/health` — versão do OpenCV, nº de pessoas e a idade do
-  último preview (se `worker_live_age_seconds` estiver alto ou `null`, o worker
-  não está processando)
+- `http://IP_DO_PI:8000/health` — qual escola é, versão do OpenCV, nº de
+  pessoas e se o worker está no ar (`worker_ativo`: `false` quando ele parou de
+  dar sinal de vida há mais de 30 s)
 - `http://IP_DO_PI:8000/live.jpg` — o que a câmera está vendo agora
 - `http://IP_DO_PI:8000/events` — últimos reconhecimentos
 
@@ -632,53 +635,61 @@ A chamada está **incompleta** nesse caso. Quem gravar falta sem checar isso vai
 marcar falta de aluno que está apenas na fila. Este é o campo mais importante
 da resposta.
 
-**`nao_identificados`** — não é a mesma coisa que ausente. Pode ser falha de
-captura, criança que passou fora do enquadramento, ou score abaixo do limiar.
-Transformar isso em falta é decisão do outro sistema, e deveria passar por
-conferência humana.
+**`ausentes`** — não é a mesma coisa que falta. A lista inclui quem o sistema
+não identificou (`"origem": "nao_identificado"` em cada item), e isso pode ser
+falha de captura, criança que passou fora do enquadramento ou score abaixo do
+limiar. Transformar isso em falta é decisão do outro sistema, e deveria passar
+por conferência humana: só trate como falta com `conferida: true`.
 
-**`matricula`** — o identificador pelo qual o sistema de gestão da escola casa
-os registros. O `person_id` continua na resposta, mas é interno deste sistema e
-não serve para o outro lado.
-
-> Este campo já se chamou `inep_id`, por informação que se mostrou incorreta:
-> o sistema da escola identifica o aluno pela **matrícula**, não pelo ID do
-> Censo Escolar. A coluna antiga continua no banco com o que foi digitado, mas
-> não é mais usada.
+**`aluno_id`** — o identificador ESTÁVEL que o sistema de gestão emite, e é
+por ele que os dois sistemas se casam. O `person_id` continua na resposta, mas
+é interno deste sistema e não serve para o outro lado. Em instalação que já
+tinha alunos cadastrados, o campo começa com o valor que havia sido digitado
+antes, como ponto de partida: substitua pelos IDs reais quando a escola os
+entregar.
 
 Casar por **nome** não é opção: homônimos, acentuação e digitação divergente
 quebram a associação silenciosamente.
 
 O campo é **opcional no cadastro**, para não travar o piloto — mas a resposta
-traz `sem_matricula` com a contagem de quem está sem, e o painel avisa. Aluno
-sem matrícula não pode ser casado pelo outro sistema, então esse número precisa
-chegar a zero antes da integração valer.
+traz `sem_aluno_id` com a contagem de quem está sem, e o painel avisa. Aluno
+sem ID não pode ser casado pelo outro sistema, então esse número precisa chegar
+a zero antes da integração valer.
 
 Preencher: no painel, em **Pessoas**, selecione o aluno e edite o campo.
 
-**Nenhuma validação de formato**, de propósito: aceita letra, barra, prefixo de
-turma, o que a escola usar. Só espaços das pontas são removidos, e zeros à
+**Nenhuma validação de formato**, de propósito: aceita letra, barra, hífen,
+UUID, o que a escola usar. Só espaços das pontas são removidos, e zeros à
 esquerda são preservados — o valor é guardado como texto, não número. Dois
-alunos não podem ter a mesma matrícula; a tentativa é recusada com o nome de
-quem já usa.
+alunos não podem ter o mesmo ID; a tentativa é recusada com o nome de quem já
+usa.
 
-> A versão anterior deste campo validava "12 dígitos", número que eu supus do
-> formato do Censo Escolar sem confirmar. Validar formato desconhecido
-> transforma dado válido em dado recusado, e o erro só aparece no pior momento:
-> cadastrando um aluno de verdade. Se o formato for confirmado depois, aí vale
-> acrescentar a checagem.
-
-Para o outro sistema consultar um aluno pela matrícula:
+Para o outro sistema consultar um aluno pelo ID:
 
 ```
-GET /people/by-matricula/000123456789
-GET /people/by-matricula/2026/0142      # barra funciona
+GET /people/by-aluno-id/000123456789
+GET /people/by-aluno-id/2026/0142      # barra funciona
 ```
 
 A resposta une as duas origens possíveis — trilhas do modo captura e eventos do
 modo realtime — e o campo `fontes` de cada pessoa diz de onde veio. Isso importa
 porque cada modo grava em tabela diferente: ler só uma delas devolveria chamada
 vazia dependendo do modo em uso naquele dia.
+
+### Várias escolas
+
+Cada escola roda o **seu próprio Pi**, com sua própria base e só os alunos
+dela. O `escola.id` do `config.yaml` identifica qual é, aparece no `/health` e
+vai carimbado na lista entregue ao sistema de gestão — que recebe de várias
+escolas e precisa separar sem depender do IP de origem, que muda quando a
+escola troca de rede.
+
+Não centralizar foi decisão, não acomodação. Juntar os alunos de várias escolas
+numa galeria só **não pode** melhorar o reconhecimento e aumenta o falso
+positivo de forma monotônica, porque o `match()` fica com o melhor resultado da
+galeria inteira — é a mesma matemática das confusões `lais -> bia`. E biometria
+de criança concentrada num servidor é um alvo; distribuída pelas escolas, um
+incidente fica contido em uma delas.
 
 ### Protegendo o acesso
 
@@ -709,8 +720,9 @@ proteção dependia de alguém lembrar de preencher o config. Agora esquecer
 uvicorn api:app --host 127.0.0.1 --port 8000
 ```
 
-**No Pi, o `install_pi.sh` já gera o token** e imprime as duas linhas para você
-colar no `config.yaml` do PC. Se precisar gerar à mão:
+**No Pi, o `install_pi.sh` já gera o token**, grava no `config.yaml` do Pi e o
+mostra no fim, para você entrar no painel pelo navegador. Se precisar gerar à
+mão:
 
 ```bash
 python -c "import secrets;print(secrets.token_urlsafe(32))"
@@ -738,7 +750,9 @@ api:
     escola: "..."
 ```
 
-O painel usa o token chamado `painel`, ou o primeiro da lista.
+No painel, entre com o token de qualquer consumidor. A sessão do navegador fica
+associada ao nome desse token, então um `painel` separado do `escola` permite
+revogar um sem derrubar o outro.
 
 > ⚠️ **Sobre HTTP, o token trafega em texto claro.** Quem captura tráfego na
 > rede o pega na primeira requisição e passa a ter acesso completo,
@@ -746,7 +760,8 @@ O painel usa o token chamado `painel`, ou o primeiro da lista.
 > interceptar é trivial. Ligue HTTPS antes de operar com crianças reais.
 
 > ⚠️ Trate o token como senha: não vai em print, e-mail, chat ou repositório.
-> Se vazar, gere outro e troque nos dois configs.
+> Se vazar, gere outro, troque no `config.yaml` do Pi, reinicie a API e entre
+> de novo no painel.
 
 **Se algum dia entrar um proxy reverso na frente da API**, atenção: todas as
 requisições passarão a chegar de `127.0.0.1` e a regra liberaria tudo. Nesse
@@ -957,7 +972,7 @@ alvo do teste. Galeria com uma pessoa só força todo rosto a casar com ela.
 | Tudo "Desconhecido" | Ninguém cadastrado, ou limiar alto demais | Cadastre pelo painel; seção 7 |
 | Reconhece a pessoa errada | Limiar baixo, poucas amostras, rosto pequeno | Suba o limiar; recadastre com mais amostras |
 | Perde quem passa rápido | Pi processa ~2 frames/s | Diminua `min_interval_seconds`, use `--int8`, aproxime a câmera |
-| Painel: "não consegui falar com a API" | `base_url` errado ou firewall | `curl http://IP_DO_PI:8000/health` do PC |
+| Painel não abre no navegador do PC | IP errado, API parada ou firewall | `curl http://IP_DO_PI:8000/health` do PC |
 | `/live.jpg` dá 404 | Worker parado ou `draw_annotations: false` | `systemctl status facial-worker` |
 | Pi travando / OOM | Desktop gráfico ligado | `sudo raspi-config` → Boot → Console |
 | Cartão cheio | Snapshots acumulados | `.venv/bin/python scripts/cleanup_snapshots.py --days 7` |

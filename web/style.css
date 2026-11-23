@@ -190,6 +190,32 @@ label.campo-inline { display: flex; align-items: flex-start; gap: .55rem;
            object-fit: contain; margin-bottom: .7rem; }
 .preview.grande { aspect-ratio: auto; max-height: 76vh; }
 
+/* Preview do cadastro: grande e centralizado.
+ *
+ * A largura é a MENOR de três: 960px, a largura da tela, e a que cabe na
+ * ALTURA da janela sem rolar. Os 290px descontados são o que fica acima do
+ * preview (topo, título, faixa de progresso) mais a legenda e o botão
+ * abaixo, medidos no navegador; a altura que sobra vira largura pela
+ * proporção 4:3. Sem esse
+ * limite, num notebook o preview empurrava o botão de capturar para fora da
+ * tela — e quem captura precisa ver o rosto e o botão juntos. O piso de 320px
+ * evita um preview minúsculo em janela muito baixa (aí rola, paciência). */
+.captura { max-width: 960px; margin: 0 auto 1.6rem; }
+.preview-captura { width: min(100%, max(320px, calc((100vh - 290px) * 4 / 3)));
+                   margin: 0 auto .45rem; }
+/* Ordem: imagem, legenda das cores, botão. A legenda fica colada na imagem
+   porque explica o que se vê nela, não o botão. */
+.legenda-captura { text-align: center; margin: 0 0 .7rem; }
+.captura-acoes { display: flex; justify-content: center; }
+.captura-acoes button { min-width: 240px; padding: .7rem 1.4rem; font-size: 1rem; }
+.captura h4 { text-align: center; }
+.captura .erro { max-width: 760px; margin: .8rem auto 0; }
+
+/* Na aba Pessoas o preview vem depois da grade de amostras: separa as duas
+   partes para não parecer mais uma amostra. */
+.captura-pessoas { margin-top: 1.8rem; padding-top: 1.4rem;
+                   border-top: 1px solid var(--borda); }
+
 .tiras { display: grid; gap: .7rem;
          grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); }
 .tira { background: var(--cartao); border: 1px solid var(--borda);

@@ -9,6 +9,7 @@ WAL permite 1 escritor + N leitores em acesso local (worker grava, API lê),
 que é exatamente o cenário deste projeto.
 """
 
+import json
 import sqlite3
 import time
 from dataclasses import dataclass, field
@@ -16,33 +17,33 @@ from pathlib import Path
 
 import numpy as np
 
+from .chamada import retirar_pessoa, tirar_fotos
 from .config import project_path
 
 
 # Nome usado nas linhas cujo titular foi removido com anonimização.
 ANONIMO = "(removido)"
 
-class MatriculaDuplicada(Exception):
-    """Outro aluno já tem essa matrícula."""
+# Modos de `delete_person`, do que preserva mais para o que apaga tudo.
+MODOS_EXCLUSAO = ("manter_historico", "anonimizar", "apagar")
+
+class AlunoIdDuplicado(Exception):
+    """Outro aluno já tem esse ID."""
 
     def __init__(self, person_id: int, nome: str):
         self.person_id, self.nome = person_id, nome
-        super().__init__(f"Matrícula já usada por '{nome}' (id {person_id}).")
+        super().__init__(f"ID de aluno já usado por '{nome}' (id {person_id}).")
 
 
-def normalizar_matricula(valor) -> str | None:
-    """Normaliza a matrícula: tira espaços das pontas e colapsa internos.
+def normalizar_aluno_id(valor) -> str | None:
+    """Normaliza o ID do aluno: tira espaços das pontas e colapsa internos.
 
-    **Nenhuma validação de formato, de propósito.** A versão anterior deste
-    campo era o ID INEP, e eu tinha posto uma checagem de "12 dígitos" baseada
-    no que eu *supunha* do formato do Censo Escolar — suposição que se revelou
-    errada duas vezes: o identificador usado pela escola não é o INEP, é a
-    matrícula, e o formato dela não foi confirmado.
-
-    Então aqui só se remove ruído de digitação. Não filtra por dígito: se a
-    matrícula tiver letra, prefixo de turma ou barra, ela sobrevive. Validar
-    formato que não se conhece transforma dado válido em dado rejeitado, e o
-    erro aparece no pior momento — na hora de cadastrar um aluno de verdade.
+    **Nenhuma validação de formato, de propósito**: o formato do ID que o
+    sistema de gestão emite não foi confirmado. Só se remove ruído de
+    digitação — letra, hífen, barra e UUID sobrevivem. Validar formato que não
+    se conhece transforma dado válido em dado rejeitado, e o erro aparece no
+    pior momento: na hora de cadastrar um aluno de verdade. Já aconteceu uma
+    vez neste projeto (ver MUDANCAS.md, 7.7).
 
     Guardado como TEXT, nunca INTEGER: é identificador, não quantidade, e
     zero à esquerda tem que sobreviver.
@@ -157,6 +158,30 @@ class Database:
                     correcoes   INTEGER
                 );
 
+                -- A chamada como foi CONFERIDA, congelada no fechamento.
+                --
+                -- Sem isto, um dia fechado continuava sendo recalculado a cada
+                -- consulta, e mudava sem ninguém pedir: reprocessar o lote
+                -- trocava quem aparecia presente, e a retenção de 30 dias
+                -- apagava as trilhas — o dia voltava com todo mundo ausente e
+                -- ainda marcado como conferido.
+                --
+                -- Cada fechamento é uma versão nova; reabrir e fechar de novo
+                -- NÃO apaga a anterior. Quem consome vê pelo número que a
+                -- chamada mudou depois de já ter sido entregue.
+                --
+                -- `payload` é o JSON de /attendance no instante do fechamento.
+                -- Contém nomes e IDs de aluno: a retenção destas linhas ainda
+                -- precisa ser decidida por quem responde por proteção de dados.
+                CREATE TABLE IF NOT EXISTS attendance_versions (
+                    dia        TEXT    NOT NULL,
+                    versao     INTEGER NOT NULL,
+                    closed_at  REAL    NOT NULL,
+                    autor      TEXT,
+                    payload    TEXT    NOT NULL,
+                    PRIMARY KEY (dia, versao)
+                );
+
                 -- Rótulo de uma detecção ESPECÍFICA: "esta aqui não é ela".
                 --
                 -- Mais fino que attendance_overrides, que fala de pessoa/dia.
@@ -214,15 +239,6 @@ class Database:
                 if coluna not in existentes:
                     con.execute(f"ALTER TABLE embeddings ADD COLUMN {coluna} {tipo}")
 
-            # Matrícula do aluno: o identificador que o sistema de gestão da
-            # escola usa. Índice único PARCIAL — dois alunos não podem
-            # compartilhar a mesma matrícula, mas vários podem estar sem
-            # preencher (sem a cláusula WHERE, o segundo NULL colidiria).
-            #
-            # A coluna `inep_id` de antes NÃO é removida: o dado já digitado
-            # continua lá, intacto, para o caso de o Censo Escolar voltar a
-            # ser necessário. Remover coluna em SQLite é operação destrutiva
-            # e o ganho seria só estético.
             # Recorte LIMPO do rosto de cada evento.
             #
             # O `snapshot_path` do modo realtime guarda o frame ANOTADO — com
@@ -244,45 +260,90 @@ class Database:
                 con.execute("ALTER TABLE detection_labels "
                             "ADD COLUMN pessoa_correta INTEGER")
 
+            # Qual versão congelada o fechamento atual representa. Fechamento
+            # anterior a esta coluna fica com NULL: não há o que servir
+            # congelado, e a chamada daquele dia segue recalculada como antes.
+            fech = {r["name"] for r in con.execute(
+                "PRAGMA table_info(attendance_closures)")}
+            if "versao" not in fech:
+                con.execute("ALTER TABLE attendance_closures ADD COLUMN versao INTEGER")
+
             pessoas = {r["name"] for r in con.execute("PRAGMA table_info(people)")}
             if "matricula" not in pessoas:
                 con.execute("ALTER TABLE people ADD COLUMN matricula TEXT")
+
+            # Aluno REMOVIDO do cadastro, mas que continua no histórico de
+            # chamadas: a linha em `people` fica (nome e `aluno_id`), sem
+            # biometria nem foto. NULL = ativo. É o que o modo de exclusão
+            # padrão faz — ver `delete_person`.
+            if "removido_em" not in pessoas:
+                con.execute("ALTER TABLE people ADD COLUMN removido_em REAL")
+
+            # ID do aluno emitido pelo sistema de gestão: a coluna viva de um
+            # campo que antes foi `inep_id` e depois `matricula`. A matrícula
+            # saiu porque carrega o ano ("2026/0142") e muda na virada — uma
+            # chave de integração que muda em janeiro quebra todo o cadastro
+            # biométrico feito até dezembro.
+            #
+            # As colunas anteriores (`inep_id`, `matricula`) NÃO são removidas
+            # aqui: o dado já digitado continua intacto, e remover coluna é
+            # destrutivo. Ficam dormentes — nada lê nem escreve nelas.
+            if "aluno_id" not in pessoas:
+                con.execute("ALTER TABLE people ADD COLUMN aluno_id TEXT")
+                # Copia o que já estava digitado. No piloto esses valores
+                # foram preenchidos à mão como identificador, e perdê-los em
+                # silêncio seria pior do que trazê-los: quando os IDs reais
+                # chegarem, é só sobrescrever pela tela de Pessoas.
+                con.execute("UPDATE people SET aluno_id = matricula "
+                            "WHERE matricula IS NOT NULL AND aluno_id IS NULL")
+
+            # Índice único PARCIAL: dois alunos não podem compartilhar o ID,
+            # mas vários podem estar sem preencher (sem o `IS NOT NULL`, o
+            # segundo NULL colidiria). E único só entre os ATIVOS: com o aluno
+            # removido mantendo o ID no histórico, um índice entre todos
+            # impediria recadastrar a mesma criança. Trocar ou derrubar índice
+            # não apaga dado nenhum — índice é só estrutura de busca.
+            con.execute("DROP INDEX IF EXISTS idx_people_matricula")
+            con.execute("DROP INDEX IF EXISTS idx_people_matricula_ativa")
             con.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_people_matricula "
-                "ON people(matricula) WHERE matricula IS NOT NULL")
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_people_aluno_id_ativo "
+                "ON people(aluno_id) "
+                "WHERE aluno_id IS NOT NULL AND removido_em IS NULL")
 
     # ---- pessoas / embeddings -------------------------------------------------
-    def person_by_matricula(self, matricula: str) -> dict | None:
-        alvo = normalizar_matricula(matricula)
+    def person_by_aluno_id(self, aluno_id: str) -> dict | None:
+        alvo = normalizar_aluno_id(aluno_id)
         if not alvo:
             return None
+        # Só entre os ativos: aluno removido guarda o ID no histórico, mas ele
+        # fica livre para um recadastro.
         with self._connect() as con:
             r = con.execute(
-                "SELECT id, name, matricula, created_at FROM people "
-                "WHERE matricula=?", (alvo,)).fetchone()
+                "SELECT id, name, aluno_id, created_at FROM people "
+                "WHERE aluno_id=? AND removido_em IS NULL", (alvo,)).fetchone()
         return dict(r) if r else None
 
-    def set_person_matricula(self, person_id: int, matricula) -> str | None:
-        """Define (ou limpa) a matrícula. Levanta MatriculaDuplicada se for de outro."""
-        alvo = normalizar_matricula(matricula)
+    def set_person_aluno_id(self, person_id: int, aluno_id) -> str | None:
+        """Define (ou limpa) o ID do aluno. Levanta AlunoIdDuplicado se for de outro."""
+        alvo = normalizar_aluno_id(aluno_id)
         if alvo:
-            dono = self.person_by_matricula(alvo)
+            dono = self.person_by_aluno_id(alvo)
             if dono and dono["id"] != person_id:
-                raise MatriculaDuplicada(dono["id"], dono["name"])
+                raise AlunoIdDuplicado(dono["id"], dono["name"])
         with self._connect() as con:
-            con.execute("UPDATE people SET matricula=? WHERE id=?",
+            con.execute("UPDATE people SET aluno_id=? WHERE id=?",
                         (alvo, person_id))
         return alvo
 
-    def add_person(self, name: str, matricula=None) -> int:
-        alvo = normalizar_matricula(matricula)
+    def add_person(self, name: str, aluno_id=None) -> int:
+        alvo = normalizar_aluno_id(aluno_id)
         if alvo:
-            dono = self.person_by_matricula(alvo)
+            dono = self.person_by_aluno_id(alvo)
             if dono:
-                raise MatriculaDuplicada(dono["id"], dono["name"])
+                raise AlunoIdDuplicado(dono["id"], dono["name"])
         with self._connect() as con:
             cur = con.execute(
-                "INSERT INTO people(name, created_at, matricula) VALUES(?, ?, ?)",
+                "INSERT INTO people(name, created_at, aluno_id) VALUES(?, ?, ?)",
                 (name, time.time(), alvo),
             )
             return int(cur.lastrowid)
@@ -335,33 +396,53 @@ class Database:
         with self._connect() as con:
             con.execute("DELETE FROM embeddings WHERE id=?", (embedding_id,))
 
-    def get_person(self, person_id: int) -> dict | None:
+    def get_person(self, person_id: int,
+                   incluir_removidos: bool = False) -> dict | None:
+        """A pessoa, ou None. Removido do cadastro conta como inexistente,
+        salvo com `incluir_removidos` — que é o que a chamada de um dia antigo
+        precisa para corrigir a presença de quem estava matriculado então."""
+        sql = ("SELECT id, name, aluno_id, created_at, removido_em FROM people "
+               "WHERE id=?")
+        if not incluir_removidos:
+            sql += " AND removido_em IS NULL"
         with self._connect() as con:
-            r = con.execute(
-                "SELECT id, name, matricula, created_at FROM people WHERE id=?",
-                (person_id,)).fetchone()
+            r = con.execute(sql, (person_id,)).fetchone()
         return dict(r) if r else None
 
     def rename_person(self, person_id: int, name: str) -> None:
         with self._connect() as con:
             con.execute("UPDATE people SET name=? WHERE id=?", (name, person_id))
 
-    def delete_person(self, person_id: int, anonimizar: bool = False) -> dict:
-        """Apaga a pessoa e TODO o rastro dela. Devolve os arquivos a remover.
+    def delete_person(self, person_id: int, anonimizar: bool = False,
+                      modo: str = None) -> dict:
+        """Remove a pessoa. Devolve os arquivos de imagem a apagar do disco.
+
+        Três modos (`MODOS_EXCLUSAO`). Em TODOS saem as imagens do rosto e os
+        embeddings — a biometria. O que muda é o que acontece com o histórico:
+
+          "manter_historico"  aluno sai do cadastro e deixa de ser reconhecido,
+                              mas nome e `aluno_id` continuam nas chamadas,
+                              como presente ou ausente, nos dias em que ele
+                              estava matriculado. A chamada é registro escolar;
+                              a foto e o vetor do rosto é que são o dado
+                              sensível. É o modo padrão da API.
+          "anonimizar"        as passagens ficam, sem identificar quem.
+          "apagar"            some tudo, inclusive o histórico — para um pedido
+                              de exclusão completa.
+
+        Sem `modo`, vale o parâmetro antigo `anonimizar` (False = "apagar"),
+        para quem já chamava assim continuar com o mesmo efeito.
 
         Quem chama é responsável por remover os arquivos — o banco não conhece o
-        sistema de arquivos. Devolver a lista evita deixar imagens de rosto no
-        disco depois de um pedido de exclusão.
-
-        `anonimizar=True` preserva as linhas de eventos e trilhas com
-        `person_id` nulo e nome neutro — a estatística de "alguém passou às
-        7:42" continua, sem identificar quem. As IMAGENS são apagadas nos dois
-        modos, porque a imagem do rosto é o dado identificante.
-
-        Devolve os caminhos por base, já que as imagens moram em dois lugares:
+        sistema de arquivos. Devolve os caminhos por base, já que as imagens
+        moram em dois lugares:
             {"snapshots": [...],   # relativos a storage.snapshots_dir
              "tracks":    [...]}   # relativos a tracking.crops_dir
         """
+        modo = modo or ("anonimizar" if anonimizar else "apagar")
+        if modo not in MODOS_EXCLUSAO:
+            raise ValueError(f"modo de exclusão inválido: {modo!r}")
+        anonimizar = modo == "anonimizar"
         with self._connect() as con:
             # `crop_path` entra junto: é o recorte LIMPO do rosto que o modo
             # realtime grava ao lado do snapshot. Ficou de fora quando a coluna
@@ -385,8 +466,33 @@ class Database:
                 WHERE t.person_id = ?
                 """, (person_id,))]
 
-            # embeddings e a pessoa saem sempre — sem eles não há reconhecimento
+            # embeddings saem sempre — sem eles não há reconhecimento
             con.execute("DELETE FROM embeddings WHERE person_id=?", (person_id,))
+
+            if modo == "manter_historico":
+                # Só a imagem sai. Eventos e trilhas ficam com nome e id, e
+                # é deles que a chamada de um dia ainda aberto se recalcula;
+                # correções de presença e rótulos também ficam, porque são
+                # parte desse mesmo histórico.
+                con.execute(
+                    "UPDATE events SET snapshot_path=NULL, crop_path=NULL "
+                    "WHERE person_id=?", (person_id,))
+                con.execute(
+                    "DELETE FROM track_crops WHERE track_id IN "
+                    "(SELECT id FROM tracks WHERE person_id=?)", (person_id,))
+                for r in con.execute(
+                        "SELECT dia, versao, payload FROM attendance_versions"
+                        ).fetchall():
+                    payload = json.loads(r["payload"])
+                    if tirar_fotos(payload, person_id):
+                        con.execute(
+                            "UPDATE attendance_versions SET payload=? "
+                            "WHERE dia=? AND versao=?",
+                            (json.dumps(payload, ensure_ascii=False),
+                             r["dia"], r["versao"]))
+                con.execute("UPDATE people SET removido_em=? WHERE id=?",
+                            (time.time(), person_id))
+                return {"snapshots": snapshots, "tracks": tracks}
 
             # Correções de presença dela: guardam motivo e autor ligados à
             # pessoa, e sem a pessoa não alimentam mais nada.
@@ -434,17 +540,33 @@ class Database:
                 con.execute("DELETE FROM tracks WHERE person_id=?", (person_id,))
                 con.execute("DELETE FROM events WHERE person_id=?", (person_id,))
 
+            # Chamadas congeladas: a exclusão vale para elas também. É a única
+            # mudança que uma versão fechada aceita sem ser reaberta.
+            for r in con.execute(
+                    "SELECT dia, versao, payload FROM attendance_versions").fetchall():
+                payload = json.loads(r["payload"])
+                if retirar_pessoa(payload, person_id, anonimizar, ANONIMO):
+                    con.execute(
+                        "UPDATE attendance_versions SET payload=? "
+                        "WHERE dia=? AND versao=?",
+                        (json.dumps(payload, ensure_ascii=False),
+                         r["dia"], r["versao"]))
+
             con.execute("DELETE FROM people WHERE id=?", (person_id,))
         return {"snapshots": snapshots, "tracks": tracks}
 
-    def list_people(self) -> list[dict]:
+    def list_people(self, incluir_removidos: bool = False) -> list[dict]:
+        """Cadastrados. Com `incluir_removidos`, também quem saiu do cadastro
+        mas continua no histórico — a chamada de dias antigos precisa deles."""
+        onde = "" if incluir_removidos else "WHERE p.removido_em IS NULL"
         with self._connect() as con:
             rows = con.execute(
-                """
-                SELECT p.id, p.name, p.matricula, p.created_at,
+                f"""
+                SELECT p.id, p.name, p.aluno_id, p.created_at, p.removido_em,
                        COUNT(e.id) AS embeddings
                 FROM people p
                 LEFT JOIN embeddings e ON e.person_id = p.id
+                {onde}
                 GROUP BY p.id
                 ORDER BY p.name COLLATE NOCASE
                 """
@@ -452,12 +574,15 @@ class Database:
         return [dict(r) for r in rows]
 
     def load_gallery(self) -> Gallery:
+        # O filtro de removido é redundante (os embeddings dele já foram
+        # apagados) e fica de propósito: removido NUNCA pode ser reconhecido.
         with self._connect() as con:
             rows = con.execute(
                 """
                 SELECT e.person_id AS pid, e.vec AS vec, p.name AS name
                 FROM embeddings e
                 JOIN people p ON p.id = e.person_id
+                WHERE p.removido_em IS NULL
                 """
             ).fetchall()
         if not rows:
@@ -990,24 +1115,103 @@ class Database:
         return {int(r["person_id"]): dict(r) for r in rows}
 
     def close_attendance(self, dia: str, autor: str, presentes: int,
-                         correcoes: int) -> None:
-        with self._connect() as con:
+                         correcoes: int, payload: dict = None) -> int | None:
+        """Fecha o dia. Com `payload`, congela a chamada numa versão nova.
+
+        Devolve o número da versão (None sem payload). Número e gravação saem
+        da mesma transação IMMEDIATE: dois fechamentos simultâneos não
+        disputam o mesmo número.
+        """
+        agora = time.time()
+        con = self._connect()
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            versao = None
+            if payload is not None:
+                versao = int(con.execute(
+                    "SELECT COALESCE(MAX(versao), 0) + 1 FROM attendance_versions "
+                    "WHERE dia=?", (dia,)).fetchone()[0])
+                con.execute(
+                    "INSERT INTO attendance_versions "
+                    "(dia, versao, closed_at, autor, payload) VALUES (?,?,?,?,?)",
+                    (dia, versao, agora, autor,
+                     json.dumps(payload, ensure_ascii=False)))
             con.execute(
                 """
                 INSERT INTO attendance_closures
-                       (dia, closed_at, autor, presentes, correcoes)
-                VALUES (?, ?, ?, ?, ?)
+                       (dia, closed_at, autor, presentes, correcoes, versao)
+                VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(dia) DO UPDATE SET
                     closed_at=excluded.closed_at, autor=excluded.autor,
-                    presentes=excluded.presentes, correcoes=excluded.correcoes
+                    presentes=excluded.presentes, correcoes=excluded.correcoes,
+                    versao=excluded.versao
                 """,
-                (dia, time.time(), autor, presentes, correcoes),
+                (dia, agora, autor, presentes, correcoes, versao),
             )
+            con.commit()
+        except Exception:
+            con.rollback()
+            raise
+        finally:
+            con.close()
+        return versao
 
     def reopen_attendance(self, dia: str) -> int:
+        """Reabre o dia. As versões congeladas ficam: são o histórico."""
         with self._connect() as con:
             return con.execute(
                 "DELETE FROM attendance_closures WHERE dia=?", (dia,)).rowcount or 0
+
+    def attendance_version(self, dia: str, versao: int = None) -> dict | None:
+        """Uma versão congelada (a mais recente, sem `versao`), com o payload."""
+        sql = "SELECT * FROM attendance_versions WHERE dia=? "
+        args = [dia]
+        if versao is None:
+            sql += "ORDER BY versao DESC LIMIT 1"
+        else:
+            sql += "AND versao=?"
+            args.append(int(versao))
+        with self._connect() as con:
+            r = con.execute(sql, args).fetchone()
+        if r is None:
+            return None
+        d = dict(r)
+        d["payload"] = json.loads(d["payload"])
+        return d
+
+    def ultima_versao(self, dia: str) -> int | None:
+        with self._connect() as con:
+            v = con.execute("SELECT MAX(versao) FROM attendance_versions WHERE dia=?",
+                            (dia,)).fetchone()[0]
+        return int(v) if v is not None else None
+
+    def attendance_versions(self, dia: str) -> list[dict]:
+        """Todas as versões do dia, da primeira à última, com o payload."""
+        with self._connect() as con:
+            rows = con.execute(
+                "SELECT * FROM attendance_versions WHERE dia=? ORDER BY versao",
+                (dia,)).fetchall()
+        saida = []
+        for r in rows:
+            d = dict(r)
+            d["payload"] = json.loads(d["payload"])
+            saida.append(d)
+        return saida
+
+    def tem_registros_brutos(self, inicio: float, fim: float) -> bool:
+        """Sobrou alguma trilha ou evento no intervalo?
+
+        Falso para um dia que já existiu é sinal de que a retenção apagou os
+        dados brutos — e aí a única fonte do que o sistema viu naquele dia é
+        a chamada congelada.
+        """
+        with self._connect() as con:
+            return bool(con.execute(
+                """
+                SELECT EXISTS(SELECT 1 FROM tracks
+                               WHERE started_at >= ? AND started_at < ?)
+                    OR EXISTS(SELECT 1 FROM events WHERE ts >= ? AND ts < ?)
+                """, (inicio, fim, inicio, fim)).fetchone()[0])
 
     def attendance_closure(self, dia: str) -> dict | None:
         with self._connect() as con:

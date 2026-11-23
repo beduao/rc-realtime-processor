@@ -20,6 +20,19 @@ camera:
   # fps: 15
   # mjpeg: true             # MJPEG em vez de vídeo cru: essencial em USB 2.0
 
+escola:
+  # Qual escola é este Pi. Cada escola roda o seu, com a base só dos alunos
+  # dela — galeria menor é reconhecimento melhor, e biometria de criança fica
+  # contida na escola em vez de concentrada num servidor só.
+  #
+  # O `id` vai carimbado na lista de presentes entregue ao sistema de gestão,
+  # que recebe de várias escolas e precisa saber de quem é cada lista. Use o
+  # mesmo código que a gestão já usa; não invente um paralelo.
+  #
+  # Pode ficar vazio num piloto de escola única.
+  id: ""
+  nome: ""
+
 api:
   host: "0.0.0.0"
   port: 8000

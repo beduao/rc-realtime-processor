@@ -270,7 +270,7 @@ async function carregarChamada() {
  *
  * A versão anterior usava innerHTML, e várias mensagens carregam texto
  * digitado por alguém: o `autor` do fechamento, o nome do aluno que vem no
- * erro de matrícula duplicada. Um nome como `<img src=x onerror=...>` virava
+ * erro de ID duplicado. Um nome como `<img src=x onerror=...>` virava
  * código rodando na tela de quem abrisse a chamada.
  *
  * Cada parte é uma string (texto puro) ou `negrito(...)` / `codigo(...)`. */
@@ -311,20 +311,36 @@ function desenharChamada() {
       "recarregue em alguns minutos. Para adiantar, no Pi: ",
       codigo("python scripts/recognize_batch.py")));
   }
-  if (d.sem_matricula) {
+  if (d.sem_aluno_id) {
     av.append(faixa("aviso",
-      negrito(`${d.sem_matricula} aluno(s) sem matrícula.`),
+      negrito(`${d.sem_aluno_id} aluno(s) sem ID.`),
       " O sistema de gestão da escola não consegue casar esses registros."));
+  }
+  if (d.base) {
+    av.append(faixa("aviso",
+      negrito(`Base da versão ${d.base.versao}.`),
+      " Os registros brutos deste dia já foram apagados pela retenção, então " +
+      "o que o sistema detectou vem da última versão fechada. Sem fotos."));
   }
   if (d.conferida) {
     const f = d.fechamento;
+    const versao = f.versao
+      ? ` Versão ${f.versao}` + (f.versao > 1 ? ", corrigida depois do primeiro fechamento." : ".")
+      : "";
     av.append(faixa("ok", `Conferida em ${f.em.slice(8, 10)}/${f.em.slice(5, 7)} ` +
-      `às ${f.em.slice(11, 16)}` + (f.autor ? ` por ${f.autor}` : "") +
-      ". Para alterar, reabra abaixo."));
+      `às ${f.em.slice(11, 16)}` + (f.autor ? ` por ${f.autor}` : "") + "." +
+      versao + " Congelada: só muda se for reaberta."));
   } else {
     av.append(faixa("aviso",
       "Chamada ", negrito("em aberto"), ". Quem não foi identificado pode ter " +
       "passado sem ser detectado — confira antes de tratar como falta."));
+    // Reaberta: a versão anterior não some, e fechar de novo gera outra. Dizer
+    // isso evita a impressão de que reabrir desfaz o que já foi entregue.
+    if (d.ultima_versao) {
+      av.append(faixa("aviso",
+        `Reaberta. A versão ${d.ultima_versao} continua guardada no histórico; ` +
+        `ao fechar de novo, a chamada vira a versão ${d.ultima_versao + 1}.`));
+    }
   }
 
   $("#n-presentes").textContent = `(${d.presentes.length})`;
@@ -382,7 +398,10 @@ function linhaPessoa(p, presente) {
   txt.append(criar("div", { className: "nome", textContent: p.nome }));
 
   const det = [ICONES[p.origem]];
-  if (!p.matricula) det.push("sem matrícula");
+  // Removido do cadastro: está aqui porque era matriculado neste dia. Sem
+  // foto porque as imagens dele foram apagadas, não por falha de captura.
+  if (p.removido) det.push("removido do cadastro");
+  else if (!p.aluno_id) det.push("sem ID");
   if (p.primeira_vez) det.push(p.primeira_vez.slice(11, 16));
   if (p.melhor_score != null) det.push(`score ${p.melhor_score.toFixed(2)}`);
   if (p.correcao && p.correcao.motivo) det.push(`motivo: ${p.correcao.motivo}`);
@@ -462,7 +481,8 @@ $("#recarregar").addEventListener("click", carregarChamada);
 $("#dia").addEventListener("change", carregarChamada);
 
 $("#fechar").addEventListener("click", async () => {
-  if (!confirm("Fechar a chamada deste dia? Depois é preciso reabrir para editar."))
+  if (!confirm("Fechar a chamada deste dia? Ela fica congelada exatamente como " +
+               "está agora; para editar depois, é preciso reabrir."))
     return;
   try {
     await api("/attendance/close", { metodo: "POST", corpo: {
@@ -681,7 +701,7 @@ $("#cad-iniciar").addEventListener("click", async () => {
   try {
     sessaoCad = await api("/enroll/start", { metodo: "POST", corpo: {
       name: $("#cad-nome").value.trim(),
-      matricula: $("#cad-matricula").value.trim() } });
+      aluno_id: $("#cad-aluno-id").value.trim() } });
   } catch (e) {
     alert(`Não foi possível iniciar: ${e.message}`);
     return;
@@ -781,7 +801,7 @@ function encerrarCadastro() {
   $("#cad-sessao").hidden = true;
   $("#cad-inicio").hidden = false;
   $("#cad-nome").value = "";
-  $("#cad-matricula").value = "";
+  $("#cad-aluno-id").value = "";
   validarInicio();
 }
 
@@ -817,7 +837,7 @@ async function recarregarListasDePessoas() {
   s.innerHTML = "";
   for (const p of pessoas) {
     s.append(criar("option", { value: p.id,
-      textContent: `${p.name} — ${p.matricula || "sem matrícula"} ` +
+      textContent: `${p.name} — ${p.aluno_id || "sem ID"} ` +
                    `(${p.embeddings} amostra(s))` }));
   }
   if (antesP && pessoas.some(p => String(p.id) === antesP)) s.value = antesP;
@@ -831,7 +851,7 @@ function limparPessoa() {
   $("#amostras-pessoa").innerHTML = "";
   $("#avisos-pessoa").innerHTML = "";
   $("#ed-nome").value = "";
-  $("#ed-matricula").value = "";
+  $("#ed-aluno-id").value = "";
 }
 
 async function carregarAmostras() {
@@ -848,7 +868,7 @@ async function carregarAmostras() {
   }
   pessoaAtual = dados.person;
   $("#ed-nome").value = pessoaAtual.name;
-  $("#ed-matricula").value = pessoaAtual.matricula || "";
+  $("#ed-aluno-id").value = pessoaAtual.aluno_id || "";
   validarEdicao();
 
   const av = $("#avisos-pessoa");
@@ -977,17 +997,17 @@ function validarEdicao() {
   if (!pessoaAtual) { $("#ed-salvar").disabled = true; return; }
   const nome = $("#ed-nome").value.trim();
   const mudou = nome !== pessoaAtual.name ||
-                $("#ed-matricula").value.trim() !== (pessoaAtual.matricula || "");
+                $("#ed-aluno-id").value.trim() !== (pessoaAtual.aluno_id || "");
   $("#ed-salvar").disabled = !nome || !mudou;
 }
 $("#ed-nome").addEventListener("input", validarEdicao);
-$("#ed-matricula").addEventListener("input", validarEdicao);
+$("#ed-aluno-id").addEventListener("input", validarEdicao);
 
 $("#ed-salvar").addEventListener("click", async () => {
   try {
     await api(`/people/${pessoaAtual.id}`, { metodo: "PATCH", corpo: {
       name: $("#ed-nome").value.trim(),
-      matricula: $("#ed-matricula").value.trim() } });
+      aluno_id: $("#ed-aluno-id").value.trim() } });
     piscarSalvo();
     await recarregarListasDePessoas();
   } catch (e) {
@@ -1013,18 +1033,28 @@ $("#add-amostra").addEventListener("click", async () => {
   }
 });
 
+/* Texto de confirmação por modo: quem clica precisa ler o que vai acontecer
+ * com o HISTÓRICO, que é a única coisa que muda entre os três — fotos e
+ * biometria saem sempre. */
+const CONFIRMA_REMOCAO = {
+  manter_historico: (n) => `Remover ${n} do cadastro? Fotos e biometria serão ` +
+    "apagadas; o nome continua nas chamadas em que estava matriculado.",
+  anonimizar: (n) => `Remover ${n}? Fotos, biometria e o nome serão apagados; ` +
+    "as chamadas ficam sem identificar quem era.",
+  apagar: (n) => `Apagar ${n} e TODO o histórico, inclusive as chamadas? ` +
+    "Não tem como desfazer.",
+};
+
 $("#ex-pessoa").addEventListener("click", async () => {
-  const anon = $("#ex-anonimizar").checked;
-  const aviso = anon
-    ? `Excluir ${pessoaAtual.name}, preservando as passagens sem identificação?`
-    : `Excluir ${pessoaAtual.name} e TODO o histórico dela? Não tem desfazer.`;
-  if (!confirm(aviso)) return;
+  const modo = document.querySelector('input[name="ex-modo"]:checked').value;
+  if (!confirm(CONFIRMA_REMOCAO[modo](pessoaAtual.name))) return;
   try {
-    const r = await api(`/people/${pessoaAtual.id}?anonimizar=${anon}`,
+    const r = await api(`/people/${pessoaAtual.id}?modo=${modo}`,
                         { metodo: "DELETE" });
     limparPessoa();
     await recarregarListasDePessoas();
-    alert(`Removido. ${JSON.stringify(r)}`);
+    alert(`Removido. Histórico: ${r.historico}. ` +
+          `${r.fotos_removidas + r.recortes_removidos} imagem(ns) apagada(s).`);
   } catch (e) {
     $("#avisos-pessoa").prepend(faixa("erro", e.message));
   }

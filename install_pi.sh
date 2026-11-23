@@ -206,8 +206,8 @@ EOF
 fi
 
 # Token de acesso: gerado aqui para o Pi nunca ficar exposto sem credencial.
-# A API recusa acesso remoto sem token, então sem isto o painel no PC tomaria
-# 503 na primeira tentativa — melhor já entregar pronto.
+# A API recusa acesso remoto sem token, então sem isto o painel aberto de outro
+# computador da rede tomaria 503 na primeira tentativa — melhor já entregar pronto.
 TOKEN_GERADO=""
 if "$PY" -c "
 import sys,re
@@ -316,7 +316,7 @@ step "9/9  Pronto"
 IP="$(hostname -I | awk '{print $1}')"
 cat <<EOF
 
-  ${BOLD}API do Pi:${RESET}    http://${IP:-IP_DO_PI}:${API_PORT}
+  ${BOLD}Painel:${RESET}       http://${IP:-IP_DO_PI}:${API_PORT}/painel/
   ${BOLD}Saúde:${RESET}        http://${IP:-IP_DO_PI}:${API_PORT}/health
 EOF
 
@@ -324,23 +324,20 @@ if [[ -n "$TOKEN_GERADO" ]]; then
 cat <<EOF
 
   ${BOLD}Token de acesso gerado${RESET} — a API recusa acesso pela rede sem ele.
-  Copie estas DUAS linhas para o config.yaml ${BOLD}do seu PC${RESET}, na seção api:
+  Abra o painel no navegador de qualquer computador da rede e entre com:
 
-     api:
-       base_url: "http://${IP:-IP_DO_PI}:${API_PORT}"
-       token: "${TOKEN_GERADO}"
+     ${TOKEN_GERADO}
 
-  Trate como senha: não coloque em print, e-mail ou repositório.
-  Sobre HTTP o token trafega em texto claro — veja HTTPS no guia antes de
-  operar com crianças reais.
+  Ele já está no config.yaml deste Pi. Trate como senha: não coloque em
+  print, e-mail ou repositório. Sobre HTTP o token trafega em texto claro —
+  veja HTTPS no guia antes de operar com crianças reais.
 EOF
 fi
 
 cat <<EOF
 
-  ${BOLD}No seu PC${RESET} (painel de cadastro e histórico):
-     pip install -r requirements-panel.txt
-     streamlit run panel/app.py
+  ${BOLD}Escola${RESET}: preencha o bloco escola: do config.yaml (id e nome) e rode
+     sudo systemctl restart facial-api
 
   ${BOLD}Comandos úteis no Pi${RESET}
      sudo journalctl -u facial-worker -f      # log do reconhecimento

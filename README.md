@@ -5,9 +5,11 @@ câmera IP Intelbras (RTSP). Cada passagem é registrada com **foto + horário**
 
 - **Engine:** YuNet (detecção) + SFace (reconhecimento) via OpenCV DNN — leve,
   roda em CPU, sem GPU/dlib/onnxruntime. Pensado para o **Raspberry Pi 3B**.
-- **Painel web:** Streamlit (cadastro ao vivo, histórico, gestão de pessoas).
-- **Duas fases:** (1) testar **tudo num computador só**; (2) exportar **o mesmo código**
-  para o Pi, deixando só o painel no PC. A única mudança é `api.base_url`.
+- **Painel web:** HTML + JavaScript em `web/`, servido pela própria API em
+  `/painel` (chamada, reconhecimentos, cadastro ao vivo, pessoas, ao vivo).
+- **Duas fases:** (1) testar **tudo num computador só**; (2) exportar **o mesmo
+  código** para o Pi. O painel é aberto no navegador de qualquer computador da
+  rede, apontando para o Pi — nada a instalar no PC.
 
 ## Arquitetura
 
@@ -15,14 +17,14 @@ câmera IP Intelbras (RTSP). Cada passagem é registrada com **foto + horário**
 Câmera Intelbras ──RTSP──► worker.py ──┐
                                        ├─ data.db (SQLite) + data/snapshots/
                            api.py  ────┘        ▲
-                              ▲ HTTP            │ (worker grava data/live.jpg)
+                              ▲ HTTP            │ (worker publica o frame em tmpfs)
                               │
-                        panel/app.py (Streamlit)
+                        web/ (HTML+JS, servido pela API em /painel)
 ```
 
 - `worker.py` mantém o stream e faz o reconhecimento (grava eventos + snapshots).
-- `api.py` (FastAPI) faz cadastro ao vivo e serve eventos/fotos/preview.
-- `panel/app.py` é um cliente HTTP fino (não usa OpenCV nem toca a câmera).
+- `api.py` (FastAPI) faz cadastro ao vivo, serve eventos/fotos/preview e o painel.
+- `web/` é o painel: não usa OpenCV nem toca a câmera, só fala com a API.
 
 ## Componentes
 
@@ -35,14 +37,14 @@ Câmera Intelbras ──RTSP──► worker.py ──┐
 | `core/storage.py` | Salva snapshots em `data/snapshots/AAAAMMDD/` |
 | `worker.py` | Loop de reconhecimento contínuo |
 | `api.py` | API HTTP (cadastro, pessoas, eventos, snapshots, live) |
-| `panel/app.py` | Painel Streamlit — chamada com correção manual, cadastro, histórico |
+| `web/` | Painel no navegador — chamada com conferência, cadastro, pessoas, ao vivo |
 | `scripts/test_camera.py` | Testa a conexão (RTSP, webcam USB ou arquivo) |
 | `scripts/find_camera.py` | Varre a rede e descobre se a câmera expõe RTSP |
 | `scripts/check_pi.py` | Diagnóstico do Pi + medição de FPS real (abre a câmera) |
 | `scripts/monitor.py` | Acompanha CPU, temperatura, memória e fila **com o worker rodando** |
 | `scripts/calibrate_threshold.py` | Calibra o limiar usando as chamadas já conferidas como referência |
 | `scripts/measure_recall.py` | Mede quantas pessoas o sistema deixa passar (falso negativo) |
-| `scripts/check_local.py` | Verifica se dá para rodar worker, API e painel nesta máquina |
+| `scripts/check_local.py` | Verifica se dá para rodar worker e API (com o painel) nesta máquina |
 | `scripts/recognize_batch.py` | Fase 2 do modo captura: reconhece por votação e gera a presença |
 | `scripts/set_mode.py` | Alterna entre `realtime` e `captura` sem reiniciar o serviço |
 | `tests/test_all.py` | Suíte de regressão (roda sem câmera e sem os modelos) |
@@ -73,8 +75,8 @@ python -m venv .venv
 .venv\Scripts\activate            # PowerShell
 # source .venv/Scripts/activate   # Git Bash
 
-# 2) dependências (worker+API e painel no mesmo venv, para testar local)
-python -m pip install -r requirements-pi.txt -r requirements-panel.txt
+# 2) dependências (worker e API; o painel vem junto com a API)
+python -m pip install -r requirements-pi.txt
 
 # 3) baixar os modelos
 python models/download_models.py
@@ -84,7 +86,7 @@ copy config.example.yaml config.yaml
 #   edite config.yaml:
 #     câmera IP  -> camera.rtsp_url com a URL RTSP (use subtype=1)
 #     webcam     -> camera.rtsp_url: 0
-#   e mantenha api.base_url = http://localhost:8000
+#     escola     -> escola.id e escola.nome (pode ficar vazio num teste)
 
 # 5) testar a câmera
 python scripts/test_camera.py     # deve salvar data/test_frame.jpg
@@ -93,20 +95,19 @@ python scripts/test_camera.py     # deve salvar data/test_frame.jpg
 **Linux ou macOS:** o mesmo, trocando `.venv\Scripts\activate` por
 `source .venv/bin/activate` e `copy` por `cp`.
 
-Agora abra **3 terminais** (com o venv ativado em cada um):
+Agora abra **2 terminais** (com o venv ativado em cada um):
 
 ```bash
-# terminal A — API
-python -m uvicorn api:app --host 0.0.0.0 --port 8000
+# terminal A — API (serve também o painel)
+python -m uvicorn api:app --host 127.0.0.1 --port 8000
 
 # terminal B — worker (reconhecimento)
 python worker.py
-
-# terminal C — painel
-python -m streamlit run panel/app.py    # abre http://localhost:8501
 ```
 
-No painel: **Cadastrar** uma pessoa, depois ver **Reconhecimentos** e **Ao vivo**.
+Abra **http://localhost:8000/painel/** no navegador. Acesso pela própria
+máquina dispensa token. No painel: **Cadastrar** uma pessoa, depois ver
+**Reconhecimentos** e **Ao vivo**.
 
 ---
 
@@ -133,17 +134,18 @@ O `install_pi.sh` valida o hardware, instala o OpenCV correto, baixa os modelos,
 cria o `config.yaml` a partir do preset de Pi, testa a câmera e liga os serviços
 `facial-worker`, `facial-api` e a limpeza diária de snapshots.
 
+Depois da instalação, preencha o bloco `escola:` do `config.yaml` com o código
+da escola (veja [Uma escola por Pi](#uma-escola-por-pi-e-o-id-do-aluno)) e
+reinicie a API: `sudo systemctl restart facial-api`. O instalador não pergunta
+a escola, e a API só lê o bloco ao iniciar.
+
 > ⚠️ **Não use o `python3-opencv` do apt.** No Bookworm ele é a versão 4.6, e o
 > detector YuNet `2023mar` só carrega no **OpenCV ≥ 4.8**. Em 64-bit o PyPI tem
 > wheel pronto (`opencv-contrib-python-headless`), então nada é compilado.
 
-No **PC** fica só o painel:
-
-```bash
-pip install -r requirements-panel.txt
-# em config.yaml: api.base_url = http://IP_DO_PI:8000
-streamlit run panel/app.py
-```
+No **PC** não há nada a instalar: abra **http://IP_DO_PI:8000/painel/** no
+navegador e entre com o token que o `install_pi.sh` mostrou no fim (ele também
+fica no `config.yaml` do Pi, em `api.token`).
 
 Nenhuma mudança de código entre as fases — só `config.yaml`.
 
@@ -152,8 +154,59 @@ Diagnóstico e monitoramento no Pi:
 ```bash
 .venv/bin/python scripts/check_pi.py     # ambiente, modelos, câmera e FPS real
 sudo journalctl -u facial-worker -f      # log ao vivo
-curl http://localhost:8000/health        # saúde da API + idade do preview
+curl http://localhost:8000/health        # saúde da API, qual escola é, idade do preview
 ```
+
+---
+
+## Uma escola por Pi, e o ID do aluno
+
+**Cada escola roda o seu próprio Raspberry Pi**, com a sua própria base e só os
+alunos dela. Não há servidor central, e isso é decisão, não limitação:
+
+- **Reconhecimento:** o sistema compara cada rosto com a galeria inteira e fica
+  com o mais parecido. Juntar os alunos de várias escolas numa galeria só não
+  melhora nada e aumenta o falso positivo — quanto mais rostos na galeria, mais
+  chance de um estranho parecer com alguém.
+- **Proteção de dados:** biometria de criança distribuída pelas escolas faz de
+  um incidente um problema de uma escola; concentrada num servidor, de todas.
+
+A escola é propriedade da **instalação**, não do aluno, e por isso vem do
+`config.yaml`, não do banco:
+
+```yaml
+escola:
+  id: "123"            # o código que o sistema de gestão já usa para a escola
+  nome: "EM Exemplo"   # só para leitura humana
+```
+
+O `escola.id` aparece no `/health` e vai carimbado na lista de presentes, para
+quem recebe de várias escolas saber de qual veio cada lista. Pode ficar vazio
+num piloto de uma escola só. O `scripts/check_local.py` mostra qual escola a
+máquina está configurada para ser.
+
+**O aluno é identificado pelo `aluno_id`**, o ID **estável** que o sistema de
+gestão da escola emite. É preenchido no cadastro (campo "ID do aluno") ou depois,
+na aba Pessoas. Guardado como texto e sem validação de formato: aceita letra,
+barra, hífen ou UUID, e zero à esquerda sobrevive.
+
+> Por que um ID estável, e não a matrícula: a matrícula carrega o ano e muda na
+> virada, e uma chave que muda em janeiro quebraria de uma vez o vínculo de
+> todo o cadastro biométrico feito até dezembro.
+
+O ID é único **dentro de uma escola** (cada Pi só conhece os alunos dela). Quem
+consome de várias escolas casa pelo par `escola_id` + `aluno_id`.
+
+Rotas para integração:
+
+| Rota | Para quê |
+|---|---|
+| `GET /attendance/presentes?dia=AAAA-MM-DD` | Presentes do dia (`aluno_id` e nome), com `escola_id` e o quanto confiar na lista (`meta.completo`, `meta.conferida`) |
+| `GET /attendance?dia=AAAA-MM-DD` | A chamada inteira: presentes, ausentes, correções e versão conferida |
+| `GET /people/by-aluno-id/{aluno_id}` | Um aluno pelo ID da gestão |
+
+`meta.sem_aluno_id` (e `sem_aluno_id` em `/attendance`) conta quem está sem ID
+cadastrado e não pode ser casado pelo outro sistema. Em operação, tem que ser 0.
 
 ---
 

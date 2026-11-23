@@ -1027,6 +1027,80 @@ def api_presenca_une_as_duas_origens_e_avisa_quando_incompleta():
 
 
 @teste
+def api_presentes_entrega_lista_enxuta_e_diz_o_quanto_confiar():
+    """A rota da merenda: matrícula + nome, e os sinais de confiança.
+
+    O risco desta rota é a cozinha ler o total sem olhar `meta`. O teste
+    fixa que `completo` cai quando há trilha pendente e que quem está sem
+    matrícula aparece na lista (almoça), contado em `sem_aluno_id`.
+    """
+    try:
+        import fastapi.testclient  # noqa: F401
+    except ImportError:
+        return "PULADO: fastapi.testclient indisponível"
+
+    c, pasta = _api_cliente("presentes", **{"escola.id": "ESC-TESTE"})
+    from core.database import Database
+    db = Database(os.path.join(pasta, "dados.db"))
+
+    ana = db.add_person("Ana")
+    db.set_person_aluno_id(ana, "2026/0142")
+    bruno = db.add_person("Bruno")               # sem matrícula, de propósito
+    db.add_person("Carla")                       # cadastrada, não apareceu
+
+    hoje = time.localtime()
+    meia = time.mktime((hoje.tm_year, hoje.tm_mon, hoje.tm_mday, 0, 0, 0, 0, 0, -1))
+    dia = time.strftime("%Y-%m-%d", time.localtime(meia))
+    crop = [{"path": "x.jpg", "quality": 1.0, "face": "[]"}]
+
+    tid = db.add_track(meia + 7.5 * 3600, meia + 7.5 * 3600 + 1, 9, crop)
+    db.resolve_track(tid, ana, "Ana", 0.81, "[]")
+    db.add_event(bruno, "Bruno", 0.74, "b.jpg", 1)
+
+    d = c.get("/attendance/presentes").json()
+    assert d["dia"] == dia, d
+    # Quem consome recebe de várias escolas e separa por este campo. Sem ele,
+    # a única pista de origem seria o IP — que muda quando a escola troca de
+    # rede, e aí a merenda de uma escola vira a da outra.
+    assert d["escola_id"] == "ESC-TESTE", d
+    assert d["total"] == 2 and len(d["presentes"]) == 2, d
+    # só os dois campos pedidos: campo a mais vira acoplamento do outro lado
+    assert all(set(p) == {"aluno_id", "nome"} for p in d["presentes"]), d["presentes"]
+    assert [p["nome"] for p in d["presentes"]] == ["Ana", "Bruno"], "fora de ordem"
+    assert d["presentes"][0]["aluno_id"] == "2026/0142"
+    assert d["presentes"][1]["aluno_id"] is None, "sem matrícula não pode sumir"
+    assert d["meta"] == {"conferida": False, "completo": True, "sem_aluno_id": 1}, d
+
+    # trilha pendente: ainda pode haver gente que passou e não entrou na lista
+    pendente = db.add_track(meia + 8 * 3600, meia + 8 * 3600 + 1, 5, crop)
+    assert c.get("/attendance/presentes").json()["meta"]["completo"] is False
+
+    # Sem escola no config: null, igual ao /health — não string vazia num
+    # lugar e null no outro.
+    c_sem, _ = _api_cliente("presentes_sem_escola")
+    assert c_sem.get("/attendance/presentes").json()["escola_id"] is None
+    assert c_sem.get("/health").json()["escola_id"] is None
+    # volta para a API desta escola (o _api_cliente recarrega o módulo)
+    c, _ = _api_cliente("presentes", **{"escola.id": "ESC-TESTE"})
+
+    # fechar a chamada é o que torna `conferida` verdadeiro
+    db.resolve_track(pendente, None, "Desconhecido", 0.3, "[]")
+    assert c.post("/attendance/close",
+                  json={"dia": dia, "autor": "Operador"}).status_code == 200
+    d2 = c.get("/attendance/presentes").json()
+    assert d2["meta"]["conferida"] is True, d2
+    assert d2["total"] == 2, d2
+
+    # dia inválido falha na entrada, não devolve lista vazia parecendo verdade
+    assert c.get("/attendance/presentes", params={"dia": "18/11/2026"}).status_code == 400
+    # dia sem movimento: estrutura válida e vazia
+    d3 = c.get("/attendance/presentes", params={"dia": "2020-01-01"}).json()
+    assert d3["total"] == 0 and d3["presentes"] == [], d3
+    return ("devolve só matrícula+nome em ordem alfabética, mantém quem está "
+            "sem matrícula e sinaliza incompleta/não conferida")
+
+
+@teste
 def api_chamada_correcao_manual_preserva_o_automatico():
     """A correção não pode sobrescrever o que o reconhecimento detectou.
 
@@ -1154,60 +1228,109 @@ def api_chamada_fechamento_trava_edicao_e_exige_lote_vazio():
 
 
 @teste
-def matricula_normalizacao_e_unicidade():
+def migracao_de_matricula_para_aluno_id_nao_perde_dado():
+    """O Pi tem banco em produção: a troca de campo tem que ser aditiva.
+
+    Simula um banco da versão anterior — `people` com `matricula` e sem
+    `aluno_id` — e abre com o código de hoje. O que estava digitado tem que
+    aparecer no campo novo, e o antigo tem que continuar intacto: se o
+    backfill estiver errado, descobrir isso aqui custa um teste; descobrir
+    no Pi custa o cadastro de todo mundo.
+    """
+    import sqlite3
+
+    from core.database import Database
+
+    caminho = os.path.join(TMP, "migracao-aluno-id.db")
+    con = sqlite3.connect(caminho)
+    con.execute("CREATE TABLE people(id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "name TEXT NOT NULL, created_at REAL, matricula TEXT)")
+    con.execute("INSERT INTO people(name, created_at, matricula) "
+                "VALUES('Ana', 1.0, '2026/0142')")
+    con.execute("INSERT INTO people(name, created_at, matricula) "
+                "VALUES('Bruno', 2.0, NULL)")
+    con.commit()
+    con.close()
+
+    db = Database(caminho)
+    pessoas = {p["name"]: p for p in db.list_people()}
+    assert pessoas["Ana"]["aluno_id"] == "2026/0142", pessoas["Ana"]
+    assert pessoas["Bruno"]["aluno_id"] is None, pessoas["Bruno"]
+    # a busca pelo campo novo encontra o valor que veio do antigo
+    assert db.person_by_aluno_id("2026/0142")["name"] == "Ana"
+
+    con = sqlite3.connect(caminho)
+    con.row_factory = sqlite3.Row
+    colunas = {r["name"] for r in con.execute("PRAGMA table_info(people)")}
+    assert {"matricula", "aluno_id"} <= colunas, colunas
+    antigo = con.execute("SELECT matricula FROM people WHERE name='Ana'").fetchone()
+    assert antigo["matricula"] == "2026/0142", "a coluna antiga foi mexida"
+    con.close()
+
+    # abrir de novo não pode sobrescrever um ID já corrigido com o valor
+    # velho da matrícula — migração que roda duas vezes tem que ser inócua
+    db.set_person_aluno_id(pessoas["Ana"]["id"], "A-99")
+    db2 = Database(caminho)
+    assert db2.person_by_aluno_id("A-99") is not None, "backfill rodou de novo"
+    return ("aluno_id recebe o valor da matrícula, a coluna antiga fica "
+            "intacta e reabrir o banco não desfaz correção")
+
+
+@teste
+def aluno_id_normalizacao_e_unicidade():
     """A matrícula é a chave de casamento com o sistema da escola."""
-    from core.database import (Database, MatriculaDuplicada,
-                               normalizar_matricula)
+    from core.database import (Database, AlunoIdDuplicado,
+                               normalizar_aluno_id)
 
     # Normaliza só ruído de digitação. NÃO valida formato: a versão anterior
     # deste campo filtrava por dígito e exigia 12 caracteres, com base numa
     # suposição sobre o ID INEP que se mostrou errada duas vezes. Matrícula
     # com letra, barra ou prefixo tem que sobreviver.
-    assert normalizar_matricula("  2026/0142  ") == "2026/0142"
-    assert normalizar_matricula("ABC-123") == "ABC-123"
-    assert normalizar_matricula("turma  A  17") == "turma A 17"
-    assert normalizar_matricula("") is None
-    assert normalizar_matricula(None) is None
-    assert normalizar_matricula("   ") is None
+    assert normalizar_aluno_id("  2026/0142  ") == "2026/0142"
+    assert normalizar_aluno_id("ABC-123") == "ABC-123"
+    assert normalizar_aluno_id("turma  A  17") == "turma A 17"
+    assert normalizar_aluno_id("") is None
+    assert normalizar_aluno_id(None) is None
+    assert normalizar_aluno_id("   ") is None
     # zero à esquerda tem que sobreviver — daí TEXT e não INTEGER
-    assert normalizar_matricula("000123456789") == "000123456789"
+    assert normalizar_aluno_id("000123456789") == "000123456789"
 
-    pasta = os.path.join(TMP, "matricula")
+    pasta = os.path.join(TMP, "aluno_id")
     os.makedirs(pasta, exist_ok=True)
     db = Database(os.path.join(pasta, "dados.db"))
 
     ana = db.add_person("Ana", "000123456789")
-    assert db.get_person(ana)["matricula"] == "000123456789"
-    achado = db.person_by_matricula(" 000123456789 ")   # busca normaliza também
+    assert db.get_person(ana)["aluno_id"] == "000123456789"
+    achado = db.person_by_aluno_id(" 000123456789 ")   # busca normaliza também
     assert achado and achado["id"] == ana
 
     # duplicidade recusada, tanto no cadastro novo...
     try:
         db.add_person("Outra", "000123456789")
         raise AssertionError("aceitou matrícula duplicada no cadastro")
-    except MatriculaDuplicada as exc:
+    except AlunoIdDuplicado as exc:
         assert exc.person_id == ana and "Ana" in str(exc)
     # ...quanto na edição
     bruno = db.add_person("Bruno")
-    assert db.get_person(bruno)["matricula"] is None
+    assert db.get_person(bruno)["aluno_id"] is None
     try:
-        db.set_person_matricula(bruno, "000123456789")
+        db.set_person_aluno_id(bruno, "000123456789")
         raise AssertionError("aceitou duplicada na edição")
-    except MatriculaDuplicada:
+    except AlunoIdDuplicado:
         pass
 
     # atribuir o próprio valor de novo é permitido (não é conflito consigo)
-    assert db.set_person_matricula(ana, "000123456789") == "000123456789"
+    assert db.set_person_aluno_id(ana, "000123456789") == "000123456789"
     # limpar é permitido, e libera o valor
-    assert db.set_person_matricula(ana, "") is None
-    assert db.set_person_matricula(bruno, "000123456789") == "000123456789"
+    assert db.set_person_aluno_id(ana, "") is None
+    assert db.set_person_aluno_id(bruno, "000123456789") == "000123456789"
     # matrícula alfanumérica é aceita e fica única também
     carla = db.add_person("Carla", "2026/0142")
-    assert db.get_person(carla)["matricula"] == "2026/0142"
+    assert db.get_person(carla)["aluno_id"] == "2026/0142"
     # vários sem matrícula coexistem — o índice único é PARCIAL, senão o
     # segundo NULL bateria com o primeiro. Ana ficou sem no passo acima.
     db.add_person("Diana")
-    sem_id = [p["name"] for p in db.list_people() if not p["matricula"]]
+    sem_id = [p["name"] for p in db.list_people() if not p["aluno_id"]]
     assert sorted(sem_id) == ["Ana", "Diana"], sem_id
     return ("espaços normalizados, formato livre (letra e barra aceitas), "
             "zero à esquerda preservado, duplicidade recusada, vários sem "
@@ -1215,13 +1338,13 @@ def matricula_normalizacao_e_unicidade():
 
 
 @teste
-def api_matricula_na_chamada_e_busca():
+def api_aluno_id_na_chamada_e_busca():
     try:
         import fastapi.testclient  # noqa: F401
     except ImportError:
         return "PULADO: fastapi.testclient indisponível"
 
-    c, pasta = _api_cliente("matriculaapi")
+    c, pasta = _api_cliente("alunoidapi")
     from core.database import Database
     db = Database(os.path.join(pasta, "dados.db"))
     ana = db.add_person("Ana", "000123456789")
@@ -1235,37 +1358,37 @@ def api_matricula_na_chamada_e_busca():
     db.resolve_track(tid, ana, "Ana", 0.8, "[]")
 
     d = c.get("/attendance", params={"dia": dia}).json()
-    assert d["sem_matricula"] == 1, d["sem_matricula"]
+    assert d["sem_aluno_id"] == 1, d["sem_aluno_id"]
     presente = d["presentes"][0]
-    assert presente["matricula"] == "000123456789", presente
-    assert d["ausentes"][0]["matricula"] is None
+    assert presente["aluno_id"] == "000123456789", presente
+    assert d["ausentes"][0]["aluno_id"] is None
 
     # busca pela matrícula — porta de entrada do outro sistema
-    r = c.get("/people/by-matricula/000123456789")
+    r = c.get("/people/by-aluno-id/000123456789")
     assert r.status_code == 200 and r.json()["name"] == "Ana", r.text
-    assert c.get("/people/by-matricula/999999999999").status_code == 404
+    assert c.get("/people/by-aluno-id/999999999999").status_code == 404
 
     # matrícula com BARRA precisa funcionar na rota: o formato não foi
     # confirmado, e "2026/0142" é comum. Daí o :path no parâmetro.
     bruno = next(p["id"] for p in db.list_people() if p["name"] == "Bruno")
     assert c.patch(f"/people/{bruno}",
-                   json={"matricula": "2026/0142"}).status_code == 200
-    r = c.get("/people/by-matricula/2026/0142")
+                   json={"aluno_id": "2026/0142"}).status_code == 200
+    r = c.get("/people/by-aluno-id/2026/0142")
     assert r.status_code == 200 and r.json()["name"] == "Bruno", r.text
 
     # duplicidade recusada na edição
     assert c.patch(f"/people/{bruno}",
-                   json={"matricula": "000123456789"}).status_code == 409
+                   json={"aluno_id": "000123456789"}).status_code == 409
 
     # Formato livre: nada de aviso inventado. A versão anterior devolvia
     # "aviso" quando o valor não tinha 12 dígitos, com base numa suposição.
-    r = c.patch(f"/people/{bruno}", json={"matricula": "123"})
+    r = c.patch(f"/people/{bruno}", json={"aluno_id": "123"})
     assert r.status_code == 200 and "aviso" not in r.json(), r.json()
 
     # nome sozinho não mexe na matrícula
     r = c.patch(f"/people/{bruno}", json={"name": "Bruno Lima"})
-    assert r.status_code == 200 and "matricula" not in r.json()
-    assert db.get_person(bruno)["matricula"] == "123", "nome mexeu na matrícula"
+    assert r.status_code == 200 and "aluno_id" not in r.json()
+    assert db.get_person(bruno)["aluno_id"] == "123", "nome mexeu na matrícula"
     return ("matrícula na chamada, contagem de faltantes, busca com barra e "
             "duplicidade recusada")
 
@@ -1924,223 +2047,6 @@ def auth_snapshot_nao_escapa_da_pasta():
     assert r.status_code == 404, \
         f"vazou arquivo de diretório irmão ({r.status_code}) — is_relative_to falhou"
     return "arquivo válido serve; traversal e diretório irmão barrados"
-
-
-def _funcao_do_painel(nomes, globais):
-    """Extrai funções e constantes do panel/app.py com globais controlados.
-
-    O painel é um script Streamlit: importá-lo executaria a página inteira.
-    Pegando só os trechos necessários dá para testar o CÓDIGO REAL — não uma
-    réplica que poderia divergir do arquivo sem ninguém notar.
-
-    Aceita lista porque uma função do painel pode chamar outra (a `imagem`
-    chama `_cache_imagem`). Extrair só a primeira dava NameError — falha do
-    andaime de teste, não do código sob teste.
-    """
-    import ast
-    if isinstance(nomes, str):
-        nomes = [nomes]
-    fonte = open(os.path.join(RAIZ, "panel", "app.py"), encoding="utf-8").read()
-    arvore = ast.parse(fonte)
-
-    corpo = []
-    for no in arvore.body:
-        if isinstance(no, ast.FunctionDef) and no.name in nomes:
-            corpo.append(no)
-        # Constantes LITERAIS de módulo que as funções usam (ex.: _CACHE_MAX).
-        # A restrição a `ast.Constant` é essencial: sem ela entrariam também
-        # `API = cfg.api.base_url...` e `S = requests.Session()`, que são
-        # maiúsculos, dependem de estado do módulo (estouraria no exec) e
-        # sobrescreveriam justamente os dublês que o teste injeta.
-        elif (isinstance(no, ast.Assign)
-                and isinstance(no.value, ast.Constant)
-                and len(no.targets) == 1
-                and isinstance(no.targets[0], ast.Name)
-                and no.targets[0].id.isupper()):
-            corpo.append(no)
-
-    faltando = [n for n in nomes
-                if not any(isinstance(c, ast.FunctionDef) and c.name == n
-                           for c in corpo)]
-    assert not faltando, f"não achei no panel/app.py: {faltando}"
-
-    mod = ast.Module(body=corpo, type_ignores=[])
-    exec(compile(mod, "panel/app.py", "exec"), globais)      # noqa: S102
-    return globais[nomes[-1]]
-
-
-@teste
-def painel_baixa_imagem_com_token():
-    """A correção que desbloqueia o token: imagem vai por requests, não por URL.
-
-    Passar URL ao st.image faz o Streamlit devolvê-la intacta e o NAVEGADOR
-    buscar o arquivo, sem o cabeçalho do token. Ligar o token quebrava todas
-    as imagens do painel. Este teste roda a API de verdade com token e
-    confirma que a função do painel traz os bytes.
-    """
-    try:
-        import fastapi.testclient  # noqa: F401
-    except ImportError:
-        return "PULADO: fastapi.testclient indisponível"
-
-    import importlib
-    import requests
-
-    c, _ = _api_cliente("painel_img", host="10.0.0.9",
-                        **{"api.token": "tok3n"})
-    api = importlib.import_module("api")
-    api.SNAP_BASE.mkdir(parents=True, exist_ok=True)
-    (api.SNAP_BASE / "foto.jpg").write_bytes(b"\xff\xd8\xff\xd9CONTEUDO")
-
-    # O TestClient devolve resposta httpx, que não tem `.ok` — atributo do
-    # requests, que é o que o painel usa de verdade. Este adaptador só repõe
-    # a diferença de biblioteca.
-    class Resp:
-        def __init__(self, r):
-            self.status_code = r.status_code
-            self.content = r.content
-            self.ok = 200 <= r.status_code < 300
-            self._r = r
-
-        def json(self):
-            # O painel passou a ler o `detail` da resposta em vez de deduzir a
-            # causa pelo código HTTP, então o dublê precisa de json() e text.
-            # Levanta ValueError quando o corpo não é JSON, igual ao requests —
-            # é desse erro que o painel se defende.
-            try:
-                return self._r.json()
-            except Exception as exc:                     # noqa: BLE001
-                raise ValueError(str(exc)) from exc
-
-        @property
-        def text(self):
-            return self._r.text
-
-    # Session que fala com a API por dentro do TestClient, com o token.
-    # Conta as idas à rede, para o teste poder provar que o cache evita
-    # rebaixar a mesma foto — que é o ponto da otimização.
-    class SessaoFalsa:
-        def __init__(self, token):
-            self.headers = {"X-API-Token": token} if token else {}
-            self.chamadas = 0
-
-        def get(self, url, timeout=None):
-            self.chamadas += 1
-            caminho = url.replace("http://api-de-teste", "")
-            return Resp(c.get(caminho, headers=self.headers))
-
-    capturado = {}
-
-    class StFalso:
-        # O `_cache_imagem` real guarda o cache aqui, então o dublê precisa
-        # ter session_state — é assim que se testa o código de verdade em vez
-        # de uma réplica.
-        session_state = {}
-
-        @staticmethod
-        def image(dados, **kw):
-            capturado["bytes"] = dados
-
-        @staticmethod
-        def caption(texto, **kw):
-            capturado["aviso"] = texto
-
-    # Cache do painel: dicionário simples, injetado nos globais da função.
-    cache = {}
-    sessoes = []
-
-    def montar(token, limpar_cache=True):
-        """Simula uma sessão nova do painel.
-
-        Limpa o cache por padrão: sem isso, o caso 1 deixaria a foto guardada
-        e o caso 2 (sem token) acertaria pelo cache em vez de exercitar o 401.
-        O caso que PROVA o cache passa limpar_cache=False de propósito.
-        """
-        capturado.clear()
-        if limpar_cache:
-            StFalso.session_state.clear()
-        sessao = SessaoFalsa(token)
-        sessoes.append(sessao)
-        g = {"S": sessao, "API": "http://api-de-teste", "st": StFalso,
-             "requests": requests}
-        return _funcao_do_painel(["_cache_imagem", "imagem"], g)
-
-    # 1) com o token certo: os bytes chegam
-    montar("tok3n")("/snapshots/foto.jpg")
-    assert capturado.get("bytes", b"").endswith(b"CONTEUDO"), capturado
-    assert "aviso" not in capturado, capturado
-
-    # 2) sem token: não renderiza imagem, e explica que é token
-    montar("")("/snapshots/foto.jpg")
-    assert "bytes" not in capturado, "não devia renderizar imagem"
-    assert "token" in capturado["aviso"].lower(), capturado
-
-    # 3) foto que não existe: a mensagem vem da API e é DIFERENTE da de token.
-    # Antes o painel deduzia a causa pelo código HTTP e escrevia "retenção" —
-    # suposição que só às vezes era verdade. Agora repassa o `detail`, então o
-    # que se testa é que a explicação é a da API e não se confunde com token.
-    montar("tok3n")("/snapshots/nao-existe.jpg")
-    assert "bytes" not in capturado
-    aviso_404 = capturado["aviso"]
-    assert "não encontrado" in aviso_404.lower(), aviso_404
-    assert "token" not in aviso_404.lower(), \
-        "404 não pode ser anunciado como problema de token"
-
-    # 4) aceita caminho relativo e URL absoluta (snapshot_url vem dos dois jeitos)
-    montar("tok3n")("http://api-de-teste/snapshots/foto.jpg")
-    assert capturado.get("bytes", b"").endswith(b"CONTEUDO"), capturado
-
-    # 5) o cache evita rebaixar a MESMA foto. É o ponto da otimização: o
-    # Streamlit reexecuta o script a cada clique, e sem isto a aba de
-    # reconhecimentos redescarregava dezenas de imagens por interação.
-    f = montar("tok3n")
-    sessao = sessoes[-1]
-    f("/snapshots/foto.jpg")
-    f("/snapshots/foto.jpg")
-    f("/snapshots/foto.jpg")
-    assert sessao.chamadas == 1, \
-        f"cache não pegou: {sessao.chamadas} idas à rede para a mesma foto"
-    assert capturado.get("bytes", b"").endswith(b"CONTEUDO"), capturado
-
-    # 6) o preview ao vivo NÃO pode ser cacheado: muda a cada instante.
-    f = montar("tok3n")
-    sessao = sessoes[-1]
-    f("/enroll/preview?t=1")
-    f("/enroll/preview?t=1")
-    assert sessao.chamadas == 2, "preview ao vivo não pode vir do cache"
-
-    return ("bytes com token; 401 e 404 distintos; caminho e URL; "
-            "cache poupa rede na foto e é ignorado no preview ao vivo")
-
-
-@teste
-def painel_nao_tem_mais_st_image_com_url():
-    """Nenhum ponto de chamada voltou para o padrão antigo.
-
-    Guarda de regressão: os 5 st.image(f"{API}...") eram o bug. Se alguém
-    reintroduzir um, ele quebra silenciosamente só quando o token estiver
-    ligado — ou seja, direto em produção.
-    """
-    import re
-    fonte = open(os.path.join(RAIZ, "panel", "app.py"), encoding="utf-8").read()
-    ruins = re.findall(r'st\.image\(\s*f?"?\{?API\}?[^\)]*', fonte)
-    assert not ruins, f"st.image com URL da API: {ruins}"
-
-    # Todo st.image tem que receber BYTES, nunca uma string. Fixar a lista
-    # exata (["r.content"]) quebrou quando o cache adicionou uma segunda
-    # chamada legítima — o teste passou a proibir manutenção em vez de
-    # proibir a regressão. Agora a regra é a propriedade que importa.
-    chamadas = [c.strip() for c in re.findall(r"st\.image\(([^,\)]+)", fonte)]
-    assert chamadas, "nenhum st.image encontrado — o wrapper sumiu?"
-    for arg in chamadas:
-        assert not arg.startswith(('"', "'", 'f"', "f'")), \
-            f"st.image recebendo string (vira URL para o navegador): {arg}"
-        assert "API" not in arg, f"st.image com URL montada: {arg}"
-
-    # e todos os pontos de exibição usam o wrapper
-    assert fonte.count("imagem(") >= 6, "esperava a definição + 5 usos"
-    return (f"{len(chamadas)} st.image, todos com bytes; "
-            f"{fonte.count('imagem(') - 1} usos do wrapper")
 
 
 @teste
@@ -3179,11 +3085,379 @@ def fechamento_so_considera_pendencias_do_proprio_dia():
     return "ontem fecha com pendência de hoje; hoje continua travado pela sua"
 
 
+@teste
+def chamada_fechada_fica_congelada_e_versiona():
+    """Dia fechado mudava sozinho: reprocessar trocava quem estava presente e
+    a retenção de 30 dias devolvia todo mundo ausente, ainda 'conferida'."""
+    try:
+        import fastapi.testclient  # noqa: F401
+    except ImportError:
+        return "PULADO: fastapi.testclient indisponível"
+
+    import importlib
+    c, pasta = _api_cliente("congela")
+    api = importlib.import_module("api")
+    db = api.db
+    snaps = os.path.join(pasta, "snaps")
+    ana = db.add_person("Ana", "A1")
+    bruno = db.add_person("Bruno", "B1")
+    carla = db.add_person("Carla", "C1")
+    hoje = time.localtime()
+    meia = time.mktime((hoje.tm_year, hoje.tm_mon, hoje.tm_mday, 0, 0, 0, 0, 0, -1))
+    dia = time.strftime("%Y-%m-%d", time.localtime(meia))
+    crop = [{"path": "x.jpg", "quality": 1.0, "face": "[]"}]
+    tid = db.add_track(meia + 7.5 * 3600, meia + 7.5 * 3600 + 1, 9, crop)
+    db.resolve_track(tid, ana, "Ana", 0.81, "[]")
+    db.add_event(bruno, "Bruno", 0.74, _arquivo(snaps, "20260101/b.jpg"), 1,
+                 ts=meia + 7.6 * 3600)
+
+    def presentes(r):
+        return {p["nome"] for p in r["presentes"]}
+
+    r = c.post("/attendance/close", json={"dia": dia, "autor": "Op"})
+    assert r.status_code == 200 and r.json()["versao"] == 1, r.text
+    d = c.get("/attendance", params={"dia": dia}).json()
+    assert d["congelada"] and d["versao"] == 1 and d["conferida"], d
+    assert d["fechamento"]["versao"] == 1 and d["aviso"] is None
+    assert presentes(d) == {"Ana", "Bruno"}
+    assert any(p.get("foto_url") for p in d["presentes"] if p["nome"] == "Bruno")
+
+    # 1) reprocessar troca a trilha de pessoa: o dia fechado NÃO muda
+    db.reset_processed_tracks()
+    db.resolve_track(tid, carla, "Carla", 0.9, "[]")
+    assert presentes(c.get("/attendance", params={"dia": dia}).json()) == \
+        {"Ana", "Bruno"}, "reprocessamento alterou chamada fechada"
+    # janela parcial recalcula (a versão é do dia inteiro) e diz que recalculou
+    parcial = c.get("/attendance", params={"dia": dia, "inicio": "00:00"}).json()
+    assert parcial["congelada"] is False and "Carla" in presentes(parcial)
+
+    # 2) a retenção apaga os dados brutos e a foto: segue igual, sem link morto
+    db.purge_tracks_before(time.time() + 86400)
+    db.purge_events_before(time.time() + 86400, vacuum=False)
+    os.remove(os.path.join(snaps, "20260101/b.jpg"))
+    d = c.get("/attendance", params={"dia": dia}).json()
+    assert presentes(d) == {"Ana", "Bruno"} and d["conferida"], d
+    assert not any(p.get("foto_url") for p in d["presentes"]), \
+        "versão congelada apontando para foto que a retenção apagou"
+
+    # fechar de novo sem reabrir é recusado
+    r = c.post("/attendance/close", json={"dia": dia, "autor": "Op"})
+    assert r.status_code == 409 and "já está fechada" in r.json()["detail"], r.text
+
+    # 3) reabrir com os dados brutos apagados parte da versão, não do zero
+    r = c.delete("/attendance/close", params={"dia": dia}).json()
+    assert r == {"reaberta": 1, "ultima_versao": 1}, r
+    d = c.get("/attendance", params={"dia": dia}).json()
+    assert d["congelada"] is False and d["ultima_versao"] == 1
+    assert d["base"] and d["base"]["versao"] == 1, d["base"]
+    assert presentes(d) == {"Ana", "Bruno"}, "reabertura começou do zero"
+    assert all(p["detectado_pelo_sistema"] for p in d["presentes"])
+
+    # 4) corrigir e fechar de novo gera a versão 2; a 1 fica no histórico
+    assert c.post("/attendance/override", json={
+        "dia": dia, "person_id": carla, "presente": True}).status_code == 200
+    r = c.post("/attendance/close", json={"dia": dia, "autor": "Op2"})
+    assert r.json()["versao"] == 2, r.text
+    d = c.get("/attendance", params={"dia": dia}).json()
+    assert d["versao"] == 2 and presentes(d) == {"Ana", "Bruno", "Carla"}
+    assert d["correcoes"]["marcados_presentes"] == 1
+    v1 = c.get("/attendance", params={"dia": dia, "versao": 1}).json()
+    assert v1["versao"] == 1 and v1["versao_vigente"] is False and v1["aviso"]
+    assert presentes(v1) == {"Ana", "Bruno"}
+    hist = c.get("/attendance/versoes", params={"dia": dia}).json()
+    assert [(v["versao"], v["vigente"]) for v in hist["versoes"]] == \
+        [(1, False), (2, True)], hist
+    assert c.get("/attendance", params={"dia": dia, "versao": 9}).status_code == 404
+
+    # 5) exclusão completa (pedido LGPD) vale também para as versões
+    #    congeladas. O modo padrão, que mantém o nome, tem teste próprio.
+    c.delete(f"/people/{bruno}", params={"modo": "apagar"})
+    d = c.get("/attendance", params={"dia": dia}).json()
+    assert "Bruno" not in presentes(d) and d["total_presentes"] == 2, d
+    assert d["total_cadastrados"] == 2
+    v1 = c.get("/attendance", params={"dia": dia, "versao": 1}).json()
+    assert presentes(v1) == {"Ana"}, "excluído continuou na versão antiga"
+    c.delete(f"/people/{ana}", params={"anonimizar": "true"})
+    d = c.get("/attendance", params={"dia": dia}).json()
+    anon = [p for p in d["presentes"] if p["person_id"] is None]
+    assert len(anon) == 1 and anon[0]["nome"] == "(removido)", d["presentes"]
+    assert anon[0]["aluno_id"] is None and "Ana" not in presentes(d)
+    assert d["total_presentes"] == 2 and d["sem_aluno_id"] == 0, d
+    return ("reprocessamento e retenção não alteram o dia fechado; reabrir "
+            "parte da versão; v2 com histórico; exclusão alcança as versões")
+
+
+@teste
+def recall_e_presenca_leem_a_versao_congelada():
+    """Depois da retenção, o recall recalculado contava todo presente marcado
+    à mão como perdido — o número caía sem o sistema ter piorado."""
+    try:
+        import fastapi.testclient  # noqa: F401
+    except ImportError:
+        return "PULADO: fastapi.testclient indisponível"
+
+    import importlib
+    import io
+    from contextlib import redirect_stdout
+    from scripts.measure_recall import medir_chamada
+    from scripts.recognize_batch import presenca
+
+    c, _ = _api_cliente("recall_congelado")
+    api = importlib.import_module("api")
+    db = api.db
+    ids = {n: db.add_person(n) for n in ("Alfa", "Beta", "Delta")}
+    hoje = time.localtime()
+    meia = time.mktime((hoje.tm_year, hoje.tm_mon, hoje.tm_mday, 0, 0, 0, 0, 0, -1))
+    dia = time.strftime("%Y-%m-%d", time.localtime(meia))
+    crop = [{"path": "x.jpg", "quality": 1.0, "face": "[]"}]
+    for i, n in enumerate(("Alfa", "Beta")):
+        t = db.add_track(meia + 7 * 3600 + i * 20, meia + 7 * 3600 + i * 20 + 1,
+                         8, crop)
+        db.resolve_track(t, ids[n], n, 0.7, "[]")
+    db.set_attendance_override(dia, ids["Delta"], True, "vi entrar", "Op")
+    assert c.post("/attendance/close", json={"dia": dia}).json()["versao"] == 1
+
+    db.purge_tracks_before(time.time() + 86400)      # a retenção passou
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        assert medir_chamada(db) == 0
+    saida = buf.getvalue()
+    assert "2 de 3" in saida and "66.7%" in saida, saida
+    assert "Delta" in saida, saida
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        presenca(db, dia)
+    saida = buf.getvalue()
+    assert "Registro congelado (versão 1)" in saida, saida
+    assert "PRESENTES (3)" in saida and "Alfa" in saida, saida
+    return "recall 2/3 e relatório de presença iguais aos do dia fechado"
+
+
+@teste
+def versao_congelada_antes_da_troca_sai_com_aluno_id():
+    """Versão congelada antes da troca matricula -> aluno_id tem `matricula`
+    nas linhas e `sem_matricula` no topo. Servida como estava, a integração
+    receberia `aluno_id: null` em todo mundo e `sem_aluno_id` acusando a
+    turma inteira. O ID é completado ao servir, pelo cadastro atual, sem
+    regravar o registro."""
+    try:
+        import fastapi.testclient  # noqa: F401
+    except ImportError:
+        return "PULADO: fastapi.testclient indisponível"
+
+    import importlib
+    c, _ = _api_cliente("versao_antiga")
+    api = importlib.import_module("api")
+    db = api.db
+    ana = db.add_person("Ana", "AEFGH42")
+    bia = db.add_person("Bia", "B-007")
+    dia = "2026-10-01"
+    # O formato exato que o _montar_chamada gravava antes da troca
+    antigo = {
+        "periodo": {"dia": dia}, "completo": True, "trilhas_pendentes": 0,
+        "conferida": False, "fechamento": None,
+        "total_cadastrados": 3, "total_presentes": 2, "sem_matricula": 0,
+        "correcoes": {"marcados_presentes": 1, "marcados_ausentes": 0, "total": 1},
+        "presentes": [
+            {"person_id": ana, "matricula": "2026/0142", "nome": "Ana",
+             "origem": "automatico", "detectado_pelo_sistema": True},
+            {"person_id": bia, "matricula": "2026/0150", "nome": "Bia",
+             "origem": "manual_presente", "detectado_pelo_sistema": False,
+             "correcao": {"motivo": None, "autor": "Op", "em": "x"}},
+        ],
+        "ausentes": [
+            {"person_id": None, "matricula": None, "nome": "(removido)",
+             "origem": "nao_identificado", "detectado_pelo_sistema": False},
+        ],
+        "aviso": "Chamada NÃO conferida.",
+    }
+    db.close_attendance(dia, "Op", 2, 1, payload=antigo)
+    # Bia sai do cadastro mantendo o histórico: o ID dela segue valendo
+    assert c.delete(f"/people/{bia}").json()["modo"] == "manter_historico"
+
+    d = c.get("/attendance", params={"dia": dia}).json()
+    por_nome = {l["nome"]: l for l in d["presentes"] + d["ausentes"]}
+    assert por_nome["Ana"]["aluno_id"] == "AEFGH42", por_nome["Ana"]
+    assert por_nome["Bia"]["aluno_id"] == "B-007", "removida perdeu o ID"
+    assert por_nome["(removido)"]["aluno_id"] is None, "anonimizada ganhou ID"
+    assert not any("matricula" in l for l in por_nome.values()), \
+        "a chave velha saiu na resposta junto com a nova"
+    assert d["sem_aluno_id"] == 0 and "sem_matricula" not in d, d
+    assert d["total_presentes"] == 2 and d["correcoes"]["marcados_presentes"] == 1
+
+    p = c.get("/attendance/presentes", params={"dia": dia}).json()
+    assert sorted(x["aluno_id"] for x in p["presentes"]) == ["AEFGH42", "B-007"], p
+    assert p["meta"]["sem_aluno_id"] == 0 and p["total"] == 2, p
+
+    # O registro guardado NÃO foi reescrito: completar é só na entrega
+    guardado = db.attendance_version(dia)["payload"]
+    assert "sem_matricula" in guardado
+    assert all("aluno_id" not in l for l in guardado["presentes"]), guardado
+    assert guardado["presentes"][0]["matricula"] == "2026/0142"
+    return ("versão no formato antigo sai com o aluno_id do cadastro atual, "
+            "sem_aluno_id 0 e sem a chave velha; anonimizada segue sem ID; "
+            "payload guardado intacto")
+
+
+@teste
+def presentes_nao_acusa_falta_de_id_de_quem_nao_tem_cadastro():
+    """`sem_aluno_id` da lista da merenda: só cadastro que dá para completar.
+
+    Anonimizado e removido vêm com `aluno_id: null`, mas não têm cadastro
+    para completar. Contá-los fazia a lista acusar "cadastro incompleto" que
+    ninguém consegue corrigir — e a contagem divergia da do `/attendance`.
+    """
+    try:
+        import fastapi.testclient  # noqa: F401
+    except ImportError:
+        return "PULADO: fastapi.testclient indisponível"
+
+    import importlib
+    c, _ = _api_cliente("presentes_sem_id")
+    api = importlib.import_module("api")
+    db = api.db
+    hoje = time.localtime()
+    meia = time.mktime((hoje.tm_year, hoje.tm_mon, hoje.tm_mday, 0, 0, 0, 0, 0, -1))
+    dia = time.strftime("%Y-%m-%d", time.localtime(meia))
+
+    ids = {"Ana": db.add_person("Ana", "A-1"),       # tem ID
+           "Caio": db.add_person("Caio"),            # sem ID: cadastro incompleto
+           "Duda": db.add_person("Duda"),            # sem ID, será removida
+           "Eva": db.add_person("Eva", "E-5")}       # será anonimizada
+    for i, (nome, pid) in enumerate(ids.items()):
+        db.add_event(pid, nome, 0.8, f"{i}.jpg", 1, ts=meia + 7 * 3600 + i * 60)
+    assert c.post("/attendance/close", json={"dia": dia}).status_code == 200
+    c.delete(f"/people/{ids['Duda']}")                          # mantém histórico
+    c.delete(f"/people/{ids['Eva']}", params={"modo": "anonimizar"})
+
+    p = c.get("/attendance/presentes", params={"dia": dia}).json()
+    nulos = sorted(x["nome"] for x in p["presentes"] if x["aluno_id"] is None)
+    assert nulos == ["(removido)", "Caio", "Duda"], nulos   # os três vêm null
+    assert p["total"] == 4, p
+    assert p["meta"]["sem_aluno_id"] == 1, \
+        f"só o Caio é cadastro corrigível: {p['meta']}"
+    # e bate com a chamada completa, que usa a mesma regra
+    d = c.get("/attendance", params={"dia": dia}).json()
+    assert d["sem_aluno_id"] == p["meta"]["sem_aluno_id"], (d["sem_aluno_id"], p["meta"])
+    return ("anonimizado e removido vêm null mas não contam; só o cadastro "
+            "corrigível conta; igual ao /attendance")
+
+
 def _arquivo(base, rel, largura=40):
     caminho = os.path.join(base, rel)
     os.makedirs(os.path.dirname(caminho), exist_ok=True)
     cv2.imwrite(caminho, np.full((30, largura, 3), 120, np.uint8))
     return rel
+
+
+@teste
+def remover_aluno_mantem_nome_nas_chamadas_e_apaga_imagens():
+    """Modo padrão: o aluno sai do cadastro e todas as imagens dele somem,
+    mas o nome continua nas chamadas — presenças E faltas — dos dias em que
+    estava matriculado. Chamada é registro escolar; o rosto é o dado sensível."""
+    try:
+        import fastapi.testclient  # noqa: F401
+    except ImportError:
+        return "PULADO: fastapi.testclient indisponível"
+
+    import importlib
+    from core.imagem import caminho_miniatura
+    from pathlib import Path
+
+    trilhas = os.path.join(TMP, "remover_aluno", "tracks")
+    c, pasta = _api_cliente("remover_aluno", **{"tracking.crops_dir": trilhas})
+    api = importlib.import_module("api")
+    db, snaps = api.db, os.path.join(pasta, "snaps")
+    ana = db.add_person("Ana", "2026/001")
+    db.add_person("Bia", "2026/002")
+    v = np.ones(128, np.float32) / np.sqrt(128)
+
+    hoje = time.localtime()
+    meia = time.mktime((hoje.tm_year, hoje.tm_mon, hoje.tm_mday, 0, 0, 0, 0, 0, -1))
+    dia_de = lambda d: time.strftime("%Y-%m-%d", time.localtime(meia + d * 86400 + 3600))
+    ontem, anteontem, hoje_s, amanha = dia_de(-1), dia_de(-2), dia_de(0), dia_de(1)
+
+    # imagens de todas as origens: amostra, passagem, recorte limpo, trilha,
+    # e uma miniatura ao lado de cada
+    amostra = _arquivo(snaps, f"amostras/{ana}/a.jpg")
+    db.add_embedding(ana, v, amostra, 500.0)
+    ev = db.add_event(ana, "Ana", 0.9, _arquivo(snaps, "20260101/ev.jpg"), 1,
+                      ts=meia + 7 * 3600,
+                      crop_path=_arquivo(snaps, "20260101/recortes/ev_c.jpg"))
+    tid = db.add_track(meia - 2 * 86400 + 7 * 3600, meia - 2 * 86400 + 7 * 3600 + 1,
+                       8, [{"path": _arquivo(trilhas, "20260101/t.jpg"),
+                            "quality": 1.0, "face": "[]"}])
+    db.resolve_track(tid, ana, "Ana", 0.8, "[]")
+    imagens = [Path(snaps) / amostra, Path(snaps) / "20260101/ev.jpg",
+               Path(snaps) / "20260101/recortes/ev_c.jpg", Path(trilhas) / "20260101/t.jpg"]
+    for img in list(imagens):
+        m = caminho_miniatura(img, 128)
+        cv2.imwrite(str(m), np.zeros((5, 5, 3), np.uint8))
+        imagens.append(m)
+    db.set_detection_label("evento", ev, "certo", "Op")
+
+    # hoje: Ana presente, fechado (congelado com foto); ontem: Ana faltou, fechado
+    assert c.post("/attendance/close", json={"dia": hoje_s}).status_code == 200
+    assert c.post("/attendance/close", json={"dia": ontem}).status_code == 200
+    d = c.get("/attendance", params={"dia": hoje_s}).json()
+    assert next(p for p in d["presentes"] if p["nome"] == "Ana").get("foto_url")
+
+    r = c.delete(f"/people/{ana}")                     # modo padrão
+    assert r.status_code == 200 and r.json()["modo"] == "manter_historico", r.text
+
+    # imagens: TODAS fora do disco, e a biometria fora do banco
+    sobrou = [str(i) for i in imagens if i.exists()]
+    assert not sobrou, f"imagens ficaram: {sobrou}"
+    assert not db.load_gallery().ids, "embedding ficou: ela seria reconhecida"
+    assert not os.path.isdir(os.path.join(snaps, "amostras", str(ana)))
+
+    # cadastro: some da lista de pessoas e das buscas
+    assert "Ana" not in {p["name"] for p in c.get("/people").json()}
+    assert c.get(f"/people/{ana}/samples").status_code == 404
+    assert c.get("/people/by-aluno-id/2026/001").status_code == 404
+
+    # chamadas FECHADAS: o nome fica — presente hoje, ausente ontem — sem foto
+    d = c.get("/attendance", params={"dia": hoje_s}).json()
+    linha = next(p for p in d["presentes"] if p["nome"] == "Ana")
+    assert linha["aluno_id"] == "2026/001" and linha["removido"] is True, linha
+    assert "foto_url" not in linha, "link para foto apagada ficou na versão"
+    assert d["total_presentes"] == 1 and d["sem_aluno_id"] == 0, d
+    d = c.get("/attendance", params={"dia": ontem}).json()
+    assert "Ana" in {p["nome"] for p in d["ausentes"]}, "a falta dela sumiu"
+
+    # chamada ABERTA de antes da remoção: recalculada, e ela continua lá
+    d = c.get("/attendance", params={"dia": anteontem}).json()
+    linha = next(p for p in d["presentes"] if p["nome"] == "Ana")
+    assert linha["removido"] is True and "foto_url" not in linha, linha
+    assert linha["passagens"] == 1
+
+    # dia DEPOIS da remoção: ela já não estava matriculada
+    d = c.get("/attendance", params={"dia": amanha}).json()
+    assert "Ana" not in {p["nome"] for p in d["presentes"] + d["ausentes"]}
+
+    # a presença dela num dia em que estava matriculada ainda pode ser corrigida
+    assert c.post("/attendance/override", json={
+        "dia": anteontem, "person_id": ana, "presente": False}).status_code == 200
+
+    # o rótulo e o nome da detecção sobrevivem (sem foto)
+    det = c.get("/detections", params={"person_id": ana}).json()["deteccoes"]
+    assert det and all(not x["foto_url"] for x in det), det
+
+    # a matrícula fica livre para recadastrar a mesma criança
+    r = c.post("/enroll/start", json={"name": "Ana", "aluno_id": "2026/001"})
+    sid = r.json()["session_id"]
+    assert c.post("/enroll/capture", json={"session_id": sid}).json()["ok"]
+    nova = c.post("/enroll/finish", json={"session_id": sid})
+    assert nova.status_code == 200 and nova.json()["id"] != ana, nova.text
+    assert c.get("/people/by-aluno-id/2026/001").json()["id"] == nova.json()["id"]
+
+    assert c.delete(f"/people/{nova.json()['id']}",
+                    params={"modo": "xyz"}).status_code == 400
+    return ("imagens e biometria apagadas; nome e matrícula ficam nas chamadas "
+            "(presença e falta, fechadas e abertas); some dos dias seguintes; "
+            "matrícula livre para recadastro")
 
 
 @teste
@@ -3223,9 +3497,12 @@ def exclusao_leva_recorte_limpo_miniaturas_e_correcoes():
         ev_outra = db.add_event(outra, "Outra", 0.5, "20260101/o.jpg", 1)
         db.set_detection_label("evento", ev_outra, "errado", "Op", pessoa_correta=alvo)
 
-        r = c.delete(f"/people/{alvo}",
-                     params={"anonimizar": str(anonimizar).lower()})
+        # Os dois modos de exclusão COMPLETA. Anonimizar vai pela forma antiga
+        # (?anonimizar=true), para provar que ela ainda funciona.
+        params = {"anonimizar": "true"} if anonimizar else {"modo": "apagar"}
+        r = c.delete(f"/people/{alvo}", params=params)
         assert r.status_code == 200, r.text
+        assert r.json()["modo"] == ("anonimizar" if anonimizar else "apagar")
 
         for rel in ("20260101/ev.jpg", "20260101/recortes/ev_crop.jpg"):
             assert not os.path.exists(os.path.join(snaps, rel)), \
@@ -3469,6 +3746,47 @@ def cadastro_avisa_e_marca_amostra_borrada():
     assert r["samples"][0]["nitidez_baixa"] is None, r["samples"]
     return ("borrada avisa e é capturada mesmo assim; marca na sessão e na aba "
             "Pessoas; amostra antiga fica sem marca; 0 desliga")
+
+
+@teste
+def painel_revalida_arquivos_sem_baixar_de_novo():
+    """Depois de atualizar o Pi, o navegador seguia com o app.js antigo.
+
+    `no-cache` faz o navegador perguntar a cada abertura; sem mudança, o
+    servidor responde 304 sem corpo — a pergunta custa poucos bytes.
+    """
+    try:
+        import fastapi.testclient  # noqa: F401
+    except ImportError:
+        return "PULADO: fastapi.testclient indisponível"
+    if not os.path.isdir(os.path.join(RAIZ, "web")):
+        return "PULADO: interface web ainda não existe"
+
+    c, _ = _api_cliente("cache_painel")
+    tamanhos = []
+    for arq in ("/painel/", "/painel/app.js", "/painel/style.css"):
+        r = c.get(arq)
+        assert r.status_code == 200, f"{arq}: {r.status_code}"
+        assert r.headers.get("cache-control") == "no-cache", (arq, r.headers)
+        etag = r.headers.get("etag")
+        assert etag, f"{arq} sem ETag: sem ela não há como responder 304"
+        tamanhos.append(len(r.content))
+
+        # A revalidação: mesmo arquivo -> 304, sem corpo
+        r2 = c.get(arq, headers={"If-None-Match": etag})
+        assert r2.status_code == 304, f"{arq}: revalidação deu {r2.status_code}"
+        assert not r2.content, f"{arq}: 304 não deveria trazer o arquivo"
+
+    # As fotos seguem com cache longo: elas nunca mudam
+    import importlib
+    api = importlib.import_module("api")
+    foto = os.path.join(str(api.SNAP_BASE), "20260101", "f.jpg")
+    _arquivo(os.path.join(TMP, "cache_painel", "snaps"), "20260101/f.jpg")
+    r = c.get("/snapshots/20260101/f.jpg")
+    assert r.status_code == 200, (foto, r.status_code)
+    assert "max-age=86400" in r.headers.get("cache-control", ""), r.headers
+    return (f"no-cache + ETag nos 3 arquivos ({sum(tamanhos) // 1024} KB); "
+            "revalidação responde 304 sem corpo; fotos mantêm cache de 1 dia")
 
 
 @teste
